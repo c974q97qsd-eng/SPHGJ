@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pyinstaller/
+
+# 前端构建产物 / 依赖
+frontend/node_modules/
+frontend/*.tsbuildinfo
+frontend/vite.config.d.ts
+frontend/vite.config.js
+
+# 运行时数据
+profiles/
+data/*.db
+data/*.db-journal
+
+# 打包产物
+build/
+/dist/
+*.spec
+
+# 日志
+*.log
