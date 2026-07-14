@@ -1,0 +1,9 @@
+{
+  "accounts": [],
+  "fetch_interval_sec": 300,
+  "auto_reply": {
+    "enabled": false,
+    "rules": []
+  },
+  "db_path": "./data/sphgj.db"
+}

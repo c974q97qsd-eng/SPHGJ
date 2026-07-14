@@ -1,0 +1,106 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ============================================================
+   设计 token:CSS 变量主题(深/浅色)。所有组件引用变量,禁随机样式。
+   8px 栅格:间距只用 Tailwind 偶数档(p-2=8px / p-4=16px / p-6=24px / p-8=32px)。
+   品牌主色:紫色系(延续原 #7c83ff 观感)。
+   ============================================================ */
+@layer base {
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 240 10% 10%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 240 10% 10%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 240 10% 10%;
+
+    --primary: 238 84% 60%;
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 240 5% 94%;
+    --secondary-foreground: 240 10% 15%;
+
+    --muted: 240 5% 94%;
+    --muted-foreground: 240 4% 46%;
+
+    --accent: 238 84% 96%;
+    --accent-foreground: 238 84% 40%;
+
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 100%;
+
+    --success: 142 60% 45%;
+    --success-foreground: 0 0% 100%;
+
+    --warning: 38 92% 50%;
+    --warning-foreground: 0 0% 100%;
+
+    --border: 240 6% 88%;
+    --input: 240 6% 88%;
+    --ring: 238 84% 60%;
+
+    --radius: 0.625rem;
+  }
+
+  .dark {
+    --background: 240 23% 13%;
+    --foreground: 240 10% 92%;
+
+    --card: 240 20% 17%;
+    --card-foreground: 240 10% 92%;
+
+    --popover: 240 20% 17%;
+    --popover-foreground: 240 10% 92%;
+
+    --primary: 238 90% 74%;
+    --primary-foreground: 240 30% 12%;
+
+    --secondary: 240 16% 24%;
+    --secondary-foreground: 240 10% 92%;
+
+    --muted: 240 16% 22%;
+    --muted-foreground: 240 8% 65%;
+
+    --accent: 240 24% 28%;
+    --accent-foreground: 238 90% 85%;
+
+    --destructive: 0 70% 60%;
+    --destructive-foreground: 0 0% 100%;
+
+    --success: 142 55% 55%;
+    --success-foreground: 0 0% 100%;
+
+    --warning: 38 92% 58%;
+    --warning-foreground: 240 30% 12%;
+
+    --border: 240 16% 28%;
+    --input: 240 16% 30%;
+    --ring: 238 90% 74%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-feature-settings: "rlig" 1, "calt" 1;
+  }
+  /* 滚动条(深色友好) */
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { @apply bg-border rounded-full; }
+  ::-webkit-scrollbar-thumb:hover { @apply bg-muted-foreground/40; }
+}
+
+/* 焦点可见性(WCAG) */
+@layer utilities {
+  .focus-ring {
+    @apply outline-none ring-2 ring-ring ring-offset-2 ring-offset-background;
+  }
+}
