@@ -17,12 +17,12 @@ import asyncio
 from urllib.parse import urlparse, parse_qs
 import logging
 logger = logging.getLogger("sphgj")
-from .browser import launch_stealth
-from .selectors import QR_CANDIDATES, ACCOUNT_NAME_CANDIDATES, COMMENT_URL
+from .browser import launch_stealth, close_context_safely
+from .selectors import QR_CANDIDATES, ACCOUNT_NAME_CANDIDATES, COMMENT_URL, LOGIN_URL
 
 
 class LoginSession:
-    def __init__(self, playwright, config, emit, account=None):
+    def __init__(self, playwright, config, emit, account=None, auto_finalize=False, on_finished=None):
         self.sid = uuid.uuid4().hex[:12]
         self.pw = playwright
         self.config = config
@@ -35,9 +35,25 @@ class LoginSession:
         self.status = "pending"
         self.qr_image = None
         self.captured = {"aid": "", "finder_id": "",
-                         "name": (account or {}).get("name", "")}
+                         "name": (account or {}).get("name", ""),
+                         "wx_name": (account or {}).get("_wx_name", "")}
         self._tasks = []
         self._finalized = False
+        self.auto_finalize = auto_finalize  # auto 模式:captured 后后端自动落盘,不等前端调 finalize
+        self.on_finished = on_finished      # 终态回调(sid, status, account_id),供 auto 队列调度
+        self._finished_called = False
+
+    def _finished(self, status):
+        """终态通知(防重复):auto 模式下触发 manager 推进下一个 relogin。"""
+        if self._finished_called:
+            return
+        self._finished_called = True
+        if self.on_finished:
+            try:
+                self.on_finished(self.sid, status,
+                                 self.account["id"] if self.account else None)
+            except Exception as e:
+                logger.debug(f"[login:{self.sid}] on_finished 异常: {e}")
 
     # ---------- 生命周期 ----------
     async def start(self, headed=False):
@@ -51,9 +67,11 @@ class LoginSession:
         self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
         self.page.on("request", self._on_request)
         try:
-            await self.page.goto(COMMENT_URL, wait_until="domcontentloaded")
+            # 直接开登录页:扫码登录场景几乎都是未登录,省去"评论页->重定向登录页"一跳。
+            # cookie 仍有效时视频号会从此重定向回 /platform 首页,_is_logged_in 照样判定。
+            await self.page.goto(LOGIN_URL, wait_until="domcontentloaded")
         except Exception as e:
-            logger.warning(f"[login:{self.sid}] goto 评论页失败(可能跳登录,忽略): {e}")
+            logger.warning(f"[login:{self.sid}] goto 登录页失败(忽略): {e}")
         await self.page.wait_for_timeout(2500)
         if self._is_logged_in():
             logger.info(f"[login:{self.sid}] cookie 复用,已登录")
@@ -85,16 +103,16 @@ class LoginSession:
         self.status = "cancelled"
         await self._close(keep_profile=False)
         await self.emit("login_status", {"sid": self.sid, "status": "cancelled"})
+        self._finished("cancelled")
 
     async def _close(self, keep_profile=False):
+        cur = asyncio.current_task()
         for t in self._tasks:
-            t.cancel()
+            if t is not cur:  # 不取消当前 task(失败路径在 _wait_login_loop 内调 _close)
+                t.cancel()
         self._tasks = []
         if self.context:
-            try:
-                await self.context.close()
-            except Exception:
-                pass
+            await close_context_safely(self.context, self.profile_dir, f"[login:{self.sid}]")
             self.context = None
             self.page = None
         if not keep_profile and self.profile_dir and not self._finalized:
@@ -191,6 +209,8 @@ class LoginSession:
             self.status = "failed"
             logger.warning(f"[login:{self.sid}] 扫码超时(5分钟)")
             await self.emit("login_status", {"sid": self.sid, "status": "failed", "error": "扫码超时(5分钟)"})
+            await self._close(keep_profile=False)
+            self._finished("failed")
 
     async def _capture_fields_and_finalize(self):
         self.status = "capturing"
@@ -205,36 +225,81 @@ class LoginSession:
         # 字段齐全 -> 通知前端自动保存(前端调 finalize 关弹窗 + 落盘);否则失败
         if self.captured["aid"] and self.captured["finder_id"]:
             self.status = "captured"
-            logger.info(f"[login:{self.sid}] 抓取完成 aid/finder_id 齐全,通知前端保存 name={self.captured['name']}")
+            logger.info(f"[login:{self.sid}] 抓取完成 aid/finder_id 齐全 name={self.captured['name']}")
             await self.emit("login_status", {"sid": self.sid, "status": "captured",
                                              "captured": dict(self.captured)})
+            # 字段已抓全,立即关 headed context 释放进程(finalize 只做 profile 改名+写 config,
+            # 不再用 context);手动模式下用户编辑名字/确认期间不再白开 headed 进程。
+            # auto 模式 finalize_with_id 内的 _close 会因 context=None 幂等跳过。
+            await self._close(keep_profile=True)
+            if self.auto_finalize:
+                # auto 模式:后端直接落盘(等同前端 finalize),成功后 on_finished 推进队列
+                await self.finalize_with_id(name=self.captured["name"])
         else:
             self.status = "failed"
             logger.warning(f"[login:{self.sid}] 未抓到 _aid/_log_finder_id,无法保存")
             await self.emit("login_status", {"sid": self.sid, "status": "failed",
                                              "error": "未抓到账号信息,请重试"})
+            await self._close(keep_profile=False)
+            self._finished("failed")
 
     async def _do_capture(self):
-        """跳评论页 + 等 post_list 拦截 aid/finder_id + 抓名称。"""
-        try:
-            if not self._is_logged_in():
-                logger.info(f"[login:{self.sid}] 未在评论页,跳转 {COMMENT_URL}")
-                await self.page.goto(COMMENT_URL, wait_until="domcontentloaded")
-            else:
-                # 已在评论页:reload 触发 post_list 重发,确保拦截到 _aid/_log_finder_id
-                try:
-                    await self.page.reload(wait_until="domcontentloaded")
-                except Exception:
-                    pass
-        except Exception as e:
-            logger.warning(f"[login:{self.sid}] 跳转评论页失败: {e}")
-        # 等 post_list 拦截到 aid/finder_id(最多 15s)
-        for _ in range(30):
-            if self.captured["aid"] and self.captured["finder_id"]:
+        """抓 _aid/_log_finder_id + 账号名。实测两者均在 localStorage(同源页可直接读),
+        无需跳评论页拦截 post_list:_aid=localStorage.__ml::aid(去 JSON 引号),
+        _log_finder_id=localStorage.finder_username(与 post_list body 完全一致)。
+        账号名用顶栏 .account-info .name(首页/评论页同一组件)。扫码后停在当前页即可,0 跳转。"""
+        # 1. localStorage 直接取 _aid / _log_finder_id(扫码后当前页即有)
+        vals = {}
+        for _ in range(6):
+            vals = await self.page.evaluate("""() => {
+                const aid = localStorage.getItem('__ml::aid') || localStorage.getItem('__rx::aid') || '';
+                const fid = localStorage.getItem('finder_username') || '';
+                let a = aid;
+                try { a = JSON.parse(aid); } catch(e) { a = aid.replace(/^"|"$/g, ''); }
+                return { aid: a, finder_id: fid };
+            }""")
+            if vals.get("aid") and vals.get("finder_id"):
                 break
             await asyncio.sleep(0.5)
-        name = await self._capture_name()
-        self.captured["name"] = name or self.captured["finder_id"][:12] or "未命名"
+        if vals.get("aid"):
+            self.captured["aid"] = vals["aid"]
+        if vals.get("finder_id"):
+            self.captured["finder_id"] = vals["finder_id"]
+        logger.info(f"[login:{self.sid}] localStorage 取 _aid={self.captured['aid'][:20]} _log_finder_id={self.captured['finder_id'][:20]}")
+        # 2. 顶栏抓账号名(.account-info .name)
+        await self.page.wait_for_timeout(2500)
+        dom_name = await self._capture_name()
+        if dom_name:
+            self.captured["name"] = dom_name
+        # 3. fallback:localStorage 没拿全 _aid/finder_id -> 跳评论页拦截 post_list
+        if not (self.captured["aid"] and self.captured["finder_id"]):
+            logger.info(f"[login:{self.sid}] localStorage 未取全,回退评论页拦截 post_list")
+            try:
+                await self.page.goto(COMMENT_URL, wait_until="domcontentloaded", timeout=8000)
+                for _ in range(30):
+                    if self.captured["aid"] and self.captured["finder_id"]:
+                        break
+                    await asyncio.sleep(0.5)
+            except Exception as e:
+                logger.warning(f"[login:{self.sid}] 回退跳转评论页失败: {e}")
+        # 4. 登录微信:调 auth/auth_data API 取 userAttr.nickname(API 比 DOM 稳)
+        wx_name = await self._fetch_wx_name()
+        if wx_name:
+            self.captured["wx_name"] = wx_name
+        # 5. fallback:没抓到名字 -> 跳 /platform 首页
+        if not dom_name:
+            try:
+                await self.page.goto("https://channels.weixin.qq.com/platform",
+                                     wait_until="domcontentloaded", timeout=8000)
+                await self.page.wait_for_timeout(3000)
+                dom_name = await self._capture_name()
+                if dom_name:
+                    self.captured["name"] = dom_name
+            except Exception as e:
+                logger.warning(f"[login:{self.sid}] 跳 /platform 抓账号名失败: {e}")
+        cur = self.captured.get("name", "")
+        if not cur or cur == "未命名" or re.match(r"^(v2_|\d+$)", cur):
+            self.captured["name"] = cur or self.captured["finder_id"][:12] or "未命名"
 
     async def _capture_name(self):
         for sel in ACCOUNT_NAME_CANDIDATES:
@@ -247,6 +312,23 @@ class LoginSession:
             except Exception:
                 continue
         return None
+
+    async def _fetch_wx_name(self):
+        """调 auth/auth_data(POST 空 body)取登录微信昵称(data.userAttr.nickname)。"""
+        aid = self.captured.get("aid") or ""
+        if not aid:
+            return ""
+        try:
+            txt = await self.page.evaluate("""async (aid) => {
+                const url = `https://channels.weixin.qq.com/cgi-bin/mmfinderassistant-bin/auth/auth_data?_aid=${aid}&_pageUrl=${encodeURIComponent('https://channels.weixin.qq.com/micro/interaction/comment')}`;
+                const r = await fetch(url, { method:'POST', headers:{'Content-Type':'application/json'}, body:'{}', credentials:'include' });
+                return await r.text();
+            }""", aid)
+            data = json.loads(txt)
+            return ((data.get("data") or {}).get("userAttr") or {}).get("nickname") or ""
+        except Exception as e:
+            logger.debug(f"[login:{self.sid}] auth_data 取微信名失败: {e}")
+            return ""
 
     # ---------- 前端确认后落盘 ----------
     async def finalize_with_id(self, account_id=None, name=None):
@@ -261,11 +343,38 @@ class LoginSession:
             acc["_aid"] = self.captured["aid"] or acc.get("_aid", "")
             acc["_log_finder_id"] = self.captured["finder_id"] or acc.get("_log_finder_id", "")
             acc["name"] = (name or self.captured["name"] or acc.get("name") or acc["id"]).strip()
+            acc["_wx_name"] = self.captured.get("wx_name") or acc.get("_wx_name", "")
             self._save_config()
             self._finalized = True
+            self._finished("finalized")
             logger.info(f"[login:{self.sid}] 账号已更新(relogin): {acc['id']} ({acc['name']})")
             return acc
+        # 排重:扫到的 _log_finder_id 已存在 -> 更新该已有账号(等同 relogin),不新增。
+        # 用 _log_finder_id 而非 _aid:_aid 每次登录会变(同账号不同 _aid,非唯一),
+        # _log_finder_id 才是账号稳定唯一标识。
+        fid = self.captured["finder_id"]
+        dup = next((a for a in self.config.get("accounts", [])
+                    if a.get("_log_finder_id") and a["_log_finder_id"] == fid), None)
+        if dup:
+            # 把本次扫码的临时 profile 落到原账号 profile_dir(替换失效 cookie)
+            target_dir = dup.get("profile_dir") or f"./profiles/{dup['id']}"
+            final_dir = self._move_profile_to(target_dir)
+            dup["_aid"] = self.captured["aid"] or dup.get("_aid", "")
+            dup["_log_finder_id"] = fid
+            dup["name"] = (name or self.captured["name"] or dup.get("name") or dup["id"]).strip()
+            dup["_wx_name"] = self.captured.get("wx_name") or dup.get("_wx_name", "")
+            dup["profile_dir"] = final_dir
+            self._save_config()
+            self._finalized = True
+            self._finished("finalized")
+            logger.info(f"[login:{self.sid}] 扫到已存在账号(_log_finder_id={fid[:20]}),已更新: {dup['id']} ({dup['name']})")
+            # 返回副本带标记通知前端重启;标记不写回 config(dup 仍是 config 内对象)
+            return {**dup, "_dedup_updated": True}
         acc_id = (account_id or self._gen_id()).strip() or self._gen_id()
+        # 确保 id 唯一:与已有账号碰撞时加后缀(防删除账号后 _gen_id 序号回退重复 / 前端传重复 id)
+        existing_ids = {a["id"] for a in self.config.get("accounts", [])}
+        if acc_id in existing_ids:
+            acc_id = f"{acc_id}_{self.sid[:4]}"
         final_dir = f"./profiles/{acc_id}"
         if self.profile_dir and os.path.exists(self.profile_dir) and self.profile_dir != final_dir:
             try:
@@ -280,6 +389,7 @@ class LoginSession:
             "name": (name or self.captured["name"] or acc_id).strip(),
             "_aid": self.captured["aid"],
             "_log_finder_id": self.captured["finder_id"],
+            "_wx_name": self.captured.get("wx_name", ""),
             "profile_dir": final_dir,
             "auto_comment_enabled": False,
             "auto_comment_content": "",
@@ -287,14 +397,38 @@ class LoginSession:
         self.config.setdefault("accounts", []).append(acc)
         self._save_config()
         self._finalized = True
+        self._finished("finalized")
         logger.info(f"[login:{self.sid}] 账号已保存: {acc_id} ({acc['name']})")
         return acc
 
     def _gen_id(self):
-        n = len(self.config.get("accounts", [])) + 1
+        existing = {a["id"] for a in self.config.get("accounts", [])}
         base = self.captured.get("name") or "acc"
         slug = re.sub(r"[^a-zA-Z0-9_-]", "", base).lower()[:12] or "acc"
-        return f"{slug}{n}"
+        n = len(self.config.get("accounts", [])) + 1
+        acc_id = f"{slug}{n}"
+        while acc_id in existing:  # 删除账号后序号回退可能碰撞,递增到唯一
+            n += 1
+            acc_id = f"{slug}{n}"
+        return acc_id
+
+    def _move_profile_to(self, target_dir):
+        """把扫码临时 profile 迁移到 target_dir(替换失效 cookie)。返回最终 profile_dir;
+        迁移失败(如原 profile 被运行中 worker 占用)则降级返回临时 dir,不抛错。"""
+        if not self.profile_dir or not os.path.exists(self.profile_dir):
+            return target_dir
+        if os.path.abspath(self.profile_dir) == os.path.abspath(target_dir):
+            return target_dir
+        try:
+            import shutil
+            if os.path.exists(target_dir):
+                shutil.rmtree(target_dir, ignore_errors=True)
+            shutil.move(self.profile_dir, target_dir)
+            self.profile_dir = target_dir
+            return target_dir
+        except Exception as e:
+            logger.warning(f"[login:{self.sid}] profile 迁移到 {target_dir} 失败,降级用临时 dir: {e}")
+            return self.profile_dir
 
     def _save_config(self):
         with open("config.json", "w", encoding="utf-8") as f:

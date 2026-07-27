@@ -1,4 +1,4 @@
-"""SPHGJ 视频号工具 - 入口。
+"""视频号工具 - 入口。
 
 启动 FastAPI(后台线程) + 打开 pywebview 桌面窗口指向本地服务。
 窗口关闭后优雅停止 Playwright/账号管理。
@@ -68,13 +68,13 @@ def _fatal(msg: str):
         if _is_windows():
             import ctypes
             # MB_ICONERROR = 0x10
-            ctypes.windll.user32.MessageBoxW(0, msg, "SPHGJ 视频号工具 - 启动失败", 0x10)
+            ctypes.windll.user32.MessageBoxW(0, msg, "视频号工具 - 启动失败", 0x10)
         else:
             import tkinter as tk
             from tkinter import messagebox
             r = tk.Tk()
             r.withdraw()
-            messagebox.showerror("SPHGJ 视频号工具 - 启动失败", msg)
+            messagebox.showerror("视频号工具 - 启动失败", msg)
             r.destroy()
     except Exception:
         pass
@@ -95,7 +95,8 @@ def main():
         pass
 
     port = _free_port()
-    config = uvicorn.Config(server.app, host="127.0.0.1", port=port,
+    # 绑 0.0.0.0:桌面窗口仍走 127.0.0.1 本机访问,同时允许内网浏览器访问
+    config = uvicorn.Config(server.app, host="0.0.0.0", port=port,
                             log_level="warning", access_log=False)
     srv = uvicorn.Server(config)
 
@@ -140,7 +141,7 @@ def main():
 
     try:
         gui = "edgechromium" if _is_windows() else None
-        webview.create_window("SPHGJ 视频号工具", url, width=1280, height=820,
+        webview.create_window("视频号工具", url, width=1280, height=820,
                               min_size=(900, 600))
         webview.start(gui=gui)
         # 窗口关闭 -> 优雅停止

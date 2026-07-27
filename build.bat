@@ -1,4 +1,6 @@
 @echo off
+chcp 65001 >nul
+setlocal EnableDelayedExpansion
 cd /d "%~dp0"
 
 echo ============================================
@@ -7,7 +9,7 @@ echo ============================================
 echo.
 
 echo [1/6] Install Python deps (requirements.txt)...
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 if errorlevel 1 (
     echo [Error] pip install failed. Check network or pip config.
     pause
@@ -40,20 +42,22 @@ echo [OK] Frontend ready.
 
 echo.
 echo [3/6] Check PyInstaller...
-pip show pyinstaller >nul 2>&1
+python -m pip show pyinstaller >nul 2>&1
 if errorlevel 1 (
     echo [Install] pyinstaller...
-    pip install pyinstaller
+    python -m pip install pyinstaller
 )
 
 echo.
 echo [4/6] PyInstaller packing...
 if exist "dist\sphgj" rmdir /S /Q "dist\sphgj"
-pyinstaller --noconsole --name sphgj --clean ^
+python -m PyInstaller --noconsole --name sphgj --clean ^
     --add-data "frontend\dist;frontend\dist" ^
     --add-data "config.json;." ^
     --hidden-import "webview.platforms.edgechromium" ^
+    --hidden-import "psutil" ^
     --collect-all webview ^
+    --collect-all playwright ^
     --collect-submodules backend ^
     --collect-submodules uvicorn ^
     --collect-submodules websockets ^
@@ -113,4 +117,5 @@ echo   exe:    dist\sphgj\sphgj.exe
 echo   browser: dist\sphgj\browsers\
 echo   profiles\ and data\ created on first run.
 echo ============================================
+endlocal
 pause

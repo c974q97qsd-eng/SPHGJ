@@ -39,6 +39,33 @@ pinlun/
 - **手动回复**:仅选中评论时触发右侧 Sheet 抽屉(回复/删除/置顶),无常驻回复栏。
 - **实时**:后端 Hub 把 `qr_update`/`login_status`/`engine_status`/`comments_update` 广播给所有 WS 客户端。
 
+### 直播大屏 & dashboardV4 数据路径
+
+**现有直播大屏(已实现)**:每账号 worker 登录后开 liveBuild page(`account_manager._live_loop`),`LiveFetcher` 拦截 liveBuild 页自动周期调用的 `get_live_info` 响应(~5s/次),解析 `data.liveStats`(`totalAudienceCount` 累计观看 / `payedGmv` GMV / 实时在线等),每 4s 经 `live_screen_update` WS 推前端 `LiveScreenPage`;另拦截 `.flv` 请求取直播流 URL 供 flv.js 播放。**不抓 DOM、不进 dashboardV4。**
+
+**dashboardV4(数据趋势大屏)进入路径** —— 公域流量/自然流量数据源,尚未接入抓取:
+1. `/platform/live/home` → 点"**进入直播间**"菜单(**仅直播中显示**,未开播 DOM 无此按钮)
+2. → `/platform/live/liveBuild`(推流/观察页,`MicroLiveBuild` 组件;**直接 goto 只渲染左侧菜单,必须从 live/home 的"进入直播间"入口进才出推流页**)→ 点"**数据趋势大屏**"菜单
+3. → `/platform/statistic/dashboardV4?objetctId=<直播场次ID>&entrance_id=2`(中间经 `/micro/statistic/dashboardV4` 路由跳转;`objetctId` 为直播场次 ID,由 liveBuild 推流页渲染入口时携带,来自 `get_live_info` 响应的场次标识,字段名待实现时确认)
+
+**公域流量位置(CDP 已联调定位)**:dashboardV4 页数据在 `<iframe name="statistic">` 内。操作路径:切到"**渠道流量分析**"tab(`.tab-item`,默认是"整体趋势") -> "**趋势**"下拉(`.funnel-data-selector` 的 `.ant-select-selector`)选"**漏斗**"(选项 `.ant-select-dropdown-menu-item`) -> 渲染 `.funnel-table-row`。公域流量行 = 子元素 `.funnel-channel-item` 文本为"公域流量"的行,4 列结构:
+- `.funnel-channel-item` = 渠道名(公域流量/直播推荐/关注开播通知/短视频引流/搜索/私域流量)
+- 第 2 列 DIV(无 class)= `进房人次 占比`(如 `244 38.79%`)
+- 第 3 列 DIV(无 class)= `成交金额 占比`(如 `¥1,152.00 66.67%`)
+- `.funnel-tmoney-item` = 客单价/累计金额(如 `¥4,721.31`)
+
+`natural_traffic`(自然流量)= **公域流量行的进房人次**(第 2 列文本首数字,如 249)。
+`natural_gmv`(自然GMV)= **公域流量行的成交金额占比**(第 3 列文本里的占比 %,如 57.14)。
+
+**现状(已实现)**:`live_fetcher.py` 的 `fetch_dashboard_data()` 在 liveBuild page 同源 fetch 三个 dashboard API 抓取(无需进 dashboardV4、无需抓 DOM):
+- `natural_traffic`(公域进房人次)= `get_ec_conversion_dashboard_data_v3` 的 `trendingSource.newWatchUv` **第一组(整场)** `dimensions=[{type:16,公域流量}]` 的 `sum`(newWatchUv 有两组:整场+近30分钟,取第一个匹配)
+- `natural_gmv`(公域成交占比%)= `getLiveDistributionChannel` 的 `liveDistChannelSourceStats` 里 `newLiveDstChannelType=1`(公域) `gmv` ÷ 所有 type `gmv` 之和 ×100
+- `refund_rate`(退款率%)= `get_live_ec_data_summary.refundRate` ×100
+- `male_ratio`(男性占比%)= `get_ec_conversion_dashboard_data_v3` 的 `portraitAudience.onlineWatchUv` 性别维度(type 3) 男 ÷ (男+女+未知) ×100
+- `heat_gmv_per_1000`(加热千次观看成交,元)= `getLiveDistributionChannel` type2(加热) `gmv` ÷ `newWatchUv` "直播加热"第一组 sum ×1000÷100
+- `liveObjectId`(直播场次ID)从 `get_live_info` 响应取;`_aid`/`_log_finder_id` 从 liveBuild page localStorage 取(`__ml::aid` / `finder_username`)
+- `account_manager._live_loop` 每 30s 抓一次,填入 `live_info`,经 `live_screen_update` WS 推前端 `LiveScreenPage`
+
 ## 运行 / 打包
 - 开发:`cd frontend && npm run dev`(5173,代理 /api /ws 到 8000);另起 `python -m uvicorn backend.server:app --port 8000`。
 - 桌面:`python main.py`(起服务 + pywebview 窗口)。

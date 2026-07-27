@@ -1,4 +1,6 @@
 @echo off
+chcp 65001 >nul
+setlocal EnableDelayedExpansion
 cd /d "%~dp0"
 
 echo ============================================
@@ -35,7 +37,7 @@ echo [Install] Upgrading pip...
 python -m pip install --upgrade pip
 
 echo [Install] Python dependencies...
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 if errorlevel 1 (
     echo [Error] Dependencies install failed. Check network or pip config.
     pause
@@ -108,4 +110,5 @@ echo.
 echo ============================================
 echo   Setup done! Run start.bat to launch.
 echo ============================================
+endlocal
 pause

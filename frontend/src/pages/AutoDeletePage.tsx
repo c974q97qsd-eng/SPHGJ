@@ -2,12 +2,15 @@ import { useEffect, useState } from "react"
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Textarea } from "@/components/ui/textarea"
+import { Input } from "@/components/ui/input"
 import { Switch } from "@/components/ui/switch"
+import { Badge } from "@/components/ui/badge"
 import { Label } from "@/components/ui/label"
-import { LoadingState, ErrorState } from "@/components/common/states"
-import { api, type AutoDeleteConfig } from "@/lib/api"
+import { LoadingState, ErrorState, EmptyState } from "@/components/common/states"
+import { api, type AutoDeleteConfig, type DeleteLogItem } from "@/lib/api"
+import { fmtTime } from "@/lib/utils"
 import { toast } from "sonner"
-import { Trash2, Save, Loader2 } from "lucide-react"
+import { Trash2, Save, Loader2, History, Search, Eraser } from "lucide-react"
 
 export function AutoDeletePage() {
   const [cfg, setCfg] = useState<AutoDeleteConfig | null>(null)
@@ -76,6 +79,108 @@ export function AutoDeletePage() {
           </div>
         </CardContent>
       </Card>
+
+      <DeleteLogsCard />
     </div>
+  )
+}
+
+/** 删除记录卡片:展示关键字命中删除的评论记录(数据库持久化),支持搜索/清空/加载更多。 */
+function DeleteLogsCard() {
+  const LIMIT = 50
+  const [logs, setLogs] = useState<DeleteLogItem[]>([])
+  const [total, setTotal] = useState(0)
+  const [loading, setLoading] = useState(true)
+  const [qInput, setQInput] = useState("")
+  const [q, setQ] = useState("")
+  const [moreLoading, setMoreLoading] = useState(false)
+
+  const load = async (query: string) => {
+    setLoading(true)
+    try {
+      const r = await api.getDeleteLogs({ q: query || undefined, limit: LIMIT, offset: 0 })
+      setLogs(r.items); setTotal(r.total)
+    } catch { /* ignore */ } finally { setLoading(false) }
+  }
+  useEffect(() => { load("") }, [])
+
+  const search = () => { setQ(qInput); load(qInput) }
+
+  const loadMore = async () => {
+    setMoreLoading(true)
+    try {
+      const r = await api.getDeleteLogs({ q: q || undefined, limit: LIMIT, offset: logs.length })
+      setLogs((prev) => [...prev, ...r.items])
+    } catch { /* ignore */ } finally { setMoreLoading(false) }
+  }
+
+  const clear = async () => {
+    try {
+      await api.clearDeleteLogs()
+      toast.success("已清空删除记录")
+      setQInput(""); setQ(""); load("")
+    } catch (e) { toast.error("清空失败:" + (e as Error).message) }
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2"><History className="h-5 w-5 text-primary" />删除记录</CardTitle>
+        <CardDescription>自动删除命中关键字的评论记录(共 {total} 条,保存在数据库)</CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {/* 搜索 + 清空 */}
+        <div className="flex items-center gap-2">
+          <div className="relative flex-1">
+            <Search className="absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+            <Input
+              value={qInput}
+              onChange={(e) => setQInput(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && search()}
+              placeholder="搜索内容/昵称/关键字"
+              className="pl-8"
+              aria-label="搜索删除记录"
+            />
+          </div>
+          <Button variant="outline" size="sm" onClick={clear} className="gap-1.5" aria-label="清空删除记录">
+            <Eraser className="h-3.5 w-3.5" />清空
+          </Button>
+        </div>
+
+        {loading ? (
+          <LoadingState />
+        ) : logs.length === 0 ? (
+          <EmptyState icon={<Trash2 className="h-6 w-6" />} title="暂无删除记录"
+            description={q ? "没有匹配的记录" : "启用自动删除后,命中关键字的评论会记录在这里"} />
+        ) : (
+          <div className="space-y-2">
+            <div className="max-h-[480px] space-y-2 overflow-y-auto pr-1">
+              {logs.map((log) => (
+                <div key={log.comment_id + log.deleted_at} className="rounded-md border p-2.5 text-sm">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <span className="truncate font-medium">{log.nickname || "匿名"}</span>
+                      <Badge variant="secondary" className="shrink-0 font-normal">{log.account_name}</Badge>
+                    </div>
+                    <span className="shrink-0 text-[10px] text-muted-foreground">{fmtTime(log.deleted_at)}</span>
+                  </div>
+                  <p className="mt-1 line-clamp-2 text-muted-foreground">{log.content}</p>
+                  <div className="mt-1.5">
+                    <Badge variant="destructive" className="font-normal">命中: {log.keyword}</Badge>
+                  </div>
+                </div>
+              ))}
+            </div>
+            {logs.length < total && (
+              <div className="flex justify-center pt-1">
+                <Button variant="outline" size="sm" onClick={loadMore} disabled={moreLoading} className="gap-1.5">
+                  {moreLoading && <Loader2 className="h-3.5 w-3.5 animate-spin" />}加载更多
+                </Button>
+              </div>
+            )}
+          </div>
+        )}
+      </CardContent>
+    </Card>
   )
 }

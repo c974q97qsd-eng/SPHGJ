@@ -1,6 +1,6 @@
 {
   "accounts": [],
-  "fetch_interval_sec": 300,
+  "fetch_interval_sec": 600,
   "auto_reply": {
     "enabled": false,
     "rules": []

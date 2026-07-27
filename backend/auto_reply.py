@@ -6,6 +6,7 @@ config.auto_reply = {
 }
 关键字一行一个(UI 文本框解析),每条配回复内容。
 """
+import asyncio
 import logging
 logger = logging.getLogger("sphgj")
 
@@ -37,7 +38,7 @@ class AutoReply:
         content = cmt.get("commentContent", "")
         if not cid or not content:
             return False
-        if self.storage.is_replied(cid):
+        if await asyncio.to_thread(self.storage.is_replied, cid):
             return False
         rule = self._match(content)
         if not rule:
@@ -48,7 +49,7 @@ class AutoReply:
         try:
             resp = await self.api.reply_comment(cid, reply_text)
             if resp and not resp.get("__err"):
-                self.storage.mark_replied(cid)
+                await asyncio.to_thread(self.storage.mark_replied, cid)
                 logger.info(f"[{self.account_id}] 自动回复 {cid}({content[:15]})-> {reply_text}")
                 return True
             logger.warning(f"[{self.account_id}] 回复失败 {cid}: {resp}")

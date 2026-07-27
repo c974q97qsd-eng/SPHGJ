@@ -17,6 +17,8 @@ QR_CANDIDATES = [
 
 # 登录后平台顶栏账号名(用于自动抓取「名称」)
 ACCOUNT_NAME_CANDIDATES = [
+    ".account-info .name",
+    ".account-info",
     ".weui-desktop-account__name",
     ".account-name",
     "[class*='account'] [class*='name']",
@@ -26,6 +28,7 @@ ACCOUNT_NAME_CANDIDATES = [
 
 LOGIN_URL = "https://channels.weixin.qq.com/platform/login"
 COMMENT_URL = "https://channels.weixin.qq.com/platform/interaction/comment"
+POST_CREATE_URL = "https://channels.weixin.qq.com/platform/post/create"  # 「打开」按钮 goto 此页(发布作品)
 LIVE_URL = "https://channels.weixin.qq.com/platform/live/liveBuild"
 LIVE_INFO_SELECTOR = ".live-info-container"
 LIVE_PLAYER_SELECTOR = ".live-player-video-element"

@@ -1,14 +1,21 @@
 import { useCallback, useEffect, useState } from "react"
-import { api, type LiveScreenItem } from "@/lib/api"
+import { api, type LiveScreenItem, type MetricDef } from "@/lib/api"
 import { useWebSocket, type WsEvent } from "@/lib/ws"
 
-/** 直播大屏:各账号直播快照 + WS 实时更新。 */
+/** 直播大屏:各账号直播快照 + WS 实时更新 + 卡片指标配置/字典。 */
 export function useLiveScreen() {
   const [items, setItems] = useState<LiveScreenItem[]>([])
+  const [cardFields, setCardFields] = useState<string[]>([])
+  const [metricDict, setMetricDict] = useState<MetricDef[]>([])
   const [loading, setLoading] = useState(true)
 
   const refresh = useCallback(async () => {
-    try { setItems((await api.getLiveScreenStatus()).items) } catch { /* ignore */ }
+    try {
+      const [st, dict] = await Promise.all([api.getLiveScreenStatus(), api.getMetricsDictionary()])
+      setItems(st.items)
+      setCardFields(st.card_fields)
+      setMetricDict(dict.metrics)
+    } catch { /* ignore */ }
     finally { setLoading(false) }
   }, [])
 
@@ -27,5 +34,5 @@ export function useLiveScreen() {
     }
   }, []))
 
-  return { items, loading, refresh }
+  return { items, cardFields, metricDict, loading, refresh }
 }

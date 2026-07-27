@@ -42,6 +42,9 @@ class LoginFinalize(BaseModel):
 class ConfigUpdate(BaseModel):
     fetch_interval_sec: Optional[int] = Field(default=None, ge=10)
     auto_reply_enabled: Optional[bool] = None
+    card_fields: Optional[List[str]] = None
+    dashboard_interval_sec: Optional[int] = Field(default=None, ge=10)
+    live_check_interval_sec: Optional[int] = Field(default=None, ge=2)
 
 
 class AutoReplyRule(BaseModel):

@@ -14,14 +14,19 @@ from datetime import datetime
 class Storage:
     def __init__(self, db_path):
         self.db_path = db_path
+        self._stats_cache = None
+        self._stats_cache_ts = 0.0
         self._init()
 
     def _conn(self):
-        return sqlite3.connect(self.db_path)
+        c = sqlite3.connect(self.db_path, timeout=30)
+        c.execute("PRAGMA busy_timeout=30000")  # 锁等待 30s,避免立即抛异常导致连接泄漏/锁死
+        return c
 
     def _init(self):
         os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
         c = self._conn()
+        c.execute("PRAGMA journal_mode=WAL")  # WAL:读写不互斥,减少多 worker 并发写锁竞争
         c.execute("""CREATE TABLE IF NOT EXISTS comments(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             account_id TEXT, export_id TEXT, comment_id TEXT UNIQUE,
@@ -35,13 +40,28 @@ class Storage:
         c.execute("""CREATE TABLE IF NOT EXISTS auto_commented(
             account_id TEXT, export_id TEXT, comment_id TEXT, commented_at TEXT,
             PRIMARY KEY(account_id, export_id))""")
+        c.execute("""CREATE TABLE IF NOT EXISTS live_window(
+            account_id TEXT, window TEXT,
+            ts REAL, audience INTEGER, gmv REAL,
+            delta_a INTEGER, delta_g REAL,
+            PRIMARY KEY(account_id, window))""")
+        c.execute("""CREATE TABLE IF NOT EXISTS daily_write_count(
+            account_id TEXT, date TEXT, count INTEGER,
+            PRIMARY KEY(account_id, date))""")
+        c.execute("""CREATE TABLE IF NOT EXISTS delete_logs(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id TEXT, comment_id TEXT, export_id TEXT,
+            nickname TEXT, content TEXT, keyword TEXT, deleted_at TEXT)""")
         c.execute("CREATE INDEX IF NOT EXISTS idx_comments_time ON comments(create_time DESC)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_comments_acc ON comments(account_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_delete_logs_time ON delete_logs(deleted_at DESC)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_delete_logs_acc ON delete_logs(account_id)")
         # 迁移:为旧库补 deleted 列(已存在则忽略)
         try:
             c.execute("ALTER TABLE comments ADD COLUMN deleted INTEGER DEFAULT 0")
         except Exception:
             pass
+        c.execute("PRAGMA wal_checkpoint(TRUNCATE)")  # 启动时收敛 WAL,避免长期运行 WAL 膨胀
         c.commit()
         c.close()
 
@@ -175,7 +195,11 @@ class Storage:
         return items, total
 
     def account_stats(self):
-        """每账号统计:总数 / 已回 / 最近抓取时间。供仪表盘与账号管理用。"""
+        """每账号统计:总数 / 已回 / 最近抓取时间。供仪表盘与账号管理用。缓存 60s。"""
+        import time
+        now = time.time()
+        if self._stats_cache is not None and now - self._stats_cache_ts < 60:
+            return self._stats_cache
         c = self._conn()
         rows = c.execute("""SELECT account_id,
                 COUNT(*) AS total,
@@ -183,5 +207,99 @@ class Storage:
                 MAX(fetched_at) AS last_fetched
             FROM comments GROUP BY account_id""").fetchall()
         c.close()
-        return [dict(account_id=r[0], total=r[1] or 0, replied=r[2] or 0,
-                     last_fetched=r[3]) for r in rows]
+        self._stats_cache = [dict(account_id=r[0], total=r[1] or 0, replied=r[2] or 0,
+                                  last_fetched=r[3]) for r in rows]
+        self._stats_cache_ts = now
+        return self._stats_cache
+
+    # ---------- 直播大屏增值统计(每窗口固定一条,upsert 不堆积) ----------
+    def save_window_state(self, account_id, window, ts, audience, gmv, delta_a, delta_g):
+        c = self._conn()
+        c.execute("""INSERT OR REPLACE INTO live_window
+            (account_id,window,ts,audience,gmv,delta_a,delta_g) VALUES(?,?,?,?,?,?,?)""",
+                  (account_id, window, ts, audience, gmv, delta_a, delta_g))
+        c.commit()
+        c.close()
+
+    def load_window_states(self, account_id):
+        """加载某账号各窗口的最近采样状态,worker 启动恢复用。返回 {window: dict}。"""
+        c = self._conn()
+        rows = c.execute(
+            "SELECT window,ts,audience,gmv,delta_a,delta_g FROM live_window WHERE account_id=?",
+            (account_id,)).fetchall()
+        c.close()
+        return {r[0]: dict(ts=r[1], audience=r[2], gmv=r[3], delta_a=r[4], delta_g=r[5]) for r in rows}
+
+    # ---------- 防风控:写操作每日计数(持久化,跨重启) ----------
+    def get_daily_write_count(self, account_id, date_str):
+        c = self._conn()
+        try:
+            row = c.execute(
+                "SELECT count FROM daily_write_count WHERE account_id=? AND date=?",
+                (account_id, date_str)).fetchone()
+            return row[0] if row else 0
+        finally:
+            c.close()
+
+    def incr_daily_write_count(self, account_id, date_str):
+        """递增某账号某日写计数,返回递增后的值。"""
+        c = self._conn()
+        try:
+            c.execute("INSERT OR IGNORE INTO daily_write_count(account_id,date,count) VALUES(?,?,0)",
+                      (account_id, date_str))
+            c.execute("UPDATE daily_write_count SET count=count+1 WHERE account_id=? AND date=?",
+                      (account_id, date_str))
+            c.commit()
+            row = c.execute(
+                "SELECT count FROM daily_write_count WHERE account_id=? AND date=?",
+                (account_id, date_str)).fetchone()
+            return row[0] if row else 0
+        finally:
+            c.close()
+
+    # ---------- 自动删除记录(关键字命中删除日志,供删除记录卡片展示) ----------
+    def log_delete(self, account_id, comment_id, nickname, content, keyword, export_id):
+        c = self._conn()
+        try:
+            c.execute("""INSERT INTO delete_logs
+                (account_id,comment_id,export_id,nickname,content,keyword,deleted_at)
+                VALUES(?,?,?,?,?,?,?)""",
+                      (account_id, comment_id, export_id, nickname, content, keyword,
+                       datetime.now().isoformat()))
+            c.commit()
+        finally:
+            c.close()
+
+    def query_delete_logs(self, account_id=None, q=None, limit=200, offset=0):
+        """分页查询删除记录,返回 (list[dict], total)。q 匹配 content/nickname/keyword。"""
+        c = self._conn()
+        try:
+            where, args = [], []
+            if account_id:
+                where.append("account_id=?"); args.append(account_id)
+            if q:
+                where.append("(content LIKE ? OR nickname LIKE ? OR keyword LIKE ?)")
+                args.extend([f"%{q}%", f"%{q}%", f"%{q}%"])
+            clause = (" WHERE " + " AND ".join(where)) if where else ""
+            total = c.execute(f"SELECT COUNT(*) FROM delete_logs{clause}", args).fetchone()[0]
+            rows = c.execute(
+                f"""SELECT account_id,comment_id,export_id,nickname,content,keyword,deleted_at
+                    FROM delete_logs{clause}
+                    ORDER BY deleted_at DESC LIMIT ? OFFSET ?""",
+                args + [limit, offset]).fetchall()
+            items = [dict(account_id=r[0], comment_id=r[1], export_id=r[2], nickname=r[3],
+                          content=r[4], keyword=r[5], deleted_at=r[6]) for r in rows]
+            return items, total
+        finally:
+            c.close()
+
+    def clear_delete_logs(self, account_id=None):
+        c = self._conn()
+        try:
+            if account_id:
+                c.execute("DELETE FROM delete_logs WHERE account_id=?", (account_id,))
+            else:
+                c.execute("DELETE FROM delete_logs")
+            c.commit()
+        finally:
+            c.close()
