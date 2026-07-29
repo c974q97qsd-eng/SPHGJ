@@ -1,17 +1,24 @@
-"""直播大屏抓取:被动拦截 liveBuild 页自身请求 + 主动同源 POST dashboard API。不抓 DOM。
+"""直播大屏抓取: 实测验证方案(2026-07-29 rev6)。
 
-被动拦截(liveBuild 页自身发起, SPHGJ 不主动请求, 无额外开销):
-- get_live_info 响应(~5s/次) -> liveStats: overlay 当前在线、增值统计(累计观看/成交)、is_live
-- check_live_status 响应(页面加载时) -> liveObjectId(场次 ID; get_live_info 不返回)
-- .flv 请求(pull-m1.wxlivecdn.com/.../orig.flv) -> stream_url, 前端 flv.js 播放
+通过诊断脚本实测确认: check_live_status 响应体含 liveObjectId + audiencePlayUrl(.flv 流),
+get_live_info 响应体含 liveStats。本版据此实现,不再依赖猜测的接口字段。
 
-主动同源 POST(在 liveBuild page fetch, 补 get_live_info 不提供的 5 字段):
-- get_ec_conversion_dashboard_data_v3 / getLiveDistributionChannel / get_live_ec_data_summary
-  -> natural_traffic/natural_gmv/refund_rate/male_ratio/heat_gmv_per_1000(见 fetch_dashboard_data)
-  需 liveObjectId(来自 check_live_status)。无需进 dashboardV4 页。
+内存安全:
+  旧版 page.route("**/*") 对每个请求(图片/字体/CSS/FLV 分片/轮询)创建 Python 代理对象,
+  长跑直播下 Playwright 不回收(microsoft/playwright#20765),累积到 5-7GB。
+  本版:
+  - CDP Network.setBlockedURLs: 浏览器层阻断图片/字体/CSS/媒体(0 Python 对象)
+  - page.on("response"): 被动捕获 get_live_info / check_live_status 响应体(实测可靠,无泄漏)
+  - page.route("**/*.flv*") / ("**/*.m3u8*"): 仅 flv/m3u8 两条精确路由,捕获 stream_url + abort
+    中止下载(等价原 page.route abort,但非 **/* 海量路由,无累积泄漏)
+
+实测验证(diagnose_live.py, uspoloassn7):
+  - check_live_status 返回 data.audiencePlayUrl = "//pull-m1.wxlivecdn.com/.../orig_..._ns405.flv?..."
+  - 仅用 page.on("response") 即可完整读到,无需 CDP Fetch 域(CDP Fetch 反而干扰响应事件)
 """
 import asyncio
 import json
+import re
 import time
 import logging
 from datetime import datetime
@@ -30,6 +37,16 @@ DASHBOARD_PAGE_URL_ENC = "https%3A%2F%2Fchannels.weixin.qq.com%2Fmicro%2Fstatist
 PUBLIC_CHANNEL_TYPE = 1
 DASHBOARD_INTERVAL = 60  # dashboard 数据抓取间隔(秒);实际由 account_manager 读 config.dashboard_interval_sec 控制
 
+# CDP 浏览器层阻断: 非必要资源(图片/字体/CSS/媒体)。
+# 注意: FLV 直播流【不】在此阻断! setBlockedURLs 会在 requestWillBeSent(即 page.on("request"))
+# 之前就拦掉请求,导致抓不到 FLV URL。FLV 改由 page.route("**/*.flv*") 精确拦截。
+_BLOCKED_URL_PATTERNS = [
+    "*.png", "*.jpg", "*.jpeg", "*.gif", "*.svg", "*.webp", "*.ico", "*.bmp",
+    "*.woff", "*.woff2", "*.ttf", "*.otf", "*.eot",
+    "*.css",
+    "*.mp4", "*.webm", "*.mp3", "*.wav", "*.ogg", "*.m4a",
+]
+
 
 class LiveFetcher:
     def __init__(self, page, account_id):
@@ -47,106 +64,73 @@ class LiveFetcher:
         self._dashboard_ts = 0.0
         self._no_liveid_warned = False   # 在直播但拿不到 liveObjectId 时 warn 一次
         self._dash_fail_warned = False   # dashboard 抓取全失败时 warn 一次(成功后重置)
-        # 持有 fire-and-forget task 引用,防止 task 被 GC 中途取消 + 关 page 时统一 cancel。
-        # 否则 task 持有 resp -> resp 持有 page -> page 回调表持有 LiveFetcher,
-        # 挂起的 task(resp.text() 未返回)会卡住整条链,page/LiveFetcher 不被回收,
-        # P0-1 关/重开 live_page 循环下累积成内存泄漏。
-        self._pending_tasks: set = set()
-        page.on("request", self._on_req)
-        page.on("response", self._on_resp)
-        # A: route 阻断非必要资源--后端 headless 不渲染画面/不播放流,只需拦截 API 响应。
-        # abort FLV 流(记录 URL 给前端 flv.js 后不下载流体,省直播中最大内存头)+
-        # image/font/stylesheet/media,大幅降低 liveBuild 页常驻内存。前端用 stream_url
-        # 在 WebView2 独立拉流播放,与后端 abort 互不影响。
-        self._route_handler = None
-        self._install_route(page)
+        self._flv_req_warned = False
+        # CDP session(仅用于浏览器层阻断非必要资源,不取 body,无代理对象)
+        self._cdp = None
 
-    def _install_route(self, page):
-        async def handler(route):
-            try:
-                req = route.request
-                u = req.url or ""
-                rt = req.resource_type
-                # FLV 直播流:先记 URL(前端 flv.js 用),再 abort 不下载流体
-                if ".flv" in u and ("wxlivecdn" in u or "trtc" in u):
-                    if u != self.stream_url:
-                        self.stream_url = u
-                    await route.abort()
-                    return
-                # 非必要资源 abort(不影响 API:xhr/fetch/document/script 照常)
-                if rt in ("image", "font", "stylesheet", "media"):
-                    await route.abort()
-                    return
-                await route.continue_()
-            except Exception:
-                # route 异常时尽量放行,避免阻断正常 API
-                try:
-                    await route.continue_()
-                except Exception:
-                    pass
+    async def goto_live(self):
+        """设置 CDP 阻断,注册 page.on 捕获回调 + flv 精确路由,然后导航到 liveBuild 页。"""
+        await self._setup_cdp()
+        self.page.on("response", self._on_resp)
+        await self._install_flv_route()
         try:
-            page.route("**/*", handler)
-            self._route_handler = handler
+            await self.page.goto(LIVE_URL, wait_until="domcontentloaded")
         except Exception as e:
-            logger.debug(f"[live:{self.account_id}] page.route 安装失败(资源阻断未生效): {e}")
+            logger.warning(f"[live:{self.account_id}] goto liveBuild 失败: {e}")
 
-    def _on_req(self, req):
-        u = req.url or ""
-        # 直播 FLV 流(pull-m1.wxlivecdn.com / trtc)
-        if ".flv" in u and ("wxlivecdn" in u or "trtc" in u):
-            self.stream_url = u
+    async def _setup_cdp(self):
+        """CDP: Network.setBlockedURLs 在浏览器层阻断图片/字体/CSS/媒体(0 Python 对象)。
 
-    def _on_resp(self, resp):
+        不启用 Fetch 域——实测确认 Fetch.enable 会干扰 check_live_status 的响应事件,
+        导致 live_object_id 取不到。FLV 用 page.route 精确拦截(见 _install_flv_route)。
+        CDP 不可用时降级: 不阻断(响应量会变大,但 page.on 仍能捕获关键 API)。
+        """
+        try:
+            self._cdp = await self.page.context.new_cdp_session(self.page)
+            await self._cdp.send("Network.enable")
+            await self._cdp.send("Network.setBlockedURLs", {"urls": _BLOCKED_URL_PATTERNS})
+        except Exception as e:
+            logger.warning(f"[live:{self.account_id}] CDP 初始化失败(降级: 不阻断): {e}")
+            self._cdp = None
+
+    async def _install_flv_route(self):
+        """page.route 精确拦截 flv/m3u8: 捕获 stream_url 后 abort 中止下载。
+
+        仅 2 条精确路由(**/*.flv* / **/*.m3u8*),非 **/* 海量路由,无 Playwright 代理对象累积泄漏。
+        这是原代码能正常出视频的方案,经实测验证最稳。
+        """
+        try:
+            await self.page.route("**/*.flv*", self._handle_flv)
+            await self.page.route("**/*.m3u8*", self._handle_flv)
+        except Exception as e:
+            logger.warning(f"[live:{self.account_id}] flv route 安装失败(降级: 靠 response 兜底): {e}")
+
+    async def _handle_flv(self, route):
+        """flv/m3u8 请求: 先抓 URL 作为 stream_url,再 abort 中止下载(后端不缓存流体,
+        前端 flv.js 独立拉流)。"""
+        u = route.request.url or ""
+        if ".flv" in u or ".m3u8" in u or "wxlivecdn" in u or "trtc" in u:
+            if u != self.stream_url:
+                self.stream_url = u
+                logger.info(f"[live:{self.account_id}] 拿到 .flv 流 URL(来自 route): {u[:80]}...")
+        try:
+            await route.abort()
+        except Exception:
+            pass
+
+    # ======================== page.on: 被动捕获响应体 ========================
+
+    async def _on_resp(self, resp):
         u = resp.url or ""
         if "channels.weixin.qq.com" not in u:
             return
         if "get_live_info" in u:
-            self._spawn(self._capture(resp), "get_live_info")
+            await self._capture(resp)
         elif "check_live_status" in u:
-            self._spawn(self._capture_live_status(resp), "check_live_status")
-
-    def _spawn(self, coro, tag):
-        """创建 fire-and-forget task 并持有引用:加入 _pending_tasks,完成时自动移除。
-
-        不持有引用的 task 会被 GC 中途取消;更危险的是挂起的 task 持有 resp->page->LiveFetcher
-        链,导致关 page 后 LiveFetcher 不被回收(P0-1 关/重开循环下累积泄漏)。
-        """
-        try:
-            t = asyncio.create_task(coro)
-            self._pending_tasks.add(t)
-            t.add_done_callback(self._pending_tasks.discard)
-        except Exception as e:
-            logger.debug(f"[live:{self.account_id}] 调度 {tag} 抓取失败: {e}")
-            coro.close()  # 没成功创建 task,关掉 coro 避免未消费协程警告
-
-    async def close(self):
-        """关闭前清理:移除 page 事件回调 + 取消挂起 task + 断开 page 引用。
-
-        必须在 page.close() 前调用,否则 page 回调表 + 挂起 task 会持有 LiveFetcher
-        与 page 对象,阻止 GC(下播后 P0-1 关/重开循环下累积成内存增长)。
-        """
-        # 1. 移除回调(try/except:page 已关时 remove_listener 可能抛)
-        for evt, fn in (("request", self._on_req), ("response", self._on_resp)):
-            try:
-                self.page.remove_listener(evt, fn)
-            except Exception:
-                pass
-        # 1b. 移除 route handler(A: 资源阻断)
-        if self._route_handler:
-            try:
-                self.page.unroute("**/*", self._route_handler)
-            except Exception:
-                pass
-            self._route_handler = None
-        # 2. 取消所有挂起 task(resp.text() 未返回的会卡住 page 不释放)
-        for t in list(self._pending_tasks):
-            if not t.done():
-                t.cancel()
-        self._pending_tasks.clear()
-        # 3. 断 LiveFetcher -> page 强引用
-        self.page = None
+            await self._capture_live_status(resp)
 
     async def _capture(self, resp):
+        """get_live_info 响应 -> liveStats(当前在线/增值统计) + 兜底 liveObjectId。"""
         try:
             txt = await resp.text()
             data = json.loads(txt)
@@ -156,15 +140,12 @@ class LiveFetcher:
                 self.live_stats = stats
                 self.updated_at = datetime.now().isoformat()
                 self.updated_at_ts = time.time()
-            # liveObjectId 主要从 check_live_status 取(见 _capture_live_status);get_live_info 不返回该字段。
-            # 这里仅在 get_live_info 偶尔返回时刷新作为兜底;不再因取不到而 warn(否则必然误报)。
+            # liveObjectId 主要从 check_live_status 取;get_live_info 偶尔也返回,作为兜底。
             live_id = d.get("liveObjectId") or (stats or {}).get("liveObjectId")
             if live_id and not self.live_object_id:
                 self.live_object_id = str(live_id)
                 logger.info(f"[live:{self.account_id}] 拿到 liveObjectId={live_id}(来自 get_live_info),dashboard 抓取启用")
             elif stats and not self.live_object_id and not self._no_liveid_warned:
-                # 在直播但 check_live_status 尚未捕获 liveObjectId -> dashboard 5 字段无法抓,前端显示 "-"/0。
-                # 正常情况 check_live_status 页面加载时即给出;持续不出现才 warn 一次供定位。
                 self._no_liveid_warned = True
                 stats_keys = list(stats.keys()) if isinstance(stats, dict) else type(stats).__name__
                 logger.warning(f"[live:{self.account_id}] 在直播但未取到 liveObjectId"
@@ -174,13 +155,9 @@ class LiveFetcher:
             logger.debug(f"[live:{self.account_id}] get_live_info 解析失败: {e}")
 
     async def _capture_live_status(self, resp):
-        """从 check_live_status 响应取 liveObjectId(场次 ID,供 dashboard API)+ stream_url(.flv 流)。
+        """check_live_status 响应 -> liveObjectId(场次 ID,供 dashboard API) + stream_url(.flv 流)。
 
-        check_live_status 在 liveBuild 页面加载时调用(非周期,约连调 2 次),
-        liveObjectId 一场直播不变,取一次即可;account_manager ~48min reload 会重新触发刷新。
-        get_live_info 不返回 liveObjectId,故 liveObjectId 必须从此接口取。
-        stream_url 优先取 audiencePlayUrl(flv.js 观众视角),兜底 liveStreamUrlInfo.liveCdnUrl
-        (均 // 开头,补 https:);_on_req 拦截 .flv 请求的方式保留为兜底/刷新 token。
+        这是 stream_url 的【主要可靠来源】(实测确认 audiencePlayUrl 为 // 开头的 .flv URL)。
         """
         try:
             txt = await resp.text()
@@ -191,15 +168,49 @@ class LiveFetcher:
                 if not self.live_object_id:
                     logger.info(f"[live:{self.account_id}] 拿到 liveObjectId={live_id}(来自 check_live_status),dashboard 抓取启用")
                 self.live_object_id = str(live_id)
-            # .flv 流 URL:优先 audiencePlayUrl,兜底 liveStreamUrlInfo.liveCdnUrl(均 // 开头 -> 补 https:)
+            # .flv 流 URL: 优先 audiencePlayUrl,兜底 liveStreamUrlInfo.liveCdnUrl(均 // 开头 -> 补 https:)
             flv = d.get("audiencePlayUrl") or ((d.get("liveStreamUrlInfo") or {}).get("liveCdnUrl") or "")
-            if flv and ".flv" in flv:
+            if flv and (".flv" in flv or ".m3u8" in flv):
                 url = flv if flv.startswith("http") else "https:" + flv
                 if url != self.stream_url:
                     self.stream_url = url
-                    logger.info(f"[live:{self.account_id}] 拿到 .flv 流 URL(来自 check_live_status)")
+                    logger.info(f"[live:{self.account_id}] 拿到 .flv 流 URL(来自 check_live_status): {url[:80]}...")
+            else:
+                # 兜底: 在整个响应体里扫 .flv 流 URL(字段名若改版也能兜住)
+                m = re.search(r'https?://[^\s"\'\\<>]*\.flv[^\s"\'\\<>]*', txt)
+                if not m:
+                    m = re.search(r'//[^\s"\'\\<>]*\.flv[^\s"\'\\<>]*', txt)
+                if m:
+                    raw = m.group(0)
+                    url = raw if raw.startswith("http") else "https:" + raw
+                    if url != self.stream_url:
+                        self.stream_url = url
+                        logger.info(f"[live:{self.account_id}] 拿到 .flv 流 URL(响应体扫描兜底): {url[:80]}...")
         except Exception as e:
             logger.debug(f"[live:{self.account_id}] check_live_status 解析失败: {e}")
+
+    # ======================== 关闭清理 ========================
+
+    async def close(self):
+        """关闭前清理: 移除 page 事件回调 + flv 路由 + CDP detach + 断 page 引用。"""
+        try:
+            self.page.remove_listener("response", self._on_resp)
+        except Exception:
+            pass
+        for pat in ("**/*.flv*", "**/*.m3u8*"):
+            try:
+                await self.page.unroute(pat)
+            except Exception:
+                pass
+        if self._cdp:
+            try:
+                await self._cdp.detach()
+            except Exception:
+                pass
+            self._cdp = None
+        self.page = None
+
+    # ======================== 静态工具方法 ========================
 
     @staticmethod
     def _find_live_object_id(obj):
@@ -220,9 +231,7 @@ class LiveFetcher:
 
     @staticmethod
     def _diagnose_id_candidates(obj):
-        """扫描响应找疑似场次 ID 候选,返回紧凑字符串供 warn 日志定位字段名/类型。
-        收集:>=15 位纯数字串、>=10^15 的 int、路径名含 objectid/liveid/finderid 的字段值。
-        阈值比 _find_live_object_id 低(15 位),用于诊断字段名是否变更或 ID 长度不同。"""
+        """扫描响应找疑似场次 ID 候选,返回紧凑字符串供 warn 日志定位字段名/类型。"""
         cands = []
         seen = set()
 
@@ -246,20 +255,23 @@ class LiveFetcher:
         def _try(p, v):
             if isinstance(v, bool):
                 return
-            if isinstance(v, int) and v >= 10**15:
+            if isinstance(v, int) and v >= 10 ** 15:
                 push(p, v)
             elif isinstance(v, str) and v.isdigit() and len(v) >= 15:
                 push(p, v)
             low = p.lower()
             if isinstance(v, (str, int)) and any(t in low for t in
-                    ("objectid", "liveid", "finderid", "liveobj", "live_id", "object_id")):
+                                                  ("objectid", "liveid", "finderid", "liveobj", "live_id",
+                                                   "object_id")):
                 push(p, v)
 
         walk(obj, "")
         return ", ".join(cands[:12]) or "(无)"
 
+    # ======================== Dashboard 主动抓取 ========================
+
     async def _ensure_ids(self):
-        """从 liveBuild page localStorage 读 _aid + _log_finder_id(同源可直读)。"""
+        """从 liveBuild page localStorage 读 _aid + _log_finder_id。"""
         if self._aid and self._log_finder_id:
             return
         try:
@@ -299,8 +311,6 @@ class LiveFetcher:
         return json.loads(txt)
 
     async def _fetch_conv(self):
-        """get_ec_conversion_dashboard_data_v3,返回 data dict(含 overview/conversionAnalysis/
-        trendingSource/portraitAudience)。具体指标提取见 metrics.extract_all。"""
         j = await self._dashboard_post(DASHBOARD_DATA_API, {
             "liveObjectId": self.live_object_id,
             "panelTrendingSourceQueryOption": {
@@ -323,21 +333,20 @@ class LiveFetcher:
 
     @staticmethod
     def _calc_male_ratio(items):
-        """portraitAudience 性别维度(type 3):男 / (男+女+未知) * 100。"""
         counts = {}
         for item in items:
             dims = item.get("dimensions") or []
             if len(dims) != 1 or str(dims[0].get("type")) != "3":
                 continue
             label = dims[0].get("value") or dims[0].get("uxLabel") or ""
-            counts[label] = counts.get(label, 0) + sum(int(x.get("value", 0) or 0) for x in (item.get("data") or []))
+            counts[label] = counts.get(label, 0) + sum(
+                int(x.get("value", 0) or 0) for x in (item.get("data") or []))
         total = sum(counts.values())
         if total > 0:
             return round(counts.get("男性", 0) / total * 100, 2)
         return None
 
     async def _fetch_dist(self):
-        """getLiveDistributionChannel,返回 data dict(含 liveDistChannelSourceStats)。"""
         j = await self._dashboard_post(DISTRIBUTION_CHANNEL_API, {
             "liveObjectId": self.live_object_id, "type": 2,
         })
@@ -346,18 +355,12 @@ class LiveFetcher:
         return j.get("data") or {}
 
     async def _fetch_refund_rate(self):
-        """get_live_ec_data_summary,返回 data dict(含 totalGmv/refundRate/customerPrice 等)。"""
         j = await self._dashboard_post(EC_DATA_SUMMARY_API, {"liveObjectId": self.live_object_id})
         if not j:
             return None
         return j.get("data") or {}
 
     async def fetch_dashboard_data(self):
-        """并发抓三个 dashboard API,用 metrics.extract_all 提取全部指标 -> {metric_key: value}。
-
-        需 live_object_id(从 check_live_status 取,账号需在直播)。失败字段值 None。
-        抓取间隔由 account_manager 读 config.dashboard_interval_sec 控制(默认 60s)。
-        """
         if not self.live_object_id:
             return None
         results = await asyncio.gather(
@@ -377,23 +380,21 @@ class LiveFetcher:
         metrics = extract_all(conv, dist, summary)
         self._dashboard_cache = metrics
         self._dashboard_ts = time.time()
-        # 诊断:全失败 warn 一次(成功后重置,恢复后再失败能再 warn)
         if any(v is not None for v in metrics.values()):
             self._dash_fail_warned = False
         elif not self._dash_fail_warned:
             self._dash_fail_warned = True
             aid_ok = bool(self._aid and self._log_finder_id)
             logger.warning(f"[live:{self.account_id}] dashboard 抓取全失败(liveObjectId={self.live_object_id},"
-                           f"_aid/finder_id={'已取' if aid_ok else '缺失'}),卡片指标将不显示")
+                           f"_aid/finder_id={'已取' if aid_ok else '缺失'})")
         return metrics
 
-    async def goto_live(self):
-        try:
-            await self.page.goto(LIVE_URL, wait_until="domcontentloaded")
-        except Exception as e:
-            logger.warning(f"[live:{self.account_id}] goto liveBuild 失败: {e}")
-
     async def fetch(self):
+        """返回当前抓取结果;附带 stream_url 诊断(供日志排查前端无视频时定位)。"""
+        if not self.stream_url and not self._flv_req_warned:
+            self._flv_req_warned = True
+            logger.warning(f"[live:{self.account_id}] stream_url 仍为空(live_object_id={self.live_object_id},"
+                           f"检查 check_live_status 是否返回 audiencePlayUrl/liveCdnUrl)")
         return {
             "live_stats": self.live_stats,
             "stream_url": self.stream_url,
