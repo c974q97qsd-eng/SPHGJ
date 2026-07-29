@@ -1,20 +1,23 @@
-"""直播大屏抓取: 实测验证方案(2026-07-29 rev6)。
+"""直播大屏抓取: 实测验证方案(2026-07-29 rev9)。
 
 通过诊断脚本实测确认: check_live_status 响应体含 liveObjectId + audiencePlayUrl(.flv 流),
 get_live_info 响应体含 liveStats。本版据此实现,不再依赖猜测的接口字段。
 
 内存安全:
-  旧版 page.route("**/*") 对每个请求(图片/字体/CSS/FLV 分片/轮询)创建 Python 代理对象,
-  长跑直播下 Playwright 不回收(microsoft/playwright#20765),累积到 5-7GB。
-  本版:
-  - CDP Network.setBlockedURLs: 浏览器层阻断图片/字体/CSS/媒体(0 Python 对象)
-  - page.on("response"): 被动捕获 get_live_info / check_live_status 响应体(实测可靠,无泄漏)
-  - page.route("**/*.flv*") / ("**/*.m3u8*"): 仅 flv/m3u8 两条精确路由,捕获 stream_url + abort
-    中止下载(等价原 page.route abort,但非 **/* 海量路由,无累积泄漏)
+  旧版 page.route("**/*") 对每个请求创建 Python 代理对象,Playwright 不回收(microsoft/playwright#20765),
+  累积 5-7GB —— 已通过改为 page.route("**/*.flv*") 精确路由解决(仅 2 条,无累积)。
 
-实测验证(diagnose_live.py, uspoloassn7):
-  - check_live_status 返回 data.audiencePlayUrl = "//pull-m1.wxlivecdn.com/.../orig_..._ns405.flv?..."
-  - 仅用 page.on("response") 即可完整读到,无需 CDP Fetch 域(CDP Fetch 反而干扰响应事件)
+  ⚠️ 重要(rev9 修正): 上一版(rev6~rev8)在 goto_live 用 CDP Network.setBlockedURLs 阻断
+  图片/字体/CSS/媒体,本意是省内存。但实测确认: setBlockedURLs 会阻断 liveBuild 页面
+  初始化所需资源(含 *.css),导致直播大屏 SPA 无法启动,check_live_status / get_live_info
+  永不触发 -> live_object_id / stream_url 永远取不到 -> 误判"非直播"关掉 live_page ->
+  "直播大屏无视频"。故 rev9 撤销 setBlockedURLs。
+  视频流的大流量由 page.route("**/*.flv*") 精确拦截 abort 处理(杜绝浏览器下载整路流),
+  图片/CSS 等小资源不读响应体、不创建代理对象,不会造成 Python 内存泄漏。
+
+实测验证(diag4.py, uspoloassn7, ROUTEONLY 模式):
+  - 仅 page.route("**/*.flv*") + page.on("response"): 稳定拿到 liveObjectId + audiencePlayUrl(.flv)
+  - 加入 setBlockedURLs 后 check_live_status 完全不触发(根因确认)
 """
 import asyncio
 import json
@@ -37,15 +40,10 @@ DASHBOARD_PAGE_URL_ENC = "https%3A%2F%2Fchannels.weixin.qq.com%2Fmicro%2Fstatist
 PUBLIC_CHANNEL_TYPE = 1
 DASHBOARD_INTERVAL = 60  # dashboard 数据抓取间隔(秒);实际由 account_manager 读 config.dashboard_interval_sec 控制
 
-# CDP 浏览器层阻断: 非必要资源(图片/字体/CSS/媒体)。
-# 注意: FLV 直播流【不】在此阻断! setBlockedURLs 会在 requestWillBeSent(即 page.on("request"))
-# 之前就拦掉请求,导致抓不到 FLV URL。FLV 改由 page.route("**/*.flv*") 精确拦截。
-_BLOCKED_URL_PATTERNS = [
-    "*.png", "*.jpg", "*.jpeg", "*.gif", "*.svg", "*.webp", "*.ico", "*.bmp",
-    "*.woff", "*.woff2", "*.ttf", "*.otf", "*.eot",
-    "*.css",
-    "*.mp4", "*.webm", "*.mp3", "*.wav", "*.ogg", "*.m4a",
-]
+# CDP 浏览器层阻断已撤销(rev9): Network.setBlockedURLs 会阻断 liveBuild 页面初始化所需
+# 资源(含 *.css),导致 check_live_status / get_live_info 永不触发,直播大屏拿不到 stream_url。
+# 视频流大流量改由 page.route("**/*.flv*") 精确拦截 abort 处理;图片/CSS 小资源不读响应体、
+# 不创建代理对象,无 Python 内存泄漏。详见文件头 docstring。
 
 
 class LiveFetcher:
@@ -65,33 +63,19 @@ class LiveFetcher:
         self._no_liveid_warned = False   # 在直播但拿不到 liveObjectId 时 warn 一次
         self._dash_fail_warned = False   # dashboard 抓取全失败时 warn 一次(成功后重置)
         self._flv_req_warned = False
-        # CDP session(仅用于浏览器层阻断非必要资源,不取 body,无代理对象)
-        self._cdp = None
 
     async def goto_live(self):
-        """设置 CDP 阻断,注册 page.on 捕获回调 + flv 精确路由,然后导航到 liveBuild 页。"""
-        await self._setup_cdp()
+        """注册 page.on 捕获回调 + flv 精确路由,然后导航到 liveBuild 页。
+
+        注意: 不再调用 CDP Network.setBlockedURLs(rev9 撤销)。该阻断会令 liveBuild SPA
+        无法初始化,导致 check_live_status 永不触发、直播大屏取不到 stream_url。
+        """
         self.page.on("response", self._on_resp)
         await self._install_flv_route()
         try:
             await self.page.goto(LIVE_URL, wait_until="domcontentloaded")
         except Exception as e:
             logger.warning(f"[live:{self.account_id}] goto liveBuild 失败: {e}")
-
-    async def _setup_cdp(self):
-        """CDP: Network.setBlockedURLs 在浏览器层阻断图片/字体/CSS/媒体(0 Python 对象)。
-
-        不启用 Fetch 域——实测确认 Fetch.enable 会干扰 check_live_status 的响应事件,
-        导致 live_object_id 取不到。FLV 用 page.route 精确拦截(见 _install_flv_route)。
-        CDP 不可用时降级: 不阻断(响应量会变大,但 page.on 仍能捕获关键 API)。
-        """
-        try:
-            self._cdp = await self.page.context.new_cdp_session(self.page)
-            await self._cdp.send("Network.enable")
-            await self._cdp.send("Network.setBlockedURLs", {"urls": _BLOCKED_URL_PATTERNS})
-        except Exception as e:
-            logger.warning(f"[live:{self.account_id}] CDP 初始化失败(降级: 不阻断): {e}")
-            self._cdp = None
 
     async def _install_flv_route(self):
         """page.route 精确拦截 flv/m3u8: 捕获 stream_url 后 abort 中止下载。
@@ -192,7 +176,7 @@ class LiveFetcher:
     # ======================== 关闭清理 ========================
 
     async def close(self):
-        """关闭前清理: 移除 page 事件回调 + flv 路由 + CDP detach + 断 page 引用。"""
+        """关闭前清理: 移除 page 事件回调 + flv 路由 + 断 page 引用。"""
         try:
             self.page.remove_listener("response", self._on_resp)
         except Exception:
@@ -202,12 +186,6 @@ class LiveFetcher:
                 await self.page.unroute(pat)
             except Exception:
                 pass
-        if self._cdp:
-            try:
-                await self._cdp.detach()
-            except Exception:
-                pass
-            self._cdp = None
         self.page = None
 
     # ======================== 静态工具方法 ========================
@@ -389,15 +367,19 @@ class LiveFetcher:
                            f"_aid/finder_id={'已取' if aid_ok else '缺失'})")
         return metrics
 
-    async def fetch(self):
-        """返回当前抓取结果;附带 stream_url 诊断(供日志排查前端无视频时定位)。"""
-        if not self.stream_url and not self._flv_req_warned:
-            self._flv_req_warned = True
-            logger.warning(f"[live:{self.account_id}] stream_url 仍为空(live_object_id={self.live_object_id},"
-                           f"检查 check_live_status 是否返回 audiencePlayUrl/liveCdnUrl)")
+    async def snapshot(self):
+        """返回当前抓取结果(无告警,供检测轮询调用)。"""
         return {
             "live_stats": self.live_stats,
             "stream_url": self.stream_url,
             "updated_at": self.updated_at,
             "metrics": self._dashboard_cache or {},
         }
+
+    async def fetch(self):
+        """返回当前抓取结果;附带 stream_url 诊断(供日志排查前端无视频时定位)。"""
+        if not self.stream_url and not self._flv_req_warned:
+            self._flv_req_warned = True
+            logger.warning(f"[live:{self.account_id}] stream_url 仍为空(live_object_id={self.live_object_id},"
+                           f"检查 check_live_status 是否返回 audiencePlayUrl/liveCdnUrl)")
+        return await self.snapshot()

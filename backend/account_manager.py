@@ -81,6 +81,10 @@ class AccountWorker:
         self._browser_refs = 0               # 浏览器引用计数(抓取/手动操作/直播各持有一份)
         self._cycle_offset = 0.0             # 抓取周期错峰偏移(manager 按账号序号分配)
         self._fetch_lock = None              # 全局抓取串行锁(manager 注入,间隔排队)
+        # 手动操作(回复/删除/置顶)延迟回收:操作后保持浏览器,120s 无新操作才回收
+        # 避免连续手动操作反复开/关 Chromium 进程(省启动开销 + 更跟手)
+        self._manual_hold = False            # 手动操作期间保持浏览器(标志,避免重复开)
+        self._manual_release_task = None     # 手动操作后延迟回收计时器
         # 手动启动后的"开播探测窗口":此窗口内高频查直播,尽快捕获"启动后开播"。
         # 仅手动 start_account 触发(用户主动操作,短期开进程可接受);到期未播收回进程,
         # 交回 10 分钟抓取周期兜底。可在 config.live_probe_window_sec 调整(秒)。
@@ -205,30 +209,97 @@ class AccountWorker:
             if self.context is not None:
                 await self._close_context()
 
-    async def _initial_live_check(self):
-        """启动后即时直播检测:开 live_page 查一次,直播则保持(交给 _live_loop 流式),
-        非直播则关页,随后 release_idle_browser 收回评论页进程(空闲不占内存)。"""
+    async def hold_for_manual(self, delay=None):
+        """手动操作(回复/删除/置顶)期间保持浏览器,操作完成后延迟回收省内存。
+
+        - 首次调用:经引用计数开浏览器(只 +1),开进程;
+        - delay 内再次调用(连回复数条):_manual_hold 已置位,不再重复开进程,只续期计时;
+        - 计时到期:释放这一份引用并回收(非直播且无其它引用时关 context)。
+        与抓取/直播的引用计数相互独立(同一把 _browser_lock 串行),互不干扰。
+
+        delay 默认 120s,可经 config.manual_release_delay_sec 调整。
+        """
+        if delay is None:
+            delay = float((self.config or {}).get("manual_release_delay_sec", 120))
+        async with self._browser_lock:
+            if not self._manual_hold:
+                self._browser_refs += 1
+                if self.context is None:
+                    try:
+                        await self._open_context()
+                    except Exception as e:
+                        self._browser_refs = max(0, self._browser_refs - 1)
+                        logger.error(f"[{self.account['id']}] 手动操作开浏览器失败: {e}")
+                        return False
+                self._manual_hold = True
+            # 已 hold:ref 已在首次占住,不重复 +1,仅续期计时
+        # 续期/新建延迟回收计时器(取消旧的,启新的)
+        if self._manual_release_task is not None and not self._manual_release_task.done():
+            self._manual_release_task.cancel()
+        self._manual_release_task = asyncio.create_task(self._delayed_close_manual(delay))
+        return self.logged_in
+
+    async def _delayed_close_manual(self, delay):
+        """延迟回收:到点释放手动持有的那一份引用;非直播且无其它引用时关 context。
+
+        与 hold_for_manual 的 +1 在 _browser_lock 内配对,避免竞态下重复关/漏关。
+        """
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+        async with self._browser_lock:
+            self._manual_hold = False
+            self._browser_refs = max(0, self._browser_refs - 1)
+            if self._browser_refs == 0 and self.live_fetcher is None and self.context is not None:
+                await self._close_context()
+
+    async def _open_and_detect_live(self):
+        """开 live_page 并导航,等待 check_live_status/get_live_info 响应后判定是否直播。
+
+        关键修复: page.on('response') 是【被动】捕获,响应在 page 加载后由页面 JS 异步发出,
+        goto 完成瞬间 check_live_status 尚未返回。若 goto 后只取一次就判定,会因 live_stats
+        仍为空误判"非直播"而立即关掉 live_page —— 这正是"直播大屏视频流消失"的根因
+        (live_page 还没拿到 stream_url 就被关了)。故 goto 后必须【等响应到达】再判定。
+
+        返回 is_live(bool): True 时保留 live_page+live_fetcher 并启动 _live_loop 流式推送;
+        False 时关掉 live_page 释放(后续交由 10 分钟抓取周期 / 开播探测窗口再判定)。
+        """
+        if self.live_fetcher is not None:
+            return True
         try:
             self.live_page = await self.context.new_page()
             self.live_fetcher = LiveFetcher(self.live_page, self.account["id"])
             await self.live_fetcher.goto_live()
             self._live_opened_ts = time.time()
-            info = await self.live_fetcher.fetch()
+            info = await self._wait_for_live_detection(self.live_fetcher, timeout=20.0)
+            # 判定:有 live_stats(近期)即直播;stream_url / live_object_id 强信号也视为直播(视频流必出)
             last_ts = self.live_fetcher.updated_at_ts or 0
-            is_live = bool(info.get("live_stats") and (time.time() - last_ts < 30))
+            fresh = (time.time() - last_ts) < 30
+            is_live = bool(info.get("live_stats") and fresh)
+            if not is_live and (self.live_fetcher.stream_url or self.live_fetcher.live_object_id):
+                is_live = True
+                logger.info(f"[{self.account['id']}] 检测到直播信号(stream_url/live_object_id 已取到),开始流式推送")
             if is_live:
                 self.start_live_loop()
-                logger.info(f"[{self.account['id']}] 启动即检测到直播,开始流式推送")
-            else:
-                try: await self.live_fetcher.close()
-                except Exception: pass
-                try: await self.live_page.close()
-                except Exception: pass
-                self.live_page = None
-                self.live_fetcher = None
-                self._live_closed_ts = time.time()
+                logger.info(f"[{self.account['id']}] 检测到直播,开始流式推送"
+                            f"(live_object_id={self.live_fetcher.live_object_id}, "
+                            f"stream_url={'有' if self.live_fetcher.stream_url else '待取'})")
+                return True
+            # 非直播:关页回收(检测窗口内未拿到任何直播信号)
+            logger.info(f"[{self.account['id']}] 直播检测:当前未在直播"
+                        f"(live_stats={info.get('live_stats') is not None}, "
+                        f"live_object_id={self.live_fetcher.live_object_id})")
+            try: await self.live_fetcher.close()
+            except Exception: pass
+            try: await self.live_page.close()
+            except Exception: pass
+            self.live_page = None
+            self.live_fetcher = None
+            self._live_closed_ts = time.time()
+            return False
         except Exception as e:
-            logger.warning(f"[{self.account['id']}] 启动直播检测失败: {e}")
+            logger.warning(f"[{self.account['id']}] 直播检测失败: {e}")
             if self.live_fetcher:
                 try: await self.live_fetcher.close()
                 except Exception: pass
@@ -238,15 +309,37 @@ class AccountWorker:
             self.live_page = None
             self.live_fetcher = None
             self._live_closed_ts = time.time()
-        finally:
-            # 非直播:收回评论页进程;直播:保持(live_fetcher 存在)
-            await self.release_idle_browser()
+            return False
+
+    async def _wait_for_live_detection(self, lf, timeout=20.0):
+        """goto 之后被动等待 check_live_status/get_live_info 响应到达(最多 timeout 秒)。
+
+        用 snapshot()(不告警)轮询,避免检测阶段误触发"stream_url 为空"告警;
+        一旦取到 live_stats / live_object_id / stream_url 任意一项即认为响应已到,立即返回。
+        """
+        deadline = time.time() + timeout
+        info = None
+        while time.time() < deadline:
+            info = await lf.snapshot()
+            if info.get("live_stats") or lf.live_object_id or lf.stream_url:
+                return info
+            await asyncio.sleep(2)
+        return info or {}
+
+    async def _initial_live_check(self):
+        """启动后即时直播检测:开 live_page 等响应判定;直播则保持并流式推送,
+        非直播则关页,随后 release_idle_browser 收回评论页进程(空闲不占内存)。"""
+        if not self.logged_in or self.context is None:
+            return
+        await self._open_and_detect_live()
+        # 非直播:收回评论页进程;直播:保持(live_fetcher 存在)
+        await self.release_idle_browser()
 
     async def _cycle_live_check(self):
-        """评论抓取周期内顺带直播检测。
+        """评论抓取周期内顺带直播检测(跟随 10 分钟周期)。
 
         - 已在直播(live_fetcher 存在):交给 _live_loop 处理,跳过。
-        - 未在直播:开 live_page 查一次;直播则保持并启动 _live_loop,非直播则关页
+        - 未在直播:开 live_page 等响应判定;直播则保持并启动 _live_loop,非直播则关页
           (随后 release_idle_browser 收回进程)。
         这样非直播账号的直播检测跟随 10 分钟抓取周期,无需常驻浏览器轮询。
         """
@@ -254,36 +347,7 @@ class AccountWorker:
             return
         if self.live_fetcher is not None:
             return
-        try:
-            self.live_page = await self.context.new_page()
-            self.live_fetcher = LiveFetcher(self.live_page, self.account["id"])
-            await self.live_fetcher.goto_live()
-            self._live_opened_ts = time.time()
-            info = await self.live_fetcher.fetch()
-            last_ts = self.live_fetcher.updated_at_ts or 0
-            is_live = bool(info.get("live_stats") and (time.time() - last_ts < 30))
-            if is_live:
-                self.start_live_loop()
-                logger.info(f"[{self.account['id']}] 周期检测到直播,保持 live_page 流式推送")
-            else:
-                try: await self.live_fetcher.close()
-                except Exception: pass
-                try: await self.live_page.close()
-                except Exception: pass
-                self.live_page = None
-                self.live_fetcher = None
-                self._live_closed_ts = time.time()
-        except Exception as e:
-            logger.warning(f"[{self.account['id']}] 周期直播检测失败: {e}")
-            if self.live_fetcher:
-                try: await self.live_fetcher.close()
-                except Exception: pass
-            if self.live_page:
-                try: await self.live_page.close()
-                except Exception: pass
-            self.live_page = None
-            self.live_fetcher = None
-            self._live_closed_ts = time.time()
+        await self._open_and_detect_live()
 
     def start_loop(self):
         if self._loop_task is None or self._loop_task.done():
@@ -567,6 +631,15 @@ class AccountWorker:
                 await self._live_probe_task
             except (asyncio.CancelledError, Exception):
                 pass
+        # 取消手动操作延迟回收计时器,避免 worker 停后它仍试图关 context
+        if self._manual_release_task is not None and not self._manual_release_task.done():
+            self._manual_release_task.cancel()
+            try:
+                await self._manual_release_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._manual_release_task = None
+        self._manual_hold = False
         # P0: 关 context 前先清理 live_fetcher 回调+挂起 task,防泄漏
         if self.live_fetcher:
             try: await self.live_fetcher.close()

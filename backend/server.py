@@ -116,6 +116,7 @@ async def get_config():
         "card_fields": config.get("card_fields") or DEFAULT_CARD_FIELDS,
         "dashboard_interval_sec": config.get("dashboard_interval_sec", 60),
         "live_check_interval_sec": config.get("live_check_interval_sec", 8),
+        "manual_release_delay_sec": config.get("manual_release_delay_sec", 120),
     }
 
 
@@ -141,6 +142,10 @@ async def patch_config(body: schemas.ConfigUpdate):
             w.config = config
     if body.live_check_interval_sec is not None:
         config["live_check_interval_sec"] = body.live_check_interval_sec
+        for w in manager.workers.values():
+            w.config = config
+    if body.manual_release_delay_sec is not None:
+        config["manual_release_delay_sec"] = body.manual_release_delay_sec
         for w in manager.workers.values():
             w.config = config
     save_config(config)
@@ -320,16 +325,28 @@ async def get_comments(
 
 @app.post("/api/comments/batch-delete")
 async def batch_delete_comments(body: schemas.BatchDeleteBody):
-    """批量删除评论:按 account_id 取 worker 串行删,逐条广播 comment_deleted。"""
+    """批量删除评论:按 account_id 取 worker 串行删,逐条广播 comment_deleted。
+
+    手动操作经 hold_for_manual 保持浏览器:整批期间只开一次进程,完成后延迟回收
+    (120s 无新操作才关),连续删除不反复开/关 Chromium。
+    """
     deleted = 0
     failed: list[dict] = []
+    held: dict = {}  # worker -> 本次 hold 是否成功(开浏览器失败则整批跳过该 worker)
     for item in body.items:
         w = manager.get_worker(item.account_id)
         if not w or not w.logged_in:
             failed.append({"comment_id": item.comment_id, "error": "账号未启动或未登录"})
             continue
-        # 浏览器可能已被回收(空闲省内存),按需重新打开;操作完释放(非直播则收回)
-        await w.ensure_browser()
+        if w in held and not held[w]:
+            failed.append({"comment_id": item.comment_id, "error": "开浏览器失败,请检查登录状态"})
+            continue
+        # 首次:开浏览器+计时;同一 worker 后续条目:仅续期(不重复开进程)
+        ok = await w.hold_for_manual()
+        held[w] = ok
+        if not ok:
+            failed.append({"comment_id": item.comment_id, "error": "开浏览器失败,请检查登录状态"})
+            continue
         try:
             resp = await w.api.delete_comment(item.export_id, item.comment_id)
             if not resp or resp.get("__err"):
@@ -340,8 +357,7 @@ async def batch_delete_comments(body: schemas.BatchDeleteBody):
             deleted += 1
         except Exception as e:
             failed.append({"comment_id": item.comment_id, "error": str(e)})
-        finally:
-            await w.release_idle_browser()
+    # 回收由各 worker 的延迟计时器统一处理(120s 无新操作才回收),无需在此逐一释放
     return {"ok": True, "deleted": deleted, "failed": failed}
 
 
@@ -350,16 +366,15 @@ async def reply_comment(comment_id: str, body: schemas.ManualReply):
     w = manager.get_worker(body.account_id)
     if not w or not w.logged_in:
         raise HTTPException(400, "账号未启动或未登录")
-    # 浏览器可能已被回收,按需重新打开;操作完释放(非直播则收回)
-    await w.ensure_browser()
-    try:
-        resp = await w.api.reply_comment(comment_id, body.content)
-        if not resp or resp.get("__err"):
-            raise HTTPException(502, f"回复失败: {resp}")
-        storage.mark_replied(comment_id)
-        await hub.emit("comment_replied", {"comment_id": comment_id, "account_id": body.account_id})
-    finally:
-        await w.release_idle_browser()
+    # 手动回复:保持浏览器,操作完成后延迟回收(连续回复只开一次进程)
+    ok = await w.hold_for_manual()
+    if not ok:
+        raise HTTPException(400, "开浏览器失败,请检查登录状态")
+    resp = await w.api.reply_comment(comment_id, body.content)
+    if not resp or resp.get("__err"):
+        raise HTTPException(502, f"回复失败: {resp}")
+    storage.mark_replied(comment_id)
+    await hub.emit("comment_replied", {"comment_id": comment_id, "account_id": body.account_id})
     return {"ok": True}
 
 
@@ -368,16 +383,15 @@ async def delete_comment(comment_id: str, body: schemas.DeleteCommentBody):
     w = manager.get_worker(body.account_id)
     if not w or not w.logged_in:
         raise HTTPException(400, "账号未启动或未登录")
-    # 浏览器可能已被回收,按需重新打开;操作完释放(非直播则收回)
-    await w.ensure_browser()
-    try:
-        resp = await w.api.delete_comment(body.export_id, comment_id)
-        if not resp or resp.get("__err"):
-            raise HTTPException(502, f"删除失败: {resp}")
-        storage.delete_comment(comment_id)
-        await hub.emit("comment_deleted", {"comment_id": comment_id})
-    finally:
-        await w.release_idle_browser()
+    # 手动删除:保持浏览器,操作完成后延迟回收
+    ok = await w.hold_for_manual()
+    if not ok:
+        raise HTTPException(400, "开浏览器失败,请检查登录状态")
+    resp = await w.api.delete_comment(body.export_id, comment_id)
+    if not resp or resp.get("__err"):
+        raise HTTPException(502, f"删除失败: {resp}")
+    storage.delete_comment(comment_id)
+    await hub.emit("comment_deleted", {"comment_id": comment_id})
     return {"ok": True}
 
 
@@ -386,14 +400,13 @@ async def pin_comment(comment_id: str, body: schemas.PinCommentBody):
     w = manager.get_worker(body.account_id)
     if not w or not w.logged_in:
         raise HTTPException(400, "账号未启动或未登录")
-    # 浏览器可能已被回收,按需重新打开;操作完释放(非直播则收回)
-    await w.ensure_browser()
-    try:
-        resp = await w.api.pin_comment(body.export_id, comment_id, body.op_type)
-        if not resp or resp.get("__err"):
-            raise HTTPException(502, f"置顶失败: {resp}")
-    finally:
-        await w.release_idle_browser()
+    # 手动置顶:保持浏览器,操作完成后延迟回收
+    ok = await w.hold_for_manual()
+    if not ok:
+        raise HTTPException(400, "开浏览器失败,请检查登录状态")
+    resp = await w.api.pin_comment(body.export_id, comment_id, body.op_type)
+    if not resp or resp.get("__err"):
+        raise HTTPException(502, f"置顶失败: {resp}")
     return {"ok": True}
 
 
