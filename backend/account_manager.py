@@ -73,8 +73,17 @@ class AccountWorker:
         self.new_count = 0
         self._new_count_date = None  # 当日新增计数日期(跨天重置 new_count)
         self._last_comment_reload = 0.0  # C: 评论页上次 reload 时间(每 2h reload 释放 JS 堆)
+        # —— 按需浏览器生命周期(省内存) ——
+        self._pw = None                      # playwright 实例(start 时注入)
+        self._headless = True
+        self._browser_lock = asyncio.Lock()  # 本账号浏览器引用计数锁
+        self._browser_refs = 0               # 浏览器引用计数(抓取/手动操作/直播各持有一份)
+        self._cycle_offset = 0.0             # 抓取周期错峰偏移(manager 按账号序号分配)
+        self._fetch_lock = None              # 全局抓取串行锁(manager 注入,间隔排队)
 
     async def start(self, playwright, headless=True):
+        self._pw = playwright
+        self._headless = headless
         os.makedirs(self.account["profile_dir"], exist_ok=True)
         # 恢复各窗口采样状态(重启 exe 后增值仍有效)
         try:
@@ -90,18 +99,41 @@ class AccountWorker:
                 self._gmv_30m = w30["delta_g"] or 0
         except Exception as e:
             logger.warning(f"[{self.account['id']}] 加载直播窗口状态失败: {e}")
-        self.context = await launch_stealth(playwright, self.account["profile_dir"], headless=headless)
+        # 自动回复/评论/删除/抓取器:先建(内部持有 api 引用),开浏览器后统一重绑
+        self.auto_reply = AutoReply(None, self.storage, self.account["id"],
+                                    self.config.get("auto_reply") or {})
+        self.auto_commenter = AutoCommenter(None, self.storage, self.account)
+        self.auto_delete = AutoDelete(None, self.storage, self.account["id"],
+                                      self.config.get("auto_delete") or {})
+        self.fetcher = CommentFetcher(None, self.storage, self.account["id"],
+                                      self.auto_reply, self.auto_commenter, self.auto_delete)
+        # 按需开浏览器(懒加载):不长期常驻 Chromium 进程——抓取/直播/手动操作时才开,
+        # 空闲(非直播)即收回省内存。失败(如 profile 锁被占用)由调用方处理。
+        try:
+            await self._open_context()
+        except Exception as e:
+            logger.error(f"[{self.account['id']}] 启动开浏览器失败: {e}")
+        self._running = True
+        # 启动后做一次直播检测(仅检测:直播则保持,非直播则收回进程)
+        if self.logged_in:
+            await self._initial_live_check()
+
+    # ======================== 按需浏览器生命周期(省内存) ========================
+
+    async def _open_context(self):
+        """懒加载开 Chromium:建 context+评论页,登录校验,建/重绑 API 客户端。幂等。"""
+        if self.context is not None:
+            return
+        self.context = await launch_stealth(self._pw, self.account["profile_dir"], headless=self._headless)
         self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
         await self.page.goto(COMMENT_URL, wait_until="domcontentloaded")
         await self.page.wait_for_timeout(3000)
-        if "interaction/comment" in (self.page.url or ""):
-            self.logged_in = True
+        self.logged_in = "interaction/comment" in (self.page.url or "")
+        if self.logged_in:
             logger.info(f"[{self.account['id']}] 已登录")
         else:
-            self.logged_in = False
             logger.warning(f"[{self.account['id']}] 未登录(当前:{self.page.url}),请重新扫码")
-        # _aid 每次登录会变,实时从 profile localStorage 读当前会话 _aid/_log_finder_id,
-        # 覆盖 config 旧值(API 调用须用当前会话 _aid)。读失败回退 config 值。
+        # _aid 每次登录会变,实时从 profile localStorage 读当前会话 _aid/_log_finder_id
         try:
             ls = await self.page.evaluate("""() => {
                 const aid = localStorage.getItem('__ml::aid') || localStorage.getItem('__rx::aid') || '';
@@ -117,83 +149,205 @@ class AccountWorker:
         except Exception as e:
             logger.debug(f"[{self.account['id']}] 读 localStorage _aid 失败,用 config 旧值: {e}")
         self.api = WxApiClient(self.page, self.account, self.config, self.storage)
-        # 抓登录微信名(调 auth/auth_data API,卡片显示用)
+        # 重绑:自动回复/评论/删除/抓取器都持有 api 引用,重开浏览器后统一指向新客户端
+        if self.auto_reply is not None: self.auto_reply.api = self.api
+        if self.auto_commenter is not None: self.auto_commenter.api = self.api
+        if self.auto_delete is not None: self.auto_delete.api = self.api
+        if self.fetcher is not None: self.fetcher.api = self.api
         try:
             wxn = await self.api.fetch_wx_name()
             if wxn:
                 self.account["_wx_name"] = wxn
-            logger.info(f"[{self.account['id']}] 登录微信: {wxn!r}")
         except Exception as e:
             logger.warning(f"[{self.account['id']}] 取登录微信名失败: {e}")
-        self.auto_reply = AutoReply(self.api, self.storage, self.account["id"],
-                                    self.config.get("auto_reply") or {})
-        self.auto_commenter = AutoCommenter(self.api, self.storage, self.account)
-        self.auto_delete = AutoDelete(self.api, self.storage, self.account["id"],
-                                      self.config.get("auto_delete") or {})
-        self.fetcher = CommentFetcher(self.api, self.storage, self.account["id"],
-                                      self.auto_reply, self.auto_commenter, self.auto_delete)
-        # 直播大屏:登录后开 liveBuild page
-        if self.logged_in:
-            try:
-                self.live_page = await self.context.new_page()
-                self.live_fetcher = LiveFetcher(self.live_page, self.account["id"])
-                await self.live_fetcher.goto_live()
-                self._live_opened_ts = time.time()
-            except Exception as e:
-                logger.warning(f"[{self.account['id']}] 直播页启动失败: {e}")
-        self._running = True
+
+    async def _close_context(self):
+        """关 context 收回 Chromium 进程(兜底 kill 残留 chrome)。清所有页面引用。"""
+        ctx = self.context
+        lf = self.live_fetcher
+        self.context = None
+        self.page = None
+        self.live_page = None
+        self.live_fetcher = None
+        if lf:
+            try: await lf.close()
+            except Exception: pass
+        if ctx:
+            await close_context_safely(ctx, self.account.get("profile_dir"), f"[{self.account['id']}] 收回进程")
+            logger.info(f"[{self.account['id']}] 收回浏览器进程(省内存)")
+
+    async def ensure_browser(self):
+        """获取一次浏览器引用(引用计数)。返回 context 是否可用/已登录。"""
+        async with self._browser_lock:
+            self._browser_refs += 1
+            if self.context is None:
+                try:
+                    await self._open_context()
+                except Exception as e:
+                    self._browser_refs = max(0, self._browser_refs - 1)
+                    logger.error(f"[{self.account['id']}] 开浏览器失败: {e}")
+                    return False
+            return self.logged_in
+
+    async def release_idle_browser(self):
+        """释放一次浏览器引用;引用归零且非直播时关 context 收回进程。"""
+        async with self._browser_lock:
+            self._browser_refs = max(0, self._browser_refs - 1)
+            if self._browser_refs > 0:
+                return
+            if self.live_fetcher is not None:
+                return  # 直播中保持常开
+            if self.context is not None:
+                await self._close_context()
+
+    async def _initial_live_check(self):
+        """启动后即时直播检测:开 live_page 查一次,直播则保持(交给 _live_loop 流式),
+        非直播则关页,随后 release_idle_browser 收回评论页进程(空闲不占内存)。"""
+        try:
+            self.live_page = await self.context.new_page()
+            self.live_fetcher = LiveFetcher(self.live_page, self.account["id"])
+            await self.live_fetcher.goto_live()
+            self._live_opened_ts = time.time()
+            info = await self.live_fetcher.fetch()
+            last_ts = self.live_fetcher.updated_at_ts or 0
+            is_live = bool(info.get("live_stats") and (time.time() - last_ts < 30))
+            if is_live:
+                self.start_live_loop()
+                logger.info(f"[{self.account['id']}] 启动即检测到直播,开始流式推送")
+            else:
+                try: await self.live_fetcher.close()
+                except Exception: pass
+                try: await self.live_page.close()
+                except Exception: pass
+                self.live_page = None
+                self.live_fetcher = None
+                self._live_closed_ts = time.time()
+        except Exception as e:
+            logger.warning(f"[{self.account['id']}] 启动直播检测失败: {e}")
+            if self.live_fetcher:
+                try: await self.live_fetcher.close()
+                except Exception: pass
+            if self.live_page:
+                try: await self.live_page.close()
+                except Exception: pass
+            self.live_page = None
+            self.live_fetcher = None
+            self._live_closed_ts = time.time()
+        finally:
+            # 非直播:收回评论页进程;直播:保持(live_fetcher 存在)
+            await self.release_idle_browser()
+
+    async def _cycle_live_check(self):
+        """评论抓取周期内顺带直播检测。
+
+        - 已在直播(live_fetcher 存在):交给 _live_loop 处理,跳过。
+        - 未在直播:开 live_page 查一次;直播则保持并启动 _live_loop,非直播则关页
+          (随后 release_idle_browser 收回进程)。
+        这样非直播账号的直播检测跟随 10 分钟抓取周期,无需常驻浏览器轮询。
+        """
+        if not self.logged_in:
+            return
+        if self.live_fetcher is not None:
+            return
+        try:
+            self.live_page = await self.context.new_page()
+            self.live_fetcher = LiveFetcher(self.live_page, self.account["id"])
+            await self.live_fetcher.goto_live()
+            self._live_opened_ts = time.time()
+            info = await self.live_fetcher.fetch()
+            last_ts = self.live_fetcher.updated_at_ts or 0
+            is_live = bool(info.get("live_stats") and (time.time() - last_ts < 30))
+            if is_live:
+                self.start_live_loop()
+                logger.info(f"[{self.account['id']}] 周期检测到直播,保持 live_page 流式推送")
+            else:
+                try: await self.live_fetcher.close()
+                except Exception: pass
+                try: await self.live_page.close()
+                except Exception: pass
+                self.live_page = None
+                self.live_fetcher = None
+                self._live_closed_ts = time.time()
+        except Exception as e:
+            logger.warning(f"[{self.account['id']}] 周期直播检测失败: {e}")
+            if self.live_fetcher:
+                try: await self.live_fetcher.close()
+                except Exception: pass
+            if self.live_page:
+                try: await self.live_page.close()
+                except Exception: pass
+            self.live_page = None
+            self.live_fetcher = None
+            self._live_closed_ts = time.time()
 
     def start_loop(self):
         if self._loop_task is None or self._loop_task.done():
             self._loop_task = asyncio.create_task(self._fetch_loop())
 
     async def _fetch_loop(self):
+        """评论抓取循环(按需开/关浏览器以省内存)。
+
+        - 每 fetch_interval_sec(默认 600s = 10 分钟)抓一次;多账号经 _cycle_offset 错峰
+          + 全局 _fetch_lock 串行,形成"间隔排队":任意时刻最多 1 个账号在抓,
+          浏览器不并发常驻。
+        - 抓取用 ensure_browser 开浏览器,结束 release_idle_browser 收回(非直播账号
+          抓完即关 Chromium 进程,空闲时不占内存)。
+        """
         interval = self.config.get("fetch_interval_sec", 600)
         rc = (self.config.get("risk_control") or {})
         night_hours = rc.get("night_hours", [0, 6])
         night_mult = rc.get("night_interval_multiplier", 3)
-        # 错峰:首次随机延迟,避免多账号同时抓取被风控关联
-        await asyncio.sleep(random.uniform(0, min(interval, 60)))
+        # 错峰:首个账号 offset 由 manager 分配(均匀错开 0~interval),避免同时拉起浏览器
+        await asyncio.sleep(self._cycle_offset)
         while self._running:
-            if self.logged_in and self.fetcher:
-                try:
-                    scanned, new_c, new_comments, deleted_ids = await self.fetcher.fetch_all()
-                    self.last_scan_at = datetime.now().isoformat()
-                    if new_c:
-                        today = datetime.now().strftime("%Y-%m-%d")
-                        if self._new_count_date != today:
-                            self._new_count_date = today
-                            self.new_count = 0
-                        self.new_count += new_c
-                    logger.info(f"[{self.account['id']}] 扫描{scanned}视频 新增{new_c}评论")
-                    if new_comments:
-                        await self._emit("comments_update",
-                                         {"account_id": self.account["id"], "comments": new_comments})
-                    for cid in deleted_ids:
-                        await self._emit("comment_deleted", {"comment_id": cid})
-                except Exception as e:
-                    logger.error(f"[{self.account['id']}] 抓取异常: {e}")
-            # C: 评论页定期 reload 释放 JS 堆(评论页 SPA 常驻供 api_client 调用,长跑累积)。
-            # 选在抓取后、sleep 前(此时 api_client 空闲,reload 不影响抓取;手动回复/删除低频,几秒 reload 可接受)。
-            now = time.time()
-            if self._last_comment_reload == 0.0:
-                self._last_comment_reload = now
-            elif now - self._last_comment_reload >= 7200 and self.page:
-                try:
-                    await self.page.reload(wait_until="domcontentloaded")
-                    self._last_comment_reload = now
-                    logger.info(f"[{self.account['id']}] 评论页定期 reload(释放 JS 堆)")
-                except Exception as e:
-                    logger.debug(f"[{self.account['id']}] 评论页 reload 失败: {e}")
-            # 夜间降频(0~6 点间隔拉长)+ 随机抖动,避免固定周期
+            # 串行抓取:全局队列锁,保证多账号不同时拉起浏览器(省内存 + 防风控关联)
+            if self._fetch_lock is not None:
+                await self._fetch_lock.acquire()
+            try:
+                ok = await self.ensure_browser()
+                if not ok:
+                    logger.warning(f"[{self.account['id']}] 抓取前开浏览器失败(未登录),跳过本轮")
+                    await asyncio.sleep(min(interval, 60))
+                    continue
+                if self.logged_in and self.fetcher:
+                    try:
+                        scanned, new_c, new_comments, deleted_ids = await self.fetcher.fetch_all()
+                        self.last_scan_at = datetime.now().isoformat()
+                        if new_c:
+                            today = datetime.now().strftime("%Y-%m-%d")
+                            if self._new_count_date != today:
+                                self._new_count_date = today
+                                self.new_count = 0
+                            self.new_count += new_c
+                        logger.info(f"[{self.account['id']}] 扫描{scanned}视频 新增{new_c}评论")
+                        if new_comments:
+                            await self._emit("comments_update",
+                                             {"account_id": self.account["id"], "comments": new_comments})
+                        for cid in deleted_ids:
+                            await self._emit("comment_deleted", {"comment_id": cid})
+                    except Exception as e:
+                        logger.error(f"[{self.account['id']}] 抓取异常: {e}")
+                # 周期内顺带检测直播(非直播则收回进程)
+                await self._cycle_live_check()
+            finally:
+                if self._fetch_lock is not None:
+                    try: self._fetch_lock.release()
+                    except Exception: pass
+                # 无动作(非直播/无手动操作)则收回浏览器进程省内存
+                await self.release_idle_browser()
+            # 夜间降频(0~6 点间隔拉长)+ 抖动
             cur = interval
             if _in_night_hours(night_hours):
                 cur = int(interval * night_mult)
             await asyncio.sleep(cur + random.uniform(0, min(cur, 30)))
 
     async def fetch_once(self):
-        if self.logged_in and self.fetcher:
-            return await self.fetcher.fetch_all()
+        ok = await self.ensure_browser()
+        try:
+            if ok and self.logged_in and self.fetcher:
+                return await self.fetcher.fetch_all()
+        finally:
+            await self.release_idle_browser()
         return 0, 0, [], []
 
     def start_live_loop(self):
@@ -204,33 +358,13 @@ class AccountWorker:
         while self._running:
             interval = self.config.get("live_check_interval_sec", 8)
             dash_interval = self.config.get("dashboard_interval_sec", 60)
+            # 非直播:本循环不持有浏览器,交由 _cycle_live_check(跟随评论抓取周期,每
+            # fetch_interval_sec 一次)检测开播。轻量睡眠避免空转占 CPU。
+            if self.live_fetcher is None:
+                await asyncio.sleep(interval * 3)
+                continue
             if self.logged_in and self.context:
                 now = time.time()
-                # P0-1: live_page 按需开关——None 且距上次关 > 5 分钟,重开检测直播(省内存)
-                if self.live_fetcher is None:
-                    if now - self._live_closed_ts > 600:
-                        try:
-                            self.live_page = await self.context.new_page()
-                            self.live_fetcher = LiveFetcher(self.live_page, self.account["id"])
-                            await self.live_fetcher.goto_live()
-                            self._live_opened_ts = now
-                            logger.info(f"[{self.account['id']}] 重开 live_page 检测直播")
-                        except Exception as e:
-                            logger.warning(f"[{self.account['id']}] 重开 live_page 失败: {e}")
-                            # P0: 刚创建的 LiveFetcher 已注册回调,关 page 前先 close 清理
-                            if self.live_fetcher:
-                                try: await self.live_fetcher.close()
-                                except Exception: pass
-                                self.live_fetcher = None
-                            if self.live_page:
-                                try: await self.live_page.close()
-                                except Exception: pass
-                                self.live_page = None
-                            self._live_closed_ts = now
-                    if self.live_fetcher is None:
-                        # P3: 非直播空转,降频减少无谓 live_loop 循环
-                        await asyncio.sleep(interval * 2)
-                        continue
                 # 每 ~48 分钟 close+重建 live_page(替代 reload):reload 不退出 Chromium renderer,
                 # 直播期间 FLV 流涨到的峰值内存不归还 OS;close page 触发 renderer 退出归还内存,
                 # 新 page 起新 renderer 重新加载,长跑内存增长比 reload 彻底。
@@ -322,6 +456,8 @@ class AccountWorker:
                             self.live_fetcher = None
                             self._live_closed_ts = now
                             logger.info(f"[{self.account['id']}] 非直播,关闭 live_page 省内存(idle={int(idle)}s)")
+                            # 收回评论页进程(非直播且无其它引用时)
+                            await self.release_idle_browser()
                             await asyncio.sleep(interval)
                             continue
                     # dashboardV4 指标,按 config.dashboard_interval_sec 抓(需 live_object_id,账号在直播)
@@ -410,6 +546,7 @@ class AccountManager:
         self.login_sessions = {}   # sid -> LoginSession
         self._playwright = None
         self._running = False
+        self._fetch_lock = None          # 评论抓取全局串行锁(间隔排队)
         self._relogin_queue = []         # 待自动 relogin 的 account_id
         self._relogin_active_acc = None  # 当前正在 auto-relogin 的 account_id
         self._relogin_active_sid = None
@@ -467,6 +604,12 @@ class AccountManager:
     async def start(self, headless=True):
         await self._ensure_playwright()
         self._running = True
+        # 评论抓取全局串行锁:多账号经此锁 + _cycle_offset 错峰,形成"间隔排队",
+        # 任意时刻最多 1 个账号在抓,浏览器不并发常驻(省内存)。
+        self._fetch_lock = asyncio.Lock()
+        interval = self.config.get("fetch_interval_sec", 600)
+        total = max(1, len(self.config.get("accounts", [])))
+        live_idx = 0
         expired = []
         for acc in self.config.get("accounts", []):
             try:
@@ -477,6 +620,12 @@ class AccountManager:
                     await w.stop()
                     self.workers.pop(acc["id"], None)
                     expired.append(acc["id"])
+                    continue
+                if w and w.logged_in:
+                    # 间隔排队:在 fetch_interval_sec 窗口内按账号序号均匀错峰
+                    w._fetch_lock = self._fetch_lock
+                    w._cycle_offset = live_idx * interval / total
+                    live_idx += 1
             except Exception as e:
                 logger.error(f"账号 {acc.get('id')} 启动失败: {e}")
         for w in self.workers.values():
@@ -517,7 +666,14 @@ class AccountManager:
         await self._ensure_playwright()
         if account_id in self.workers:
             return self.workers[account_id]
+        if self._fetch_lock is None:
+            self._fetch_lock = asyncio.Lock()
         w = AccountWorker(acc, self.storage, self.config, self._emit)
+        # 按账号在配置中的序号分配错峰偏移,与既有 worker 错开抓取节奏
+        idx = next((i for i, a in enumerate(self.config.get("accounts", [])) if a["id"] == account_id), 0)
+        total = max(1, len(self.config.get("accounts", [])))
+        w._fetch_lock = self._fetch_lock
+        w._cycle_offset = idx * self.config.get("fetch_interval_sec", 600) / total
         await w.start(self._playwright, headless=True)
         if w.logged_in:
             w.start_loop()

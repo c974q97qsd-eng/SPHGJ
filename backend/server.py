@@ -328,6 +328,8 @@ async def batch_delete_comments(body: schemas.BatchDeleteBody):
         if not w or not w.logged_in:
             failed.append({"comment_id": item.comment_id, "error": "账号未启动或未登录"})
             continue
+        # 浏览器可能已被回收(空闲省内存),按需重新打开;操作完释放(非直播则收回)
+        await w.ensure_browser()
         try:
             resp = await w.api.delete_comment(item.export_id, item.comment_id)
             if not resp or resp.get("__err"):
@@ -338,6 +340,8 @@ async def batch_delete_comments(body: schemas.BatchDeleteBody):
             deleted += 1
         except Exception as e:
             failed.append({"comment_id": item.comment_id, "error": str(e)})
+        finally:
+            await w.release_idle_browser()
     return {"ok": True, "deleted": deleted, "failed": failed}
 
 
@@ -346,11 +350,16 @@ async def reply_comment(comment_id: str, body: schemas.ManualReply):
     w = manager.get_worker(body.account_id)
     if not w or not w.logged_in:
         raise HTTPException(400, "账号未启动或未登录")
-    resp = await w.api.reply_comment(comment_id, body.content)
-    if not resp or resp.get("__err"):
-        raise HTTPException(502, f"回复失败: {resp}")
-    storage.mark_replied(comment_id)
-    await hub.emit("comment_replied", {"comment_id": comment_id, "account_id": body.account_id})
+    # 浏览器可能已被回收,按需重新打开;操作完释放(非直播则收回)
+    await w.ensure_browser()
+    try:
+        resp = await w.api.reply_comment(comment_id, body.content)
+        if not resp or resp.get("__err"):
+            raise HTTPException(502, f"回复失败: {resp}")
+        storage.mark_replied(comment_id)
+        await hub.emit("comment_replied", {"comment_id": comment_id, "account_id": body.account_id})
+    finally:
+        await w.release_idle_browser()
     return {"ok": True}
 
 
@@ -359,11 +368,16 @@ async def delete_comment(comment_id: str, body: schemas.DeleteCommentBody):
     w = manager.get_worker(body.account_id)
     if not w or not w.logged_in:
         raise HTTPException(400, "账号未启动或未登录")
-    resp = await w.api.delete_comment(body.export_id, comment_id)
-    if not resp or resp.get("__err"):
-        raise HTTPException(502, f"删除失败: {resp}")
-    storage.delete_comment(comment_id)
-    await hub.emit("comment_deleted", {"comment_id": comment_id})
+    # 浏览器可能已被回收,按需重新打开;操作完释放(非直播则收回)
+    await w.ensure_browser()
+    try:
+        resp = await w.api.delete_comment(body.export_id, comment_id)
+        if not resp or resp.get("__err"):
+            raise HTTPException(502, f"删除失败: {resp}")
+        storage.delete_comment(comment_id)
+        await hub.emit("comment_deleted", {"comment_id": comment_id})
+    finally:
+        await w.release_idle_browser()
     return {"ok": True}
 
 
@@ -372,9 +386,14 @@ async def pin_comment(comment_id: str, body: schemas.PinCommentBody):
     w = manager.get_worker(body.account_id)
     if not w or not w.logged_in:
         raise HTTPException(400, "账号未启动或未登录")
-    resp = await w.api.pin_comment(body.export_id, comment_id, body.op_type)
-    if not resp or resp.get("__err"):
-        raise HTTPException(502, f"置顶失败: {resp}")
+    # 浏览器可能已被回收,按需重新打开;操作完释放(非直播则收回)
+    await w.ensure_browser()
+    try:
+        resp = await w.api.pin_comment(body.export_id, comment_id, body.op_type)
+        if not resp or resp.get("__err"):
+            raise HTTPException(502, f"置顶失败: {resp}")
+    finally:
+        await w.release_idle_browser()
     return {"ok": True}
 
 
