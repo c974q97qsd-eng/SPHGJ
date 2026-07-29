@@ -111,18 +111,28 @@ export interface AppConfig {
   live_check_interval_sec: number
 }
 
+/** 默认请求超时(毫秒)。后端若 10s 不响应则 abort,避免 fetch 永久 pending 导致页面卡死。 */
+const FETCH_TIMEOUT_MS = 10_000
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
-  const r = await fetch(`/api${path}`, {
-    headers: { "Content-Type": "application/json" },
-    ...init,
-  })
-  if (!r.ok) {
-    let msg = `${r.status}`
-    try { msg += " " + (JSON.stringify(await r.json())) } catch { /* ignore */ }
-    throw new Error(msg)
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS)
+  try {
+    const r = await fetch(`/api${path}`, {
+      headers: { "Content-Type": "application/json" },
+      ...init,
+      signal: controller.signal,
+    })
+    if (!r.ok) {
+      let msg = `${r.status}`
+      try { msg += " " + (JSON.stringify(await r.json())) } catch { /* ignore */ }
+      throw new Error(msg)
+    }
+    if (r.status === 204) return undefined as T
+    return (await r.json()) as T
+  } finally {
+    clearTimeout(timer)
   }
-  if (r.status === 204) return undefined as T
-  return (await r.json()) as T
 }
 
 export const api = {

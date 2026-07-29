@@ -8,8 +8,11 @@ export function useAccounts() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const timer = useRef<ReturnType<typeof setInterval>>()
+  const refreshing = useRef(false)  // 并发保护:上一次 refresh 未完成时跳过
 
   const refresh = useCallback(async () => {
+    if (refreshing.current) return  // 防止请求堆积
+    refreshing.current = true
     try {
       const s = await api.getAccounts()
       setStatus(s)
@@ -18,6 +21,7 @@ export function useAccounts() {
       setError((e as Error).message)
     } finally {
       setLoading(false)
+      refreshing.current = false
     }
   }, [])
 
