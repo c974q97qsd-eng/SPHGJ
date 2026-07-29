@@ -52,6 +52,7 @@ class AccountWorker:
         self.live_page = None
         self.live_fetcher = None
         self._live_loop_task = None
+        self._live_probe_task = None     # 手动启动后短期开播探测任务
         self._live_opened_ts = 0.0   # live_page 开启时间(P0-1 按需开关)
         self._live_closed_ts = 0.0   # live_page 关闭时间
         self.live_info = None
@@ -80,6 +81,10 @@ class AccountWorker:
         self._browser_refs = 0               # 浏览器引用计数(抓取/手动操作/直播各持有一份)
         self._cycle_offset = 0.0             # 抓取周期错峰偏移(manager 按账号序号分配)
         self._fetch_lock = None              # 全局抓取串行锁(manager 注入,间隔排队)
+        # 手动启动后的"开播探测窗口":此窗口内高频查直播,尽快捕获"启动后开播"。
+        # 仅手动 start_account 触发(用户主动操作,短期开进程可接受);到期未播收回进程,
+        # 交回 10 分钟抓取周期兜底。可在 config.live_probe_window_sec 调整(秒)。
+        self._probe_window = float((self.config or {}).get("live_probe_window_sec", 180))
 
     async def start(self, playwright, headless=True):
         self._pw = playwright
@@ -354,6 +359,43 @@ class AccountWorker:
         if self._live_loop_task is None or self._live_loop_task.done():
             self._live_loop_task = asyncio.create_task(self._live_loop())
 
+    def start_live_probe(self):
+        """手动启动后短期开播探测:高频查直播,尽快捕获"启动后开播"。
+
+        仅手动 start_account 调用(用户主动操作,短期开进程可接受)。复用 _cycle_live_check
+        (已有的直播检测逻辑),窗口内每 ~24s 查一次,检测到直播则转 _live_loop 流式;
+        窗口结束仍未播则收回进程,交回 10 分钟抓取周期兜底。
+        """
+        if self._live_probe_task is None or self._live_probe_task.done():
+            self._live_probe_task = asyncio.create_task(self._live_probe_loop())
+
+    async def _live_probe_loop(self):
+        probe_until = time.time() + self._probe_window
+        interval = self.config.get("live_check_interval_sec", 8)
+        ok = await self.ensure_browser()
+        if not ok:
+            return
+        try:
+            while self._running and time.time() < probe_until:
+                if self.logged_in:
+                    # 借用全局抓取锁,避免与 10 分钟抓取并发拉起浏览器
+                    if self._fetch_lock is not None:
+                        await self._fetch_lock.acquire()
+                    try:
+                        await self._cycle_live_check()
+                    finally:
+                        if self._fetch_lock is not None:
+                            try: self._fetch_lock.release()
+                            except Exception: pass
+                    if self.live_fetcher is not None:
+                        logger.info(f"[{self.account['id']}] 开播探测窗口内检测到直播,转流式推送")
+                        return
+                await asyncio.sleep(interval * 3)
+        finally:
+            # 未播:收回进程(live_fetcher 为 None 时 release 会关 context);
+            # 已播:live_fetcher 非 None,release 提前返回不关,保持流式。
+            await self.release_idle_browser()
+
     async def _live_loop(self):
         while self._running:
             interval = self.config.get("live_check_interval_sec", 8)
@@ -519,6 +561,12 @@ class AccountWorker:
                 await self._live_loop_task
             except (asyncio.CancelledError, Exception):
                 pass
+        if self._live_probe_task:
+            self._live_probe_task.cancel()
+            try:
+                await self._live_probe_task
+            except (asyncio.CancelledError, Exception):
+                pass
         # P0: 关 context 前先清理 live_fetcher 回调+挂起 task,防泄漏
         if self.live_fetcher:
             try: await self.live_fetcher.close()
@@ -679,6 +727,10 @@ class AccountManager:
             w.start_loop()
             w.start_live_loop()
             self.workers[account_id] = w
+            # 手动启动:首检未播则进入短期开播探测(每 ~24s 查一次,最长 live_probe_window_sec 秒),
+            # 尽快捕获"启动后开播"——解决非直播账号开播检测跟随 10 分钟抓取周期的延迟问题。
+            if w.live_fetcher is None:
+                w.start_live_probe()
         else:
             # 未登录:关掉刚开的 context 释放进程(避免 chrome-headless-shell.exe 残留),
             # 不入 workers;前端据返回的 logged_in=false 自动转 relogin 扫码。
