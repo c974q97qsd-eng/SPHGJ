@@ -89,6 +89,9 @@ class AccountWorker:
         # 仅手动 start_account 触发(用户主动操作,短期开进程可接受);到期未播收回进程,
         # 交回 10 分钟抓取周期兜底。可在 config.live_probe_window_sec 调整(秒)。
         self._probe_window = float((self.config or {}).get("live_probe_window_sec", 180))
+        # 直播信号丢失自恢复:重载 live_page 重试捕获(避免账号实际在播却因捕获瞬断被误关,需手动重启)
+        self._live_nosignal_reloads = 0
+        self._live_last_reload_attempt = 0.0
 
     async def start(self, playwright, headless=True):
         self._pw = playwright
@@ -269,28 +272,32 @@ class AccountWorker:
             return True
         try:
             self.live_page = await self.context.new_page()
-            self.live_fetcher = LiveFetcher(self.live_page, self.account["id"])
-            await self.live_fetcher.goto_live()
+            # 用局部 lf 持有 LiveFetcher,避免并发 _close_context/release_idle_browser 将
+            # self.live_fetcher 置 None 后,本方法内再访问 .updated_at_ts 触发 'NoneType' 崩溃。
+            lf = LiveFetcher(self.live_page, self.account["id"])
+            self.live_fetcher = lf
+            await lf.goto_live()
             self._live_opened_ts = time.time()
-            info = await self._wait_for_live_detection(self.live_fetcher, timeout=20.0)
+            self._live_nosignal_reloads = 0
+            info = await self._wait_for_live_detection(lf, timeout=20.0)
             # 判定:有 live_stats(近期)即直播;stream_url / live_object_id 强信号也视为直播(视频流必出)
-            last_ts = self.live_fetcher.updated_at_ts or 0
+            last_ts = lf.updated_at_ts or 0
             fresh = (time.time() - last_ts) < 30
             is_live = bool(info.get("live_stats") and fresh)
-            if not is_live and (self.live_fetcher.stream_url or self.live_fetcher.live_object_id):
+            if not is_live and (lf.stream_url or lf.live_object_id):
                 is_live = True
                 logger.info(f"[{self.account['id']}] 检测到直播信号(stream_url/live_object_id 已取到),开始流式推送")
             if is_live:
                 self.start_live_loop()
                 logger.info(f"[{self.account['id']}] 检测到直播,开始流式推送"
-                            f"(live_object_id={self.live_fetcher.live_object_id}, "
-                            f"stream_url={'有' if self.live_fetcher.stream_url else '待取'})")
+                            f"(live_object_id={lf.live_object_id}, "
+                            f"stream_url={'有' if lf.stream_url else '待取'})")
                 return True
             # 非直播:关页回收(检测窗口内未拿到任何直播信号)
             logger.info(f"[{self.account['id']}] 直播检测:当前未在直播"
                         f"(live_stats={info.get('live_stats') is not None}, "
-                        f"live_object_id={self.live_fetcher.live_object_id})")
-            try: await self.live_fetcher.close()
+                        f"live_object_id={lf.live_object_id})")
+            try: await lf.close()
             except Exception: pass
             try: await self.live_page.close()
             except Exception: pass
@@ -300,8 +307,9 @@ class AccountWorker:
             return False
         except Exception as e:
             logger.warning(f"[{self.account['id']}] 直播检测失败: {e}")
-            if self.live_fetcher:
-                try: await self.live_fetcher.close()
+            lf = self.live_fetcher  # 可能已被并发置 None,下面统一判空处理
+            if lf:
+                try: await lf.close()
                 except Exception: pass
             if self.live_page:
                 try: await self.live_page.close()
@@ -469,6 +477,9 @@ class AccountWorker:
             if self.live_fetcher is None:
                 await asyncio.sleep(interval * 3)
                 continue
+            # 用局部 lf 持有 LiveFetcher,避免并发 _close_context/release_idle_browser 将
+            # self.live_fetcher 置 None 后,本方法内再访问 .updated_at_ts 触发 'NoneType' 崩溃。
+            lf = self.live_fetcher
             if self.logged_in and self.context:
                 now = time.time()
                 # 每 ~48 分钟 close+重建 live_page(替代 reload):reload 不退出 Chromium renderer,
@@ -478,12 +489,13 @@ class AccountWorker:
                 if self.live_page and now - self._last_live_reload >= 2880:
                     rebuilt = False
                     try:
-                        if self.live_fetcher:
-                            await self.live_fetcher.close()  # P0: 清回调+挂起 task
+                        if lf:
+                            await lf.close()  # P0: 清回调+挂起 task
                         await self.live_page.close()         # 关 page 促 renderer 退出
                         self.live_page = await self.context.new_page()
-                        self.live_fetcher = LiveFetcher(self.live_page, self.account["id"])
-                        await self.live_fetcher.goto_live()
+                        lf = LiveFetcher(self.live_page, self.account["id"])
+                        self.live_fetcher = lf
+                        await lf.goto_live()
                         self._last_live_reload = now
                         rebuilt = True
                         logger.info(f"[{self.account['id']}] live_page 定期 close+重建(释放 renderer 内存)")
@@ -502,7 +514,7 @@ class AccountWorker:
                         self.live_fetcher = None
                         self._live_closed_ts = now
                 try:
-                    info = await self.live_fetcher.fetch()
+                    info = await lf.fetch()
                     self.live_info = info
                     # 增值统计:采样累计观看/GMV,算 10分钟观看、10/30分钟 GMV 增值
                     stats = info.get("live_stats") or {}
@@ -535,11 +547,33 @@ class AccountWorker:
                             self._ts_30m = now
                             self._persist_window("30m", now, audience, gmv, 0, self._gmv_30m)
                     # is_live: 有 live_stats 且 get_live_info 近期仍返回数据(30秒内)
-                    last_ts = self.live_fetcher.updated_at_ts or 0
+                    last_ts = lf.updated_at_ts or 0
                     info["is_live"] = bool(info.get("live_stats") and (now - last_ts < 30))
-                    # P0-1: 非直播持续 2 分钟 -> 关 live_page 省内存(从未直播看 _live_opened_ts,直播结束看 last_ts)
+                    # 自恢复:账号实际可能在播,但 check_live_status 捕获偶发瞬断(长驻页面常见)。
+                    # 信号丢失 >120s 不直接关页,而是重载 live_page 重触发捕获(最多 3 次,间隔 60s),
+                    # 成功拿到信号则继续流式;彻底失败(3 次仍无)才判定下播关页回收。
                     if not info["is_live"]:
                         idle = (now - self._live_opened_ts) if last_ts == 0 else (now - last_ts)
+                        page_alive = bool(self.live_page) and "liveBuild" in (self.live_page.url or "")
+                        can_reload = page_alive and (self._live_nosignal_reloads or 0) < 3 \
+                            and (now - (self._live_last_reload_attempt or 0)) > 60
+                        if idle > 120 and can_reload:
+                            self._live_nosignal_reloads = (self._live_nosignal_reloads or 0) + 1
+                            self._live_last_reload_attempt = now
+                            try:
+                                if lf:
+                                    await lf.close()
+                                await self.live_page.reload(wait_until="domcontentloaded")
+                                lf = LiveFetcher(self.live_page, self.account["id"])
+                                self.live_fetcher = lf
+                                await lf.goto_live()
+                                self._last_live_reload = now
+                                logger.info(f"[{self.account['id']}] 直播信号丢失,重载 live_page 重试捕获"
+                                            f"(第{self._live_nosignal_reloads}次/最多3次)")
+                                await asyncio.sleep(interval * 3)
+                                continue
+                            except Exception as e:
+                                logger.warning(f"[{self.account['id']}] 信号丢失重载失败: {e}")
                         if idle > 120:
                             # P2: 关 live_page 前先推"已下播"(stream_url=None/is_live=False),
                             # 让前端 LiveScreenPage 销毁 flv.js player 释放 MSE 缓冲。
@@ -553,23 +587,26 @@ class AccountWorker:
                                 })
                             except Exception: pass
                             # P0: 先清理 LiveFetcher 回调+挂起 task,再关 page,防泄漏
-                            if self.live_fetcher:
-                                try: await self.live_fetcher.close()
+                            if lf:
+                                try: await lf.close()
                                 except Exception: pass
                             try: await self.live_page.close()
                             except Exception: pass
                             self.live_page = None
                             self.live_fetcher = None
                             self._live_closed_ts = now
+                            self._live_nosignal_reloads = 0
                             logger.info(f"[{self.account['id']}] 非直播,关闭 live_page 省内存(idle={int(idle)}s)")
                             # 收回评论页进程(非直播且无其它引用时)
                             await self.release_idle_browser()
                             await asyncio.sleep(interval)
                             continue
+                    # 成功拿到直播信号:重置自愈重试计数,便于下次真正瞬断时重新自愈
+                    self._live_nosignal_reloads = 0
                     # dashboardV4 指标,按 config.dashboard_interval_sec 抓(需 live_object_id,账号在直播)
-                    if self.live_fetcher.live_object_id and now - (self.live_fetcher._dashboard_ts or 0) >= dash_interval:
+                    if lf.live_object_id and now - (lf._dashboard_ts or 0) >= dash_interval:
                         try:
-                            dd = await self.live_fetcher.fetch_dashboard_data()
+                            dd = await lf.fetch_dashboard_data()
                             if dd:
                                 info["metrics"] = dd
                         except Exception as e:
