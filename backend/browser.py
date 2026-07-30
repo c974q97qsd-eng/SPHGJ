@@ -23,6 +23,9 @@ STEALTH_ARGS = [
     "--disable-renderer-backgrounding",            # 防 renderer 后台降优先级
     "--disable-backgrounding-occluded-windows",    # 防遮挡窗口降级
     "--disable-dev-shm-usage",          # Linux 避 /dev/shm 不足写磁盘(Windows 忽略)
+    # rev10: 缓存上限(=1 实质禁用),省 profile 磁盘占用 + 缓存内存映射;不影响 cookie/localStorage
+    "--disk-cache-size=1",
+    "--media-cache-size=1",
 ]
 
 # 在每个页面加载前注入,抹掉常见自动化指纹

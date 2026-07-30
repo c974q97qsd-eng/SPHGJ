@@ -82,6 +82,43 @@ _LOOP: Optional[asyncio.AbstractEventLoop] = None
 async def _capture_loop():
     global _LOOP
     _LOOP = asyncio.get_event_loop()
+    asyncio.create_task(_mem_monitor())
+
+
+def _process_rss_mb() -> float:
+    """当前进程 RSS(MB),Windows ctypes psapi(无第三方依赖);失败返回 0。"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _PMC(ctypes.Structure):
+            _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD)] + [
+                (n, ctypes.c_size_t) for n in (
+                    "PeakWorkingSetSize", "WorkingSetSize",
+                    "QuotaPeakPagedPoolUsage", "QuotaPagedPoolUsage",
+                    "QuotaPeakNonPagedPoolUsage", "QuotaNonPagedPoolUsage",
+                    "PagefileUsage", "PeakPagefileUsage")]
+
+        pmc = _PMC()
+        pmc.cb = ctypes.sizeof(_PMC)
+        ok = ctypes.windll.psapi.GetProcessMemoryInfo(
+            ctypes.windll.kernel32.GetCurrentProcess(), ctypes.byref(pmc), pmc.cb)
+        if ok:
+            return pmc.WorkingSetSize / 1048576.0
+    except Exception:
+        pass
+    return 0.0
+
+
+async def _mem_monitor():
+    """每 30 分钟记录主进程 RSS,用于监控内存增长曲线(验证精简效果)。"""
+    while True:
+        await asyncio.sleep(1800)
+        mb = _process_rss_mb()
+        if mb > 0:
+            n_live = sum(1 for w in manager.workers.values() if w.live_fetcher is not None)
+            n_total = len(manager.workers)
+            logger.info(f"[mem] 主进程 RSS={mb:.0f}MB (账号={n_total}, 直播中={n_live})")
 
 
 def graceful_shutdown(timeout: float = 15.0):

@@ -1,23 +1,25 @@
-"""直播大屏抓取: 实测验证方案(2026-07-29 rev9)。
+"""直播大屏抓取: 实测验证方案(2026-07-29 rev9) + 阶段化内存精简(2026-07-31 rev10)。
 
 通过诊断脚本实测确认: check_live_status 响应体含 liveObjectId + audiencePlayUrl(.flv 流),
 get_live_info 响应体含 liveStats。本版据此实现,不再依赖猜测的接口字段。
 
-内存安全:
-  旧版 page.route("**/*") 对每个请求创建 Python 代理对象,Playwright 不回收(microsoft/playwright#20765),
-  累积 5-7GB —— 已通过改为 page.route("**/*.flv*") 精确路由解决(仅 2 条,无累积)。
+内存演进:
+  - 旧版 page.route("**/*") 对每个请求创建 Python 代理对象,Playwright 不回收
+    (microsoft/playwright#20765),累积 5-7GB —— 已改为 page.route("**/*.flv*") 精确路由。
+  - rev6~rev8 在 goto 前用 CDP setBlockedURLs 拦图片/CSS/媒体 -> 拦掉 *.css 导致
+    liveBuild SPA 无法初始化,check_live_status 永不触发 -> 误判非直播(rev9 撤销)。
+  - rev9 后实测: Python 主进程长跑涨到 9GB,而 4 个浏览器进程仅 ~200MB ——
+    泄漏在 Python 驱动层,两个来源:
+    1) FLV 路由: 直播页预览播放器被 abort 后不断重试拉流,每次重试创建一组
+       Python Route/Request 对象,驱动层不回收(#20765 同类);
+    2) 撤销阻断后,直播间弹幕头像等海量图片响应在 Python 侧持续产生 Response 对象。
 
-  ⚠️ 重要(rev9 修正): 上一版(rev6~rev8)在 goto_live 用 CDP Network.setBlockedURLs 阻断
-  图片/字体/CSS/媒体,本意是省内存。但实测确认: setBlockedURLs 会阻断 liveBuild 页面
-  初始化所需资源(含 *.css),导致直播大屏 SPA 无法启动,check_live_status / get_live_info
-  永不触发 -> live_object_id / stream_url 永远取不到 -> 误判"非直播"关掉 live_page ->
-  "直播大屏无视频"。故 rev9 撤销 setBlockedURLs。
-  视频流的大流量由 page.route("**/*.flv*") 精确拦截 abort 处理(杜绝浏览器下载整路流),
-  图片/CSS 等小资源不读响应体、不创建代理对象,不会造成 Python 内存泄漏。
-
-实测验证(diag4.py, uspoloassn7, ROUTEONLY 模式):
-  - 仅 page.route("**/*.flv*") + page.on("response"): 稳定拿到 liveObjectId + audiencePlayUrl(.flv)
-  - 加入 setBlockedURLs 后 check_live_status 完全不触发(根因确认)
+  rev10 阶段化精简(关键: 阻断必须等 SPA 初始化完成、拿到直播信号之后才启用):
+    stage1(拿到 liveStats/liveObjectId): CDP setBlockedURLs 拦图片+媒体
+      (不含 css/js/api),浏览器层阻断,0 Python 对象;
+    stage2(拿到 stream_url): 阻断追加 FLV 模式 + 解除 page.route FLV 路由
+      + JS 停掉页面 <video> 播放器 —— FLV 重试在浏览器层被拦,不再产生 Route 对象。
+    48 分钟定期重建 live_page 后,新页面自动重走"先放开、后精简"流程。
 """
 import asyncio
 import json
@@ -40,10 +42,14 @@ DASHBOARD_PAGE_URL_ENC = "https%3A%2F%2Fchannels.weixin.qq.com%2Fmicro%2Fstatist
 PUBLIC_CHANNEL_TYPE = 1
 DASHBOARD_INTERVAL = 60  # dashboard 数据抓取间隔(秒);实际由 account_manager 读 config.dashboard_interval_sec 控制
 
-# CDP 浏览器层阻断已撤销(rev9): Network.setBlockedURLs 会阻断 liveBuild 页面初始化所需
-# 资源(含 *.css),导致 check_live_status / get_live_info 永不触发,直播大屏拿不到 stream_url。
-# 视频流大流量改由 page.route("**/*.flv*") 精确拦截 abort 处理;图片/CSS 小资源不读响应体、
-# 不创建代理对象,无 Python 内存泄漏。详见文件头 docstring。
+# ======================== rev10: 阶段化内存精简 ========================
+# stage1(拿到 liveStats/liveObjectId): 浏览器层拦图片+媒体(不含 css/js/api)
+# stage2(拿到 stream_url): 追加拦 FLV + 解除 page.route FLV 路由 + 停 video
+_SLIM_MEDIA_URLS = [
+    "*.png*", "*.jpg*", "*.jpeg*", "*.gif*", "*.svg*", "*.webp*", "*.ico*", "*.bmp*",
+    "*.mp4*", "*.webm*", "*.mp3*", "*.wav*", "*.ogg*", "*.m4a*",
+]
+_SLIM_FLV_URLS = ["*.flv*", "*.m3u8*", "*wxlivecdn*", "*trtc*"]
 
 
 class LiveFetcher:
@@ -63,6 +69,10 @@ class LiveFetcher:
         self._no_liveid_warned = False   # 在直播但拿不到 liveObjectId 时 warn 一次
         self._dash_fail_warned = False   # dashboard 抓取全失败时 warn 一次(成功后重置)
         self._flv_req_warned = False
+        # rev10: 阶段化内存精简状态
+        self._slim_stage = 0     # 0=未精简 1=已拦图片/媒体 2=已拦FLV并解除route
+        self._cdp_slim = None    # 用于 setBlockedURLs 的 CDP session
+        self._slim_task = None   # route 内异步触发精简的 task 引用(防 GC)
 
     async def goto_live(self):
         """注册 page.on 捕获回调 + flv 精确路由,然后导航到 liveBuild 页。
@@ -97,10 +107,55 @@ class LiveFetcher:
             if u != self.stream_url:
                 self.stream_url = u
                 logger.info(f"[live:{self.account_id}] 拿到 .flv 流 URL(来自 route): {u[:80]}...")
+            # 拿到 stream_url: 触发 stage2(在 route handler 里用 create_task 避免阻塞 abort)
+            if self._slim_stage < 2:
+                self._slim_task = asyncio.create_task(self._apply_slimming(2))
         try:
             await route.abort()
         except Exception:
             pass
+
+    # ======================== rev10: 阶段化内存精简 ========================
+
+    async def _apply_slimming(self, stage: int):
+        """拿到直播信号后,在浏览器层(CDP)阻断非必要资源(0 Python 对象)。
+
+        必须在 SPA 初始化完成后调用(rev6~rev8 教训: goto 前阻断会杀初始化)。
+        stage1: 拦图片+媒体 -> 弹幕头像等图片响应不再产生 Python Response 对象。
+        stage2: 追加拦 FLV + 解除 page.route FLV 路由 + JS 停 <video> ->
+                FLV 重试在浏览器层被拦,不再产生 Python Route 对象(主泄漏源)。
+        """
+        if self._slim_stage >= stage or not self.page:
+            return
+        self._slim_stage = stage  # 先置位防重入(asyncio 单线程,await 前设置即可)
+        try:
+            if self._cdp_slim is None:
+                self._cdp_slim = await self.page.context.new_cdp_session(self.page)
+                await self._cdp_slim.send("Network.enable")
+            urls = list(_SLIM_MEDIA_URLS)
+            if stage >= 2:
+                urls += _SLIM_FLV_URLS
+            await self._cdp_slim.send("Network.setBlockedURLs", {"urls": urls})
+            logger.info(f"[live:{self.account_id}] 内存精简 stage{stage} 生效(浏览器层阻断 {len(urls)} 类资源)")
+        except Exception as e:
+            logger.debug(f"[live:{self.account_id}] 内存精简 stage{stage} 失败(不影响抓取): {e}")
+            return
+        if stage >= 2:
+            # FLV 已有 CDP 兜底拦截,解除 page.route(每次播放器重试都会创建 Route 对象)
+            for pat in ("**/*.flv*", "**/*.m3u8*"):
+                try:
+                    await self.page.unroute(pat)
+                except Exception:
+                    pass
+            # 停掉页面预览播放器,源头减少 FLV 重试
+            try:
+                await self.page.evaluate("""()=>{
+                    document.querySelectorAll('video').forEach(v=>{
+                        try{v.pause();v.removeAttribute('src');v.load();}catch(e){}
+                    });
+                }""")
+            except Exception:
+                pass
 
     # ======================== page.on: 被动捕获响应体 ========================
 
@@ -135,6 +190,9 @@ class LiveFetcher:
                 logger.warning(f"[live:{self.account_id}] 在直播但未取到 liveObjectId"
                                f"(get_live_info 无此字段,check_live_status 未捕获),dashboard 5 字段将不显示。"
                                f"liveStats keys={stats_keys}; stream_url={self.stream_url}")
+            # rev10: 拿到 liveStats/liveObjectId 说明 SPA 已初始化完成 -> stage1(拦图片/媒体)
+            if stats or self.live_object_id:
+                await self._apply_slimming(1)
         except Exception as e:
             logger.debug(f"[live:{self.account_id}] get_live_info 解析失败: {e}")
 
@@ -152,6 +210,8 @@ class LiveFetcher:
                 if not self.live_object_id:
                     logger.info(f"[live:{self.account_id}] 拿到 liveObjectId={live_id}(来自 check_live_status),dashboard 抓取启用")
                 self.live_object_id = str(live_id)
+                # rev10: 拿到 liveObjectId 说明 SPA 已初始化 -> stage1(拦图片/媒体)
+                await self._apply_slimming(1)
             # .flv 流 URL: 优先 audiencePlayUrl,兜底 liveStreamUrlInfo.liveCdnUrl(均 // 开头 -> 补 https:)
             flv = d.get("audiencePlayUrl") or ((d.get("liveStreamUrlInfo") or {}).get("liveCdnUrl") or "")
             if flv and (".flv" in flv or ".m3u8" in flv):
@@ -159,6 +219,8 @@ class LiveFetcher:
                 if url != self.stream_url:
                     self.stream_url = url
                     logger.info(f"[live:{self.account_id}] 拿到 .flv 流 URL(来自 check_live_status): {url[:80]}...")
+                # rev10: 拿到 stream_url -> stage2(追加拦 FLV + 解除 page.route + 停 video)
+                await self._apply_slimming(2)
             else:
                 # 兜底: 在整个响应体里扫 .flv 流 URL(字段名若改版也能兜住)
                 m = re.search(r'https?://[^\s"\'\\<>]*\.flv[^\s"\'\\<>]*', txt)
@@ -170,13 +232,15 @@ class LiveFetcher:
                     if url != self.stream_url:
                         self.stream_url = url
                         logger.info(f"[live:{self.account_id}] 拿到 .flv 流 URL(响应体扫描兜底): {url[:80]}...")
+                    # rev10: 同样触发 stage2
+                    await self._apply_slimming(2)
         except Exception as e:
             logger.debug(f"[live:{self.account_id}] check_live_status 解析失败: {e}")
 
     # ======================== 关闭清理 ========================
 
     async def close(self):
-        """关闭前清理: 移除 page 事件回调 + flv 路由 + 断 page 引用。"""
+        """关闭前清理: 移除 page 事件回调 + flv 路由 + CDP 精简 session detach + 断 page 引用。"""
         try:
             self.page.remove_listener("response", self._on_resp)
         except Exception:
@@ -186,6 +250,12 @@ class LiveFetcher:
                 await self.page.unroute(pat)
             except Exception:
                 pass
+        if self._cdp_slim:
+            try:
+                await self._cdp_slim.detach()
+            except Exception:
+                pass
+            self._cdp_slim = None
         self.page = None
 
     # ======================== 静态工具方法 ========================
