@@ -1,4 +1,4 @@
-"""直播大屏抓取: 实测验证方案(2026-07-29 rev9) + 阶段化内存精简(2026-07-31 rev10)。
+"""直播大屏抓取: 实测验证方案(2026-07-29 rev9) + 阶段化内存精简(rev10~rev11)。
 
 通过诊断脚本实测确认: check_live_status 响应体含 liveObjectId + audiencePlayUrl(.flv 流),
 get_live_info 响应体含 liveStats。本版据此实现,不再依赖猜测的接口字段。
@@ -9,16 +9,22 @@ get_live_info 响应体含 liveStats。本版据此实现,不再依赖猜测的�
   - rev6~rev8 在 goto 前用 CDP setBlockedURLs 拦图片/CSS/媒体 -> 拦掉 *.css 导致
     liveBuild SPA 无法初始化,check_live_status 永不触发 -> 误判非直播(rev9 撤销)。
   - rev9 后实测: Python 主进程长跑涨到 9GB,而 4 个浏览器进程仅 ~200MB ——
-    泄漏在 Python 驱动层,两个来源:
+    泄漏在 Python 驱动层,三个来源:
     1) FLV 路由: 直播页预览播放器被 abort 后不断重试拉流,每次重试创建一组
        Python Route/Request 对象,驱动层不回收(#20765 同类);
-    2) 撤销阻断后,直播间弹幕头像等海量图片响应在 Python 侧持续产生 Response 对象。
+    2) 撤销阻断后,直播间弹幕头像等海量图片响应在 Python 侧持续产生 Response 对象;
+    3)(rev11 发现) page.on("response") 为【每一个网络响应】创建 Python Response 对象,
+       直播间弹幕/观众数轮询/tracking/analytics 每分钟数百个请求,每个 1-5KB 不释放 ->
+       这是最大泄漏源(占 11GB 中的大头)。
 
-  rev10 阶段化精简(关键: 阻断必须等 SPA 初始化完成、拿到直播信号之后才启用):
-    stage1(拿到 liveStats/liveObjectId): CDP setBlockedURLs 拦图片+媒体
-      (不含 css/js/api),浏览器层阻断,0 Python 对象;
-    stage2(拿到 stream_url): 阻断追加 FLV 模式 + 解除 page.route FLV 路由
-      + JS 停掉页面 <video> 播放器 —— FLV 重试在浏览器层被拦,不再产生 Route 对象。
+  rev10 阶段化精简:
+    stage1(拿到 liveStats/liveObjectId): CDP setBlockedURLs 拦图片+媒体(不含 css/js/api);
+    stage2(拿到 stream_url): 追加拦 FLV + 解除 page.route FLV 路由 + JS 停 <video>。
+
+  rev11 核心修复: 用 CDP Network.responseReceived 替代 page.on("response")。
+    CDP 事件是轻量 dict,仅在检测到目标 URL(get_live_info/check_live_status)时才调用
+    Network.getResponseBody 读体 —— 其余数千个网络请求【零 Python 对象分配】。
+    同时统一 CDP session(一个 session 兼做响应捕获 + setBlockedURLs 精简)。
     48 分钟定期重建 live_page 后,新页面自动重走"先放开、后精简"流程。
 """
 import asyncio
@@ -69,18 +75,33 @@ class LiveFetcher:
         self._no_liveid_warned = False   # 在直播但拿不到 liveObjectId 时 warn 一次
         self._dash_fail_warned = False   # dashboard 抓取全失败时 warn 一次(成功后重置)
         self._flv_req_warned = False
-        # rev10: 阶段化内存精简状态
+        # rev10~rev11: 阶段化内存精简状态 + CDP 响应捕获
         self._slim_stage = 0     # 0=未精简 1=已拦图片/媒体 2=已拦FLV并解除route
-        self._cdp_slim = None    # 用于 setBlockedURLs 的 CDP session
+        self._cdp = None         # 统一 CDP session(响应捕获 + setBlockedURLs 精简)
+        self._cdp_ready = False  # Network.enable 是否已发送
         self._slim_task = None   # route 内异步触发精简的 task 引用(防 GC)
 
     async def goto_live(self):
-        """注册 page.on 捕获回调 + flv 精确路由,然后导航到 liveBuild 页。
+        """建 CDP session(响应捕获+精简共用) + flv 精确路由,然后导航到 liveBuild 页。
 
-        注意: 不再调用 CDP Network.setBlockedURLs(rev9 撤销)。该阻断会令 liveBuild SPA
-        无法初始化,导致 check_live_status 永不触发、直播大屏取不到 stream_url。
+        rev11 核心改进: 不再使用 page.on("response", callback)。
+        该回调会为页面上【每一个网络响应】创建 Python Response 对象(Playwright #20765),
+        直播间每分钟数百个请求(danmaku/轮询/tracking/analytics),每个 1-5KB 不释放 ->
+        累积到 11GB+。
+
+        改用 CDP Network.responseReceived: 事件是轻量 dict,仅在目标 URL
+        (get_live_info / check_live_status) 时才调用 getResponseBody 读体,
+        其余请求零 Python 对象分配。
         """
-        self.page.on("response", self._on_resp)
+        # rev11: 建 CDP session,启用 Network 域,注册 responseReceived 回调
+        try:
+            self._cdp = await self.page.context.new_cdp_session(self.page)
+            await self._cdp.send("Network.enable")
+            self._cdp_ready = True
+            self._cdp.on("Network.responseReceived", self._on_cdp_response)
+            logger.debug(f"[live:{self.account_id}] CDP session 已建(Network 域已启用)")
+        except Exception as e:
+            logger.warning(f"[live:{self.account_id}] CDP session 创建失败(降级): {e}")
         await self._install_flv_route()
         try:
             await self.page.goto(LIVE_URL, wait_until="domcontentloaded")
@@ -124,18 +145,24 @@ class LiveFetcher:
         stage1: 拦图片+媒体 -> 弹幕头像等图片响应不再产生 Python Response 对象。
         stage2: 追加拦 FLV + 解除 page.route FLV 路由 + JS 停 <video> ->
                 FLV 重试在浏览器层被拦,不再产生 Python Route 对象(主泄漏源)。
+
+        rev11: 复用 goto_live 建的统一 CDP session(self._cdp),不再新建。
         """
         if self._slim_stage >= stage or not self.page:
             return
         self._slim_stage = stage  # 先置位防重入(asyncio 单线程,await 前设置即可)
         try:
-            if self._cdp_slim is None:
-                self._cdp_slim = await self.page.context.new_cdp_session(self.page)
-                await self._cdp_slim.send("Network.enable")
+            cdp = self._cdp
+            if cdp is None:
+                # CDP session 在 goto_live 时建;若失败则尝试重建(极端情况)
+                cdp = await self.page.context.new_cdp_session(self.page)
+                await cdp.send("Network.enable")
+                self._cdp = cdp
+                self._cdp_ready = True
             urls = list(_SLIM_MEDIA_URLS)
             if stage >= 2:
                 urls += _SLIM_FLV_URLS
-            await self._cdp_slim.send("Network.setBlockedURLs", {"urls": urls})
+            await cdp.send("Network.setBlockedURLs", {"urls": urls})
             logger.info(f"[live:{self.account_id}] 内存精简 stage{stage} 生效(浏览器层阻断 {len(urls)} 类资源)")
         except Exception as e:
             logger.debug(f"[live:{self.account_id}] 内存精简 stage{stage} 失败(不影响抓取): {e}")
@@ -157,21 +184,43 @@ class LiveFetcher:
             except Exception:
                 pass
 
-    # ======================== page.on: 被动捕获响应体 ========================
+    # ======================== rev11: CDP 响应捕获(替代 page.on(response)) ========================
 
-    async def _on_resp(self, resp):
-        u = resp.url or ""
-        if "channels.weixin.qq.com" not in u:
-            return
-        if "get_live_info" in u:
-            await self._capture(resp)
-        elif "check_live_status" in u:
-            await self._capture_live_status(resp)
+    def _on_cdp_response(self, event):
+        """CDP Network.responseReceived 回调(轻量 dict,无 Python Response 对象)。
 
-    async def _capture(self, resp):
-        """get_live_info 响应 -> liveStats(当前在线/增值统计) + 兜底 liveObjectId。"""
+        仅对 get_live_info / check_live_status 两个目标 URL 调用 getResponseBody 读体,
+        其余数千个网络请求立即返回,零 Python 内存分配。
+        用 create_task 避免阻塞 CDP 事件分发线程。
+        """
         try:
-            txt = await resp.text()
+            url = (event.get("response") or {}).get("url", "")
+            if "channels.weixin.qq.com" not in url:
+                return
+            if "get_live_info" in url:
+                asyncio.create_task(self._capture_cdp(event.get("requestId", "")))
+            elif "check_live_status" in url:
+                asyncio.create_task(self._capture_live_status_cdp(event.get("requestId", "")))
+        except Exception:
+            pass  # CDP 回调不允许异常上抛
+
+    async def _read_cdp_body(self, request_id: str) -> str:
+        """通过 CDP Network.getResponseBody 读取指定请求的响应体文本。"""
+        try:
+            if self._cdp is None:
+                return ""
+            result = await self._cdp.send("Network.getResponseBody", {"requestId": request_id})
+            return result.get("body", "") or ""
+        except Exception as e:
+            logger.debug(f"[live:{self.account_id}] CDP getResponseBody 失败: {e}")
+            return ""
+
+    async def _capture_cdp(self, request_id: str):
+        """get_live_info 响应(CDP 版): 读体 -> liveStats + 兜底 liveObjectId -> stage1。"""
+        try:
+            txt = await self._read_cdp_body(request_id)
+            if not txt:
+                return
             data = json.loads(txt)
             d = data.get("data") or {}
             stats = d.get("liveStats")
@@ -190,19 +239,21 @@ class LiveFetcher:
                 logger.warning(f"[live:{self.account_id}] 在直播但未取到 liveObjectId"
                                f"(get_live_info 无此字段,check_live_status 未捕获),dashboard 5 字段将不显示。"
                                f"liveStats keys={stats_keys}; stream_url={self.stream_url}")
-            # rev10: 拿到 liveStats/liveObjectId 说明 SPA 已初始化完成 -> stage1(拦图片/媒体)
+            # 拿到 liveStats/liveObjectId 说明 SPA 已初始化完成 -> stage1(拦图片/媒体)
             if stats or self.live_object_id:
                 await self._apply_slimming(1)
         except Exception as e:
             logger.debug(f"[live:{self.account_id}] get_live_info 解析失败: {e}")
 
-    async def _capture_live_status(self, resp):
-        """check_live_status 响应 -> liveObjectId(场次 ID,供 dashboard API) + stream_url(.flv 流)。
+    async def _capture_live_status_cdp(self, request_id: str):
+        """check_live_status 响应(CDP 版): 读体 -> liveObjectId + stream_url(.flv 流) -> stage1/2。
 
         这是 stream_url 的【主要可靠来源】(实测确认 audiencePlayUrl 为 // 开头的 .flv URL)。
         """
         try:
-            txt = await resp.text()
+            txt = await self._read_cdp_body(request_id)
+            if not txt:
+                return
             data = json.loads(txt)
             d = data.get("data") or {}
             live_id = d.get("liveObjectId") or self._find_live_object_id(d)
@@ -210,7 +261,7 @@ class LiveFetcher:
                 if not self.live_object_id:
                     logger.info(f"[live:{self.account_id}] 拿到 liveObjectId={live_id}(来自 check_live_status),dashboard 抓取启用")
                 self.live_object_id = str(live_id)
-                # rev10: 拿到 liveObjectId 说明 SPA 已初始化 -> stage1(拦图片/媒体)
+                # 拿到 liveObjectId 说明 SPA 已初始化 -> stage1(拦图片/媒体)
                 await self._apply_slimming(1)
             # .flv 流 URL: 优先 audiencePlayUrl,兜底 liveStreamUrlInfo.liveCdnUrl(均 // 开头 -> 补 https:)
             flv = d.get("audiencePlayUrl") or ((d.get("liveStreamUrlInfo") or {}).get("liveCdnUrl") or "")
@@ -219,7 +270,7 @@ class LiveFetcher:
                 if url != self.stream_url:
                     self.stream_url = url
                     logger.info(f"[live:{self.account_id}] 拿到 .flv 流 URL(来自 check_live_status): {url[:80]}...")
-                # rev10: 拿到 stream_url -> stage2(追加拦 FLV + 解除 page.route + 停 video)
+                # 拿到 stream_url -> stage2(追加拦 FLV + 解除 page.route + 停 video)
                 await self._apply_slimming(2)
             else:
                 # 兜底: 在整个响应体里扫 .flv 流 URL(字段名若改版也能兜住)
@@ -232,7 +283,7 @@ class LiveFetcher:
                     if url != self.stream_url:
                         self.stream_url = url
                         logger.info(f"[live:{self.account_id}] 拿到 .flv 流 URL(响应体扫描兜底): {url[:80]}...")
-                    # rev10: 同样触发 stage2
+                    # 同样触发 stage2
                     await self._apply_slimming(2)
         except Exception as e:
             logger.debug(f"[live:{self.account_id}] check_live_status 解析失败: {e}")
@@ -240,22 +291,31 @@ class LiveFetcher:
     # ======================== 关闭清理 ========================
 
     async def close(self):
-        """关闭前清理: 移除 page 事件回调 + flv 路由 + CDP 精简 session detach + 断 page 引用。"""
-        try:
-            self.page.remove_listener("response", self._on_resp)
-        except Exception:
-            pass
+        """关闭前清理: 移除 CDP 回调 + detach session + 解除 flv 路由 + 断 page 引用。
+
+        rev11: 不再有 page.on("response") 需要移除(已改用 CDP);CDP session
+        是 goto_live 时统一建的(self._cdp),响应捕获 + slimming 共用。
+        """
+        # 移除 CDP responseReceived 回调
+        if self._cdp is not None:
+            try:
+                self._cdp.remove_listener("Network.responseReceived", self._on_cdp_response)
+            except Exception:
+                pass
+        # 解除 FLV 路由
         for pat in ("**/*.flv*", "**/*.m3u8*"):
             try:
                 await self.page.unroute(pat)
             except Exception:
                 pass
-        if self._cdp_slim:
+        # detach CDP session(响应捕获 + slimming 共用)
+        if self._cdp:
             try:
-                await self._cdp_slim.detach()
+                await self._cdp.detach()
             except Exception:
                 pass
-            self._cdp_slim = None
+            self._cdp = None
+            self._cdp_ready = False
         self.page = None
 
     # ======================== 静态工具方法 ========================
