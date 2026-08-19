@@ -20,6 +20,7 @@ logger = logging.getLogger("sphgj")
 from .storage import Storage
 from .account_manager import AccountManager
 from . import schemas
+from .metrics import metric_dictionary, validate_card_fields, DEFAULT_CARD_FIELDS
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 CONFIG_PATH = os.path.join(ROOT, "config.json")
@@ -31,8 +32,11 @@ def load_config():
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
-        cfg = {"accounts": [], "fetch_interval_sec": 300,
-               "auto_reply": {"enabled": False, "rules": []}, "db_path": "./data/comments.db"}
+        cfg = {"accounts": [], "fetch_interval_sec": 600,
+               "auto_reply": {"enabled": False, "rules": []}, "db_path": "./data/comments.db",
+               "risk_control": {"read_interval": [1.0, 2.5], "write_interval": [4.0, 8.0],
+                                 "night_hours": [0, 6], "night_interval_multiplier": 3,
+                                 "daily_write_limit": 100}}
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
         return cfg
@@ -78,17 +82,71 @@ _LOOP: Optional[asyncio.AbstractEventLoop] = None
 async def _capture_loop():
     global _LOOP
     _LOOP = asyncio.get_event_loop()
+    asyncio.create_task(_mem_monitor())
+    # 打印运行版本(懒导入 main.VERSION,避免与 main 的循环依赖)
+    try:
+        from main import VERSION
+        logger.info(f"[启动] 视频号工具 v{VERSION} (FastAPI 已就绪)")
+    except Exception:
+        pass
 
 
-def graceful_shutdown(timeout: float = 5.0):
-    """主线程(pywebview 窗口关闭后)调用:停 manager + playwright。"""
+def _process_rss_mb() -> float:
+    """当前进程 RSS(MB),Windows ctypes psapi(无第三方依赖);失败返回 0。"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _PMC(ctypes.Structure):
+            _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD)] + [
+                (n, ctypes.c_size_t) for n in (
+                    "PeakWorkingSetSize", "WorkingSetSize",
+                    "QuotaPeakPagedPoolUsage", "QuotaPagedPoolUsage",
+                    "QuotaPeakNonPagedPoolUsage", "QuotaNonPagedPoolUsage",
+                    "PagefileUsage", "PeakPagefileUsage")]
+
+        pmc = _PMC()
+        pmc.cb = ctypes.sizeof(_PMC)
+        ok = ctypes.windll.psapi.GetProcessMemoryInfo(
+            ctypes.windll.kernel32.GetCurrentProcess(), ctypes.byref(pmc), pmc.cb)
+        if ok:
+            return pmc.WorkingSetSize / 1048576.0
+    except Exception:
+        pass
+    return 0.0
+
+
+async def _mem_monitor():
+    """每 30 分钟记录主进程 RSS,用于监控内存增长曲线(验证精简效果)。"""
+    while True:
+        await asyncio.sleep(1800)
+        mb = _process_rss_mb()
+        if mb > 0:
+            n_live = sum(1 for w in manager.workers.values() if w.live_fetcher is not None)
+            n_total = len(manager.workers)
+            logger.info(f"[mem] 主进程 RSS={mb:.0f}MB (账号={n_total}, 直播中={n_live})")
+
+
+def graceful_shutdown(timeout: float = 15.0):
+    """主线程(pywebview 窗口关闭后)调用:停 manager + playwright。
+
+    超时放宽到 15s:多账号各自带直播 FLV 页,context.close 需要时间,
+    原 5s 易超时;超时/异常时取消后台协程,避免进程退出时它仍往已断管道
+    写事件触发驱动 EPIPE 崩溃。
+    """
     if _LOOP is None:
         return
+    fut = None
     try:
         fut = asyncio.run_coroutine_threadsafe(manager.stop_all(), _LOOP)
         fut.result(timeout=timeout)
     except Exception as e:
         logger.warning(f"graceful_shutdown 异常: {e}")
+        if fut is not None:
+            try:
+                fut.cancel()
+            except Exception:
+                pass
 
 
 # ===================== 配置 =====================
@@ -98,6 +156,10 @@ async def get_config():
         "fetch_interval_sec": config.get("fetch_interval_sec", 300),
         "auto_reply": config.get("auto_reply", {"enabled": False, "rules": []}),
         "accounts_count": len(config.get("accounts", [])),
+        "card_fields": config.get("card_fields") or DEFAULT_CARD_FIELDS,
+        "dashboard_interval_sec": config.get("dashboard_interval_sec", 60),
+        "live_check_interval_sec": config.get("live_check_interval_sec", 8),
+        "manual_release_delay_sec": config.get("manual_release_delay_sec", 120),
     }
 
 
@@ -112,6 +174,23 @@ async def patch_config(body: schemas.ConfigUpdate):
         config.setdefault("auto_reply", {})["enabled"] = body.auto_reply_enabled
         for w in manager.workers.values():
             w.auto_reply.auto_config = config["auto_reply"]
+    if body.card_fields is not None:
+        ok, err = validate_card_fields(body.card_fields)
+        if not ok:
+            raise HTTPException(400, err)
+        config["card_fields"] = body.card_fields
+    if body.dashboard_interval_sec is not None:
+        config["dashboard_interval_sec"] = body.dashboard_interval_sec
+        for w in manager.workers.values():
+            w.config = config
+    if body.live_check_interval_sec is not None:
+        config["live_check_interval_sec"] = body.live_check_interval_sec
+        for w in manager.workers.values():
+            w.config = config
+    if body.manual_release_delay_sec is not None:
+        config["manual_release_delay_sec"] = body.manual_release_delay_sec
+        for w in manager.workers.values():
+            w.config = config
     save_config(config)
     return {"ok": True, "config": await get_config()}
 
@@ -207,6 +286,24 @@ async def stop_account(account_id: str):
     return {"ok": True}
 
 
+@app.post("/api/accounts/{account_id}/open-browser")
+async def open_account_browser(account_id: str):
+    """打开带登录态的 headed 浏览器供手动操作(停 worker,关浏览器后自动重启)。"""
+    ok = await manager.open_account_browser(account_id)
+    if not ok:
+        raise HTTPException(404, "账号不存在或打开失败")
+    return {"ok": True}
+
+
+@app.post("/api/accounts/{account_id}/open-dashboard")
+async def open_dashboard(account_id: str):
+    """打开当前直播的 dashboardV4 大屏(需账号在直播,停 worker,关浏览器后自动重启)。"""
+    ok, msg = await manager.open_dashboard(account_id)
+    if not ok:
+        raise HTTPException(400, msg or "打开失败")
+    return {"ok": True}
+
+
 # ===================== 引擎 =====================
 @app.post("/api/engine/start")
 async def engine_start():
@@ -229,6 +326,12 @@ async def engine_fetch_now():
 
 
 # ===================== 直播大屏 =====================
+@app.get("/api/metrics/dictionary")
+async def metrics_dictionary():
+    """卡片可选指标清单(供前端配置 UI)。"""
+    return {"metrics": metric_dictionary(), "card_fields": config.get("card_fields") or DEFAULT_CARD_FIELDS}
+
+
 @app.get("/api/live-screen/status")
 async def live_screen_status():
     """各账号直播快照(读 worker 缓存)。"""
@@ -243,8 +346,10 @@ async def live_screen_status():
             "live_stats": info.get("live_stats") if info else None,
             "stream_url": info.get("stream_url") if info else None,
             "updated_at": info.get("updated_at") if info else None,
+            "is_live": bool(info.get("is_live")) if info else False,
+            "metrics": info.get("metrics") if info else None,
         })
-    return {"items": items}
+    return {"items": items, "card_fields": config.get("card_fields") or DEFAULT_CARD_FIELDS}
 
 
 # ===================== 评论 =====================
@@ -263,13 +368,27 @@ async def get_comments(
 
 @app.post("/api/comments/batch-delete")
 async def batch_delete_comments(body: schemas.BatchDeleteBody):
-    """批量删除评论:按 account_id 取 worker 串行删,逐条广播 comment_deleted。"""
+    """批量删除评论:按 account_id 取 worker 串行删,逐条广播 comment_deleted。
+
+    手动操作经 hold_for_manual 保持浏览器:整批期间只开一次进程,完成后延迟回收
+    (120s 无新操作才关),连续删除不反复开/关 Chromium。
+    """
     deleted = 0
     failed: list[dict] = []
+    held: dict = {}  # worker -> 本次 hold 是否成功(开浏览器失败则整批跳过该 worker)
     for item in body.items:
         w = manager.get_worker(item.account_id)
         if not w or not w.logged_in:
             failed.append({"comment_id": item.comment_id, "error": "账号未启动或未登录"})
+            continue
+        if w in held and not held[w]:
+            failed.append({"comment_id": item.comment_id, "error": "开浏览器失败,请检查登录状态"})
+            continue
+        # 首次:开浏览器+计时;同一 worker 后续条目:仅续期(不重复开进程)
+        ok = await w.hold_for_manual()
+        held[w] = ok
+        if not ok:
+            failed.append({"comment_id": item.comment_id, "error": "开浏览器失败,请检查登录状态"})
             continue
         try:
             resp = await w.api.delete_comment(item.export_id, item.comment_id)
@@ -281,6 +400,7 @@ async def batch_delete_comments(body: schemas.BatchDeleteBody):
             deleted += 1
         except Exception as e:
             failed.append({"comment_id": item.comment_id, "error": str(e)})
+    # 回收由各 worker 的延迟计时器统一处理(120s 无新操作才回收),无需在此逐一释放
     return {"ok": True, "deleted": deleted, "failed": failed}
 
 
@@ -289,6 +409,10 @@ async def reply_comment(comment_id: str, body: schemas.ManualReply):
     w = manager.get_worker(body.account_id)
     if not w or not w.logged_in:
         raise HTTPException(400, "账号未启动或未登录")
+    # 手动回复:保持浏览器,操作完成后延迟回收(连续回复只开一次进程)
+    ok = await w.hold_for_manual()
+    if not ok:
+        raise HTTPException(400, "开浏览器失败,请检查登录状态")
     resp = await w.api.reply_comment(comment_id, body.content)
     if not resp or resp.get("__err"):
         raise HTTPException(502, f"回复失败: {resp}")
@@ -302,6 +426,10 @@ async def delete_comment(comment_id: str, body: schemas.DeleteCommentBody):
     w = manager.get_worker(body.account_id)
     if not w or not w.logged_in:
         raise HTTPException(400, "账号未启动或未登录")
+    # 手动删除:保持浏览器,操作完成后延迟回收
+    ok = await w.hold_for_manual()
+    if not ok:
+        raise HTTPException(400, "开浏览器失败,请检查登录状态")
     resp = await w.api.delete_comment(body.export_id, comment_id)
     if not resp or resp.get("__err"):
         raise HTTPException(502, f"删除失败: {resp}")
@@ -315,6 +443,10 @@ async def pin_comment(comment_id: str, body: schemas.PinCommentBody):
     w = manager.get_worker(body.account_id)
     if not w or not w.logged_in:
         raise HTTPException(400, "账号未启动或未登录")
+    # 手动置顶:保持浏览器,操作完成后延迟回收
+    ok = await w.hold_for_manual()
+    if not ok:
+        raise HTTPException(400, "开浏览器失败,请检查登录状态")
     resp = await w.api.pin_comment(body.export_id, comment_id, body.op_type)
     if not resp or resp.get("__err"):
         raise HTTPException(502, f"置顶失败: {resp}")
@@ -370,6 +502,29 @@ async def set_auto_delete(body: schemas.AutoDeleteConfig):
         if w.auto_delete:
             w.auto_delete.update_config(config["auto_delete"])
     return {"ok": True, "auto_delete": config["auto_delete"]}
+
+
+@app.get("/api/auto-delete/logs")
+async def get_auto_delete_logs(
+    account_id: Optional[str] = None,
+    q: Optional[str] = None,
+    limit: int = Query(200, ge=1, le=2000),
+    offset: int = Query(0, ge=0),
+):
+    """自动删除记录(关键字命中删除日志)。带 account_name 便于前端展示。"""
+    items, total = storage.query_delete_logs(account_id=account_id, q=q,
+                                             limit=limit, offset=offset)
+    name_map = {a["id"]: a.get("name", a["id"]) for a in config.get("accounts", [])}
+    for it in items:
+        it["account_name"] = name_map.get(it["account_id"], it["account_id"])
+    return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+
+@app.delete("/api/auto-delete/logs")
+async def clear_auto_delete_logs(account_id: Optional[str] = None):
+    """清空删除记录(指定 account_id 则只清该账号)。"""
+    storage.clear_delete_logs(account_id=account_id)
+    return {"ok": True}
 
 
 # ===================== WebSocket =====================
