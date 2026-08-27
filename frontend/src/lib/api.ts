@@ -13,6 +13,7 @@ export interface AccountStatus {
   auto_comment_enabled: boolean
   auto_comment_content: string
   has_aid: boolean
+  wx_name: string
 }
 
 export interface EngineStatus {
@@ -50,6 +51,24 @@ export interface AutoDeleteConfig {
   keywords: string[]
 }
 
+export interface DeleteLogItem {
+  account_id: string
+  account_name: string
+  comment_id: string
+  export_id: string
+  nickname: string
+  content: string
+  keyword: string
+  deleted_at: string
+}
+
+export interface DeleteLogPage {
+  items: DeleteLogItem[]
+  total: number
+  limit: number
+  offset: number
+}
+
 export interface LiveStats {
   currentOnlineCount?: number
   totalAudienceCount?: number
@@ -69,12 +88,27 @@ export interface LiveScreenItem {
   live_stats: LiveStats | null
   stream_url: string | null
   updated_at: string | null
+  is_live?: boolean
+  metrics?: Record<string, number | null>  // dashboardV4 指标(按 metrics 字典 key,见 MetricDef)
+}
+
+export type MetricFormat = "int" | "float" | "currency" | "yuan" | "percent" | "duration"
+
+export interface MetricDef {
+  key: string
+  display_name: string
+  unit: string
+  format: MetricFormat
+  group: string
 }
 
 export interface AppConfig {
   fetch_interval_sec: number
   auto_reply: AutoReplyConfig
   accounts_count: number
+  card_fields: string[]
+  dashboard_interval_sec: number
+  live_check_interval_sec: number
 }
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
@@ -93,7 +127,7 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   getConfig: () => req<AppConfig>("/config"),
-  patchConfig: (body: Partial<{ fetch_interval_sec: number; auto_reply_enabled: boolean }>) =>
+  patchConfig: (body: Partial<{ fetch_interval_sec: number; auto_reply_enabled: boolean; card_fields: string[]; dashboard_interval_sec: number; live_check_interval_sec: number }>) =>
     req<{ ok: boolean; config: AppConfig }>("/config", { method: "PATCH", body: JSON.stringify(body) }),
 
   getAccounts: () => req<EngineStatus>("/accounts"),
@@ -106,6 +140,8 @@ export const api = {
   startAccount: (id: string) => req<{ ok: boolean; logged_in: boolean }>(`/accounts/${id}/start`, { method: "POST" }),
   reloginAccount: (id: string) => req<{ sid: string; status: string }>(`/accounts/${id}/relogin`, { method: "POST" }),
   stopAccount: (id: string) => req<{ ok: boolean }>(`/accounts/${id}/stop`, { method: "POST" }),
+  openAccountBrowser: (id: string) => req<{ ok: boolean }>(`/accounts/${id}/open-browser`, { method: "POST" }),
+  openDashboard: (id: string) => req<{ ok: boolean }>(`/accounts/${id}/open-dashboard`, { method: "POST" }),
 
   loginStart: () => req<{ sid: string; status: string }>("/accounts/login/start", { method: "POST" }),
   loginOpenWindow: (sid: string) => req<{ sid: string; status: string }>(`/accounts/login/${sid}/open-window`, { method: "POST" }),
@@ -143,8 +179,16 @@ export const api = {
   getAutoDelete: () => req<AutoDeleteConfig>("/auto-delete/rules"),
   setAutoDelete: (body: AutoDeleteConfig) =>
     req<{ ok: boolean; auto_delete: AutoDeleteConfig }>("/auto-delete/rules", { method: "PATCH", body: JSON.stringify(body) }),
+  getDeleteLogs: (params: { account_id?: string; q?: string; limit?: number; offset?: number } = {}) => {
+    const q = new URLSearchParams()
+    Object.entries(params).forEach(([k, v]) => v !== undefined && v !== "" && q.set(k, String(v)))
+    return req<DeleteLogPage>(`/auto-delete/logs?${q.toString()}`)
+  },
+  clearDeleteLogs: (account_id?: string) =>
+    req<{ ok: boolean }>(`/auto-delete/logs${account_id ? `?account_id=${account_id}` : ""}`, { method: "DELETE" }),
 
-  getLiveScreenStatus: () => req<{ items: LiveScreenItem[] }>("/live-screen/status"),
+  getLiveScreenStatus: () => req<{ items: LiveScreenItem[]; card_fields: string[] }>("/live-screen/status"),
+  getMetricsDictionary: () => req<{ metrics: MetricDef[]; card_fields: string[] }>("/metrics/dictionary"),
 
   exportCsvUrl: (account_id?: string) => `/api/comments/export${account_id ? `?account_id=${account_id}` : ""}`,
 }

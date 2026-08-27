@@ -18,11 +18,13 @@ const STATUS_TEXT: Record<Status, string> = {
   cancelled: "已取消",
 }
 
-export function AddAccountDialog({ open, onOpenChange, onDone, reloginAccountId }: {
+export function AddAccountDialog({ open, onOpenChange, onDone, reloginAccountId, reloginAccountName, reloginWxName }: {
   open: boolean
   onOpenChange: (v: boolean) => void
   onDone: () => void
   reloginAccountId?: string
+  reloginAccountName?: string
+  reloginWxName?: string
 }) {
   const [sid, setSid] = useState<string | null>(null)
   const [status, setStatus] = useState<Status>("starting")
@@ -59,10 +61,15 @@ export function AddAccountDialog({ open, onOpenChange, onDone, reloginAccountId 
     const s = sidRef.current
     if (!s) return
     try {
-      await api.loginFinalize(s, reloginAccountId, name || undefined)
+      const r = await api.loginFinalize(s, reloginAccountId, name || undefined)
+      const acc = r?.account as { _dedup_updated?: boolean; id?: string; name?: string } | undefined
       if (reloginAccountId) {
         await api.startAccount(reloginAccountId)
         toast.success("已重新登录并启动")
+      } else if (acc?._dedup_updated && acc.id) {
+        // 排重更新:后端已更新已有账号字段+cookie,这里重启加载新 cookie
+        await api.startAccount(acc.id).catch(() => {})
+        toast.success(`已更新账号${acc.name ? ` ${acc.name}` : ""} 并启动`)
       } else {
         toast.success("账号已添加")
       }
@@ -110,6 +117,12 @@ export function AddAccountDialog({ open, onOpenChange, onDone, reloginAccountId 
           <DialogTitle className="flex items-center gap-2"><Smartphone className="h-5 w-5 text-primary" />{reloginAccountId ? "重新登录" : "添加账号"}</DialogTitle>
           <DialogDescription className="sr-only">扫码登录视频号助手,软件自动抓取账号信息并保存</DialogDescription>
         </DialogHeader>
+
+        {/* 当前要登录的账号 + 微信号(方便用户确认用哪个微信扫哪个账号) */}
+        <div className="rounded-md bg-muted/40 px-3 py-2 text-xs space-y-0.5">
+          <div className="flex justify-between gap-2"><span className="text-muted-foreground">登录账号</span><span className="font-medium truncate ml-2">{reloginAccountName || "新账号"}</span></div>
+          {reloginWxName && <div className="flex justify-between gap-2"><span className="text-muted-foreground">原微信号</span><span className="font-medium truncate ml-2">{reloginWxName}</span></div>}
+        </div>
 
         <div className="flex flex-col items-center gap-3 py-6">
           {status === "failed" ? <AlertCircle className="h-10 w-10 text-destructive" />

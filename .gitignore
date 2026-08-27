@@ -23,3 +23,17 @@ build/
 
 # 日志
 *.log
+
+# 本地配置 / 账号数据(含本地账号,禁止提交)
+config.json
+
+# 前端构建产物(不应纳入版本库)
+frontend/dist/
+
+# 杂项垃圾 / 临时文件
+nul
+*.lnk
+*.timestamp-*.mjs
+build - 副本.bat
+frontend/NPM RUN BUIID.BAT
+

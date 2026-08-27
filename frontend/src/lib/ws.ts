@@ -8,7 +8,8 @@ export type WsEvent =
   | { event: "comments_update"; payload: { account_id: string; comments: unknown[] } }
   | { event: "comment_replied"; payload: { comment_id: string } }
   | { event: "comment_deleted"; payload: { comment_id: string } }
-  | { event: "live_screen_update"; payload: { account_id: string; name: string; live_stats: unknown; stream_url: string | null; updated_at: string } }
+  | { event: "live_screen_update"; payload: { account_id: string; name: string; live_stats: unknown; stream_url: string | null; updated_at: string; is_live?: boolean; metrics?: Record<string, number | null> } }
+  | { event: "relogin_queue"; payload: { active: string | null; active_name?: string; pending: string[] } }
 
 /**
  * WebSocket 订阅。自动重连。返回最近事件 + 订阅回调注册。

@@ -5,8 +5,12 @@
   2. 本地存每视频上次 commentCount,没增加的跳过
   3. 评论按 commentId 去重(已存在的 upsert,不重复计数)
 
+storage 调用一律走 _s() 放线程池(asyncio.to_thread),避免同步 SQLite 阻塞
+uvicorn 事件循环(多 worker 并发写锁等待会卡死事件循环,导致 8712 不响应)。
+
 返回 (扫描视频数, 新增评论数, 新评论列表[dict])--新评论列表供 WS 实时推送。
 """
+import asyncio
 import logging
 logger = logging.getLogger("sphgj")
 
@@ -34,6 +38,10 @@ class CommentFetcher:
         self.auto_commenter = auto_commenter
         self.auto_delete = auto_delete
 
+    async def _s(self, fn, *args):
+        """storage 同步方法放线程池执行,避免 SQLite 阻塞事件循环。"""
+        return await asyncio.to_thread(fn, *args)
+
     async def fetch_all(self, max_videos=None):
         """遍历所有视频,增量抓评论。返回 (扫描视频数, 新增评论数, 新评论列表, 已删评论 id 列表)。"""
         scanned = 0
@@ -56,7 +64,7 @@ class CommentFetcher:
                     continue
                 scanned += 1
                 # 新视频检测(本地无记录)-> 自动评论+置顶
-                is_new = self.storage.get_video_comment_count(self.account_id, oid) is None
+                is_new = (await self._s(self.storage.get_video_comment_count, self.account_id, oid)) is None
                 if is_new and self.auto_commenter:
                     try:
                         await self.auto_commenter.try_comment(oid)
@@ -64,17 +72,17 @@ class CommentFetcher:
                         logger.error(f"[{self.account_id}] 自动评论异常 {oid}: {e}")
                 # 优化1:没评论的跳过(仍记录评论数=0)
                 if not cc:
-                    self.storage.set_video_comment_count(self.account_id, oid, 0)
+                    await self._s(self.storage.set_video_comment_count, self.account_id, oid, 0)
                     continue
                 # 优化2:评论数没增加的跳过
-                prev = self.storage.get_video_comment_count(self.account_id, oid)
+                prev = await self._s(self.storage.get_video_comment_count, self.account_id, oid)
                 if prev is not None and prev == cc:
                     continue
                 # 抓评论
                 n, new_subs, del_ids = await self._fetch_comments_for_video(oid)
                 new_comments.extend(new_subs)
                 deleted_ids.extend(del_ids)
-                self.storage.set_video_comment_count(self.account_id, oid, cc)
+                await self._s(self.storage.set_video_comment_count, self.account_id, oid, cc)
                 if max_videos and scanned >= max_videos:
                     return scanned, len(new_comments), new_comments, deleted_ids
             last_buff = data.get("lastBuff") or ""
@@ -99,8 +107,8 @@ class CommentFetcher:
                 cid = cmt.get("commentId")
                 if not cid:
                     continue
-                is_new = not self.storage.is_comment_exists(cid)
-                self.storage.upsert_comment(self.account_id, export_id, cmt)
+                is_new = not (await self._s(self.storage.is_comment_exists, cid))
+                await self._s(self.storage.upsert_comment, self.account_id, export_id, cmt)
                 if is_new:
                     # 自动删除优先:命中关键字则删,不进新评论列表,不触发自动回复
                     deleted = False
@@ -125,8 +133,8 @@ class CommentFetcher:
                     sid = sub.get("commentId")
                     if not sid:
                         continue
-                    is_new_sub = not self.storage.is_comment_exists(sid)
-                    self.storage.upsert_comment(self.account_id, export_id, sub)
+                    is_new_sub = not (await self._s(self.storage.is_comment_exists, sid))
+                    await self._s(self.storage.upsert_comment, self.account_id, export_id, sub)
                     if is_new_sub:
                         deleted_sub = False
                         if self.auto_delete:

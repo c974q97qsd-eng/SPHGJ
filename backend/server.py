@@ -395,7 +395,12 @@ async def batch_delete_comments(body: schemas.BatchDeleteBody):
             if not resp or resp.get("__err"):
                 failed.append({"comment_id": item.comment_id, "error": f"删除失败: {resp}"})
                 continue
+            # 删除前取评论信息,写入删除记录模块(手动删除)
+            cinfo = storage.get_comment(item.comment_id)
             storage.delete_comment(item.comment_id)
+            storage.log_delete(item.account_id, item.comment_id,
+                               (cinfo or {}).get("nickname"), (cinfo or {}).get("content"),
+                               "手动删除", item.export_id)
             await hub.emit("comment_deleted", {"comment_id": item.comment_id})
             deleted += 1
         except Exception as e:
@@ -433,7 +438,12 @@ async def delete_comment(comment_id: str, body: schemas.DeleteCommentBody):
     resp = await w.api.delete_comment(body.export_id, comment_id)
     if not resp or resp.get("__err"):
         raise HTTPException(502, f"删除失败: {resp}")
+    # 删除前取评论信息,写入删除记录模块(手动删除)
+    cinfo = storage.get_comment(comment_id)
     storage.delete_comment(comment_id)
+    storage.log_delete(body.account_id, comment_id,
+                       (cinfo or {}).get("nickname"), (cinfo or {}).get("content"),
+                       "手动删除", body.export_id)
     await hub.emit("comment_deleted", {"comment_id": comment_id})
     return {"ok": True}
 

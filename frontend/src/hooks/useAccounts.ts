@@ -46,6 +46,8 @@ export function useAccountActions(refresh: () => void) {
     busy,
     start: (id: string) => act(id, api.startAccount),
     stop: (id: string) => act(id, api.stopAccount),
+    openBrowser: (id: string) => act(id, api.openAccountBrowser),
+    openDashboard: (id: string) => act(id, api.openDashboard),
     remove: (id: string, removeProfile: boolean) => act(id, (i) => api.deleteAccount(i, removeProfile)),
   }
 }
