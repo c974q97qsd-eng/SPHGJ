@@ -1,0 +1,26 @@
+{
+  "accounts": [
+    {
+      "id": "example_account_1",
+      "name": "示例账号",
+      "_aid": "<替换为登录后自动生成的 aid，请勿手填>",
+      "_log_finder_id": "<替换为登录后自动生成的 finder id，请勿手填>",
+      "profile_dir": "./profiles/example_account_1",
+      "auto_comment_enabled": true,
+      "auto_comment_content": "点头像，进入直播间领取优惠券下单！",
+      "_wx_name": "示例微信名"
+    }
+  ],
+  "fetch_interval_sec": 600,
+  "auto_reply": {
+    "enabled": false,
+    "rules": []
+  },
+  "db_path": "./data/sphgj.db",
+  "auto_delete": {
+    "enabled": true,
+    "keywords": [
+      "换成你的过滤关键字"
+    ]
+  }
+}
