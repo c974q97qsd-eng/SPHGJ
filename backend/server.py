@@ -6,7 +6,10 @@ Hub 把后端事件(qr_update/login_status/comments_update/engine_status)广播�
 import os
 import csv
 import json
+import sys
+import gc
 import asyncio
+from collections import Counter
 from datetime import datetime
 from typing import Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query
@@ -21,6 +24,7 @@ from .storage import Storage
 from .account_manager import AccountManager
 from . import schemas
 from .metrics import metric_dictionary, validate_card_fields, DEFAULT_CARD_FIELDS
+from .memtrim import trim_now
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 CONFIG_PATH = os.path.join(ROOT, "config.json")
@@ -193,6 +197,92 @@ async def patch_config(body: schemas.ConfigUpdate):
             w.config = config
     save_config(config)
     return {"ok": True, "config": await get_config()}
+
+
+@app.post("/api/system/memtrim")
+async def manual_memtrim():
+    """rev15 P0: 手动触发一次内存归还(gc.collect + 工作集压缩)。
+
+    定时 trim 每 memtrim_interval_sec(默认 600s)执行一次,且首次也要等一个完整周期;
+    提供手动端点便于立即验证效果 —— 直接对比返回里的 rss_mb_before / rss_mb_after,
+    或与任务管理器中 Python 进程占用对照。
+    """
+    try:
+        import psutil
+    except ImportError:
+        raise HTTPException(500, "未安装 psutil,无法读取进程内存")
+    proc = psutil.Process()
+    before = proc.memory_info().rss / 1024 / 1024
+    # to_thread:gc.collect() 全量回收是同步阻塞,不能卡住 uvicorn 事件循环
+    collected, ok = await asyncio.to_thread(trim_now)
+    after = proc.memory_info().rss / 1024 / 1024
+    logger.info(f"[memtrim] 手动触发: RSS {before:.1f}MB -> {after:.1f}MB"
+                f"(省 {before - after:.1f}MB, gc 回收 {collected} 对象)")
+    return {
+        "ok": True,
+        "gc_collected": collected,
+        "working_set_trimmed": ok,
+        "rss_mb_before": round(before, 1),
+        "rss_mb_after": round(after, 1),
+        "rss_mb_saved": round(before - after, 1),
+    }
+
+
+@app.get("/api/system/memdiag")
+async def mem_diagnose():
+    """rev15: 内存诊断 —— 报告进程 RSS,并按类型统计 gc 跟踪的存活对象。
+
+    判读方法(关键):
+      - tracked_mb 接近 rss_mb
+          -> 内存主要在 Python 对象里,看 top_types 找具体类型,针对性优化;
+      - tracked_mb 远小于 rss_mb(例:200MB vs 3500MB)
+          -> 差值 untracked_mb 是【原生内存】:Playwright 的 C++ driver、
+             Chromium 残留进程/共享内存、内存映射文件、未释放的原生 buffer。
+             此时优化 Python 对象【无效】,应改查浏览器生命周期与原生资源释放。
+
+    注意:这是重量级操作(遍历全部 gc 对象,大进程上需数秒且临时占用可观内存),
+    仅用于排查,不要高频调用。
+    """
+    try:
+        import psutil
+    except ImportError:
+        raise HTTPException(500, "未安装 psutil,无法读取进程内存")
+    proc = psutil.Process()
+    rss_mb = proc.memory_info().rss / 1024 / 1024
+
+    def _collect():
+        gc.collect()
+        objs = gc.get_objects()
+        counts = Counter()
+        sizes = Counter()
+        for o in objs:
+            try:
+                t = type(o).__name__
+            except Exception:
+                continue
+            counts[t] += 1
+            try:
+                sizes[t] += sys.getsizeof(o)
+            except Exception:
+                pass
+        del objs  # 尽早释放这份巨大的临时列表
+        return counts, sizes
+
+    # 重量级同步遍历放线程池,避免卡住 uvicorn 事件循环
+    counts, sizes = await asyncio.to_thread(_collect)
+    top = [
+        {"type": t, "count": counts[t], "size_mb": round(sizes[t] / 1024 / 1024, 2)}
+        for t, _ in sizes.most_common(20)
+    ]
+    tracked_mb = sum(sizes.values()) / 1024 / 1024
+    logger.info(f"[memdiag] RSS={rss_mb:.1f}MB 可跟踪对象={tracked_mb:.1f}MB "
+                f"(原生/未跟踪 {rss_mb - tracked_mb:.1f}MB)")
+    return {
+        "rss_mb": round(rss_mb, 1),
+        "tracked_mb": round(tracked_mb, 1),
+        "untracked_mb": round(rss_mb - tracked_mb, 1),
+        "top_types": top,
+    }
 
 
 # ===================== 扫码登录(须在 {account_id} 路由之前注册,否则

@@ -30,6 +30,12 @@ def _shape(account_id, export_id, cmt):
 
 
 class CommentFetcher:
+    # 流式推送阈值:新评论缓冲累积到该条数即推送一次并清空。
+    # 目的:高评论量账号(如直播中)一次扫描可能产生数千条新评论,全量堆在内存里等
+    # fetch_all 结束才推送 -> 峰值内存 O(总评论数);分批推送后缓冲恒定在阈值规模,
+    # 峰值降到 O(阈值)。200 条约 100KB,对推送开销与内存占用的折中取值。
+    FLUSH_THRESHOLD = 200
+
     def __init__(self, api_client, storage, account_id, auto_reply=None, auto_commenter=None, auto_delete=None):
         self.api = api_client
         self.storage = storage
@@ -42,11 +48,33 @@ class CommentFetcher:
         """storage 同步方法放线程池执行,避免 SQLite 阻塞事件循环。"""
         return await asyncio.to_thread(fn, *args)
 
-    async def fetch_all(self, max_videos=None):
-        """遍历所有视频,增量抓评论。返回 (扫描视频数, 新增评论数, 新评论列表, 已删评论 id 列表)。"""
+    async def _flush(self, new_comments, deleted_ids, on_batch):
+        """流式推送:把累积的新评论/已删 id 交给回调,成功后清空缓冲。
+
+        异常时【不清空】——保留缓冲,由 fetch_all 的最终返回值补发,保证不丢评论。
+        """
+        if not on_batch or (not new_comments and not deleted_ids):
+            return
+        try:
+            await on_batch(list(new_comments), list(deleted_ids))
+        except Exception as e:
+            logger.error(f"[{self.account_id}] 流式推送失败,保留缓冲由最终结果补发: {e}")
+            return
+        new_comments.clear()
+        deleted_ids.clear()
+
+    async def fetch_all(self, max_videos=None, on_batch=None):
+        """遍历所有视频,增量抓评论。返回 (扫描视频数, 新增评论数, 新评论列表, 已删评论 id 列表)。
+
+        on_batch: 可选 async 回调 fn(comments, deleted_ids)。给定时启用【流式推送】——
+                  缓冲累积到 FLUSH_THRESHOLD 条即推送并清空,避免高评论量账号在内存堆积
+                  全量新评论。不传则保持原有行为(全部抓完一次性返回)。
+                  注意:返回的"新评论列表"仅含【未推送完的剩余部分】,新增数则是完整总数。
+        """
         scanned = 0
-        new_comments = []
+        new_comments = []   # 待推送缓冲(流式模式下会周期性清空)
         deleted_ids = []
+        total_new = 0       # 新增总数(独立于缓冲:流式清空后计数仍准确)
         last_buff = ""
         while True:
             resp = await self.api.fetch_video_list(last_buff=last_buff, only_unread=False)
@@ -79,19 +107,27 @@ class CommentFetcher:
                 if prev is not None and prev == cc:
                     continue
                 # 抓评论
-                n, new_subs, del_ids = await self._fetch_comments_for_video(oid)
+                n, new_subs, del_ids = await self._fetch_comments_for_video(oid, on_batch=on_batch)
+                total_new += n
                 new_comments.extend(new_subs)
                 deleted_ids.extend(del_ids)
+                # 流式:缓冲达阈值即推送并清空(单视频内部也会 flush,这里兜住跨视频累积)
+                if on_batch and len(new_comments) >= self.FLUSH_THRESHOLD:
+                    await self._flush(new_comments, deleted_ids, on_batch)
                 await self._s(self.storage.set_video_comment_count, self.account_id, oid, cc)
                 if max_videos and scanned >= max_videos:
-                    return scanned, len(new_comments), new_comments, deleted_ids
+                    return scanned, total_new, new_comments, deleted_ids
             last_buff = data.get("lastBuff") or ""
             if not last_buff:
                 break
-        return scanned, len(new_comments), new_comments, deleted_ids
+        return scanned, total_new, new_comments, deleted_ids
 
-    async def _fetch_comments_for_video(self, export_id):
-        """抓单个视频所有评论(分页 lastBuff)。返回 (新增数, 新评论列表, 已删评论 id 列表)。"""
+    async def _fetch_comments_for_video(self, export_id, on_batch=None):
+        """抓单个视频所有评论(分页 lastBuff)。返回 (新增数, 新评论列表, 已删评论 id 列表)。
+
+        on_batch 给定时,缓冲达阈值即推送并清空;返回的列表仅含未推送完的剩余部分,
+        新增数 new_count 是完整总数(流式清空不影响计数)。
+        """
         new_count = 0
         new_list = []
         deleted_ids = []
@@ -122,6 +158,9 @@ class CommentFetcher:
                     else:
                         new_count += 1
                         new_list.append(_shape(self.account_id, export_id, cmt))
+                        # 流式:单视频内评论量大时(直播中)及时推送,避免缓冲膨胀
+                        if on_batch and len(new_list) >= self.FLUSH_THRESHOLD:
+                            await self._flush(new_list, deleted_ids, on_batch)
                         # 未删的新评论触发自动回复
                         if self.auto_reply:
                             try:
@@ -147,6 +186,8 @@ class CommentFetcher:
                         else:
                             new_count += 1
                             new_list.append(_shape(self.account_id, export_id, sub))
+                            if on_batch and len(new_list) >= self.FLUSH_THRESHOLD:
+                                await self._flush(new_list, deleted_ids, on_batch)
             last_buff = data.get("lastBuff") or ""
             if not last_buff or not comments:
                 break

@@ -227,6 +227,8 @@ class LiveFetcher:
                 except Exception:
                     pass
                 self._learning = False
+                # rev15 P3: 学完即剔除 cookie,释放常驻内存
+                self._strip_cookie_headers()
                 logger.info(f"[live:{self.account_id}] 已动态学到直播检测 API,关闭常驻请求监听(改为主动轮询)")
         except Exception:
             pass  # CDP 回调不允许异常上抛
@@ -239,6 +241,21 @@ class LiveFetcher:
             "headers": req.get("headers", {}) or {},
             "postData": req.get("postData"),
         }
+
+    def _strip_cookie_headers(self):
+        """rev15 P3: 学到 API 规格后剔除 cookie,释放常驻内存。
+
+        重放走 page.evaluate(fetch) 且带 credentials:'include',浏览器会【自动附加】当前源
+        的 cookie —— 显式传递 cookie 既冗余,又是 headers 里体积最大的一项(视频号会话
+        cookie 常 2~8KB,且随会话增长)。4 账号 × 2 接口常驻,累积可达数十 KB 且永不释放。
+
+        仅剔除 cookie,保留其余功能性 header(如 authorization/x-wechat-* 等),
+        避免误伤重放鉴权导致回退到 CDP 高内存模式。
+        """
+        for spec in self._learned.values():
+            headers = spec.get("headers") or {}
+            for k in ("cookie", "Cookie"):
+                headers.pop(k, None)
 
     async def poll(self):
         """rev13: 主动轮询 get_live_info/check_live_status(同源 fetch,替代常驻 CDP 响应监听)。
@@ -630,7 +647,17 @@ class LiveFetcher:
             else:
                 summary = r
         metrics = extract_all(conv, dist, summary)
-        self._dashboard_cache = metrics
+        # rev15 P1: 立即释放原始大响应。conv 含 trendingSource(时间序列,数百点)与
+        # portraitAudience(多维人群画像),单响应可达数 MB;三个经 asyncio.gather 并行返回后
+        # 同时驻留 -> 形成每周期的峰值内存。extract_all 已提取出全部标量指标,原始 dict 不再
+        # 需要 -> 显式解除引用,不等 GC 分代周期(gen2 回收在长跑进程中可能滞留很久)。
+        del conv, dist, summary
+        # 原地复用缓存 dict:避免每周期丢弃旧 dict 再新建,减少堆碎片
+        if self._dashboard_cache:
+            self._dashboard_cache.clear()
+            self._dashboard_cache.update(metrics)
+        else:
+            self._dashboard_cache = metrics
         self._dashboard_ts = time.time()
         if any(v is not None for v in metrics.values()):
             self._dash_fail_warned = False

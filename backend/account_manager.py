@@ -22,6 +22,7 @@ from .auto_comment import AutoCommenter
 from .login_capture import LoginSession
 from .browser import launch_stealth, close_context_safely
 from .selectors import COMMENT_URL, POST_CREATE_URL
+from .memtrim import MemoryTrimmer
 
 
 def _in_night_hours(night_hours):
@@ -394,7 +395,9 @@ class AccountWorker:
                     continue
                 if self.logged_in and self.fetcher:
                     try:
-                        scanned, new_c, new_comments, deleted_ids = await self.fetcher.fetch_all()
+                        # rev15 P2: 传 on_batch 启用流式推送,避免高评论量账号在内存堆积全量新评论
+                        scanned, new_c, new_comments, deleted_ids = await self.fetcher.fetch_all(
+                            on_batch=self._emit_comment_batch)
                         self.last_scan_at = datetime.now().isoformat()
                         if new_c:
                             today = datetime.now().strftime("%Y-%m-%d")
@@ -432,6 +435,18 @@ class AccountWorker:
         finally:
             await self.release_idle_browser()
         return 0, 0, [], []
+
+    async def _emit_comment_batch(self, comments, deleted_ids):
+        """rev15 P2: 评论流式推送回调(由 CommentFetcher 在缓冲达阈值时调用)。
+
+        与抓取结束后的最终推送走同一套事件(comments_update / comment_deleted),
+        前端无需改动;分批推送让缓冲恒定在阈值规模,峰值内存从 O(总评论数) 降到 O(阈值)。
+        """
+        if comments:
+            await self._emit("comments_update",
+                             {"account_id": self.account["id"], "comments": comments})
+        for cid in deleted_ids:
+            await self._emit("comment_deleted", {"comment_id": cid})
 
     def start_live_loop(self):
         if self._live_loop_task is None or self._live_loop_task.done():
@@ -488,11 +503,15 @@ class AccountWorker:
             lf = self.live_fetcher
             if self.logged_in and self.context:
                 now = time.time()
-                # 每 ~48 分钟 close+重建 live_page(替代 reload):reload 不退出 Chromium renderer,
+                # 每 ~30 分钟 close+重建 live_page(替代 reload):reload 不退出 Chromium renderer,
                 # 直播期间 FLV 流涨到的峰值内存不归还 OS;close page 触发 renderer 退出归还内存,
                 # 新 page 起新 renderer 重新加载,长跑内存增长比 reload 彻底。
+                # rev15 P4: 周期 48min -> 30min(config.live_page_rebuild_sec 可调)。
+                # 依据:长时间直播(6h+)时 renderer 的 JS 堆/DOM 树仍缓慢增长,缩短周期可更频繁
+                # 释放;重建有约 15s 数据空窗(转诊断用 pending 标记),30min 是空窗频率与内存增长的折中。
                 self._last_live_reload = getattr(self, "_last_live_reload", 0.0)
-                if self.live_page and now - self._last_live_reload >= 2880:
+                rebuild_sec = int(self.config.get("live_page_rebuild_sec", 1800))
+                if self.live_page and now - self._last_live_reload >= rebuild_sec:
                     rebuilt = False
                     try:
                         if lf:
@@ -715,6 +734,8 @@ class AccountManager:
         self._relogin_active_acc = None  # 当前正在 auto-relogin 的 account_id
         self._relogin_active_sid = None
         self._open_browsers = {}         # account_id -> headed BrowserContext(用户手动操作)
+        # rev15 P0: 定时内存归还(gc.collect + 工作集压缩),解决 Python 分配器不归还 OS 的 RSS 膨胀
+        self._memtrim = MemoryTrimmer(int(config.get("memtrim_interval_sec", 600)))
 
     async def _ensure_playwright(self):
         if self._playwright is None:
@@ -768,6 +789,8 @@ class AccountManager:
     async def start(self, headless=True):
         await self._ensure_playwright()
         self._running = True
+        # rev15 P0: 启动定时内存归还(独立于账号,引擎运行期间常驻)
+        self._memtrim.start()
         # 评论抓取全局串行锁:多账号经此锁 + _cycle_offset 错峰,形成"间隔排队",
         # 任意时刻最多 1 个账号在抓,浏览器不并发常驻(省内存)。
         self._fetch_lock = asyncio.Lock()
@@ -803,6 +826,8 @@ class AccountManager:
 
     async def stop(self):
         self._running = False
+        # rev15 P0: 停掉定时内存归还
+        self._memtrim.stop()
         # 并发关闭各 worker:多账号串行关带 FLV 流的 context 很慢,
         # 易触发 graceful_shutdown 的 5s 超时;return_exceptions 保证
         # 单个 worker 失败不中断其余(每个 w.stop 内部已吞 context.close 异常)。
