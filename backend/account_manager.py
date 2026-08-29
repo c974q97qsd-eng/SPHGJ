@@ -93,6 +93,8 @@ class AccountWorker:
         # 直播信号丢失自恢复:重载 live_page 重试捕获(避免账号实际在播却因捕获瞬断被误关,需手动重启)
         self._live_nosignal_reloads = 0
         self._live_last_reload_attempt = 0.0
+        # rev16 F2: 判定信号丢失后原地重试 poll 的计数(信号恢复即清零)
+        self._live_poll_retry = 0
 
     async def start(self, playwright, headless=True):
         self._pw = playwright
@@ -384,6 +386,15 @@ class AccountWorker:
         # 错峰:首个账号 offset 由 manager 分配(均匀错开 0~interval),避免同时拉起浏览器
         await asyncio.sleep(self._cycle_offset)
         while self._running:
+            # rev16 F3: 直播期间评论抓取降频。
+            # 直播中评论主要由直播间产生(live_page 侧流式处理),而 fetch_all() 是遍历该账号
+            # 【全部视频】逐个分页拉评论 —— 开销大(ensure_browser + 遍历视频 + 分页请求)
+            # 但直播期间收益极低。账号在播时改用 live_fetch_interval_sec(默认 3600s),
+            # 省约 83% 抓取开销;设为 0 则直播期间完全跳过(直播检测仍由 _live_loop 负责)。
+            live_fetch_interval = int(self.config.get("live_fetch_interval_sec", 3600))
+            if self.live_fetcher is not None and live_fetch_interval == 0:
+                await asyncio.sleep(30)
+                continue
             # 串行抓取:全局队列锁,保证多账号不同时拉起浏览器(省内存 + 防风控关联)
             if self._fetch_lock is not None:
                 await self._fetch_lock.acquire()
@@ -422,9 +433,15 @@ class AccountWorker:
                 # 无动作(非直播/无手动操作)则收回浏览器进程省内存
                 await self.release_idle_browser()
             # 夜间降频(0~6 点间隔拉长)+ 抖动
-            cur = interval
-            if _in_night_hours(night_hours):
-                cur = int(interval * night_mult)
+            # rev16 F3: 账号在播时改用直播专用间隔(已足够长,不再叠加夜间倍率 ——
+            # 夜间倍率是为风控降频设计,3600s 本身即很保守,叠加后单夜仅 0~1 次意义不大,
+            # 且会让"直播结束前后的评论"延迟过久才被捕获)。
+            if self.live_fetcher is not None and live_fetch_interval > 0:
+                cur = live_fetch_interval
+            else:
+                cur = interval
+                if _in_night_hours(night_hours):
+                    cur = int(interval * night_mult)
             await asyncio.sleep(cur + random.uniform(0, min(cur, 30)))
 
     async def fetch_once(self):
@@ -514,11 +531,15 @@ class AccountWorker:
                 if self.live_page and now - self._last_live_reload >= rebuild_sec:
                     rebuilt = False
                     try:
+                        # rev16 F4: 先取出旧实例已学的 API 规格,重建后继承(省去重学空窗)。
+                        # 必须在 close() 前取值,close() 可能清空 _learned。
+                        inherited_learned = dict(lf._learned) if (lf and getattr(lf, "_learned", None)) else None
                         if lf:
                             await lf.close()  # P0: 清回调+挂起 task
                         await self.live_page.close()         # 关 page 促 renderer 退出
                         self.live_page = await self.context.new_page()
-                        lf = LiveFetcher(self.live_page, self.account["id"])
+                        lf = LiveFetcher(self.live_page, self.account["id"],
+                                         learned=inherited_learned)
                         self.live_fetcher = lf
                         await lf.goto_live()
                         self._last_live_reload = now
@@ -571,13 +592,30 @@ class AccountWorker:
                             self._last_g30 = gmv
                             self._ts_30m = now
                             self._persist_window("30m", now, audience, gmv, 0, self._gmv_30m)
-                    # is_live: 有 live_stats 且 get_live_info 近期仍返回数据(30秒内)
+                    # rev16 F1: is_live 判定窗口 30s -> live_signal_lost_sec(默认 90s)。
+                    # 原 30s 过紧:poll 是 page.evaluate(fetch) 重放,单轮偶发失败(页面卡顿、
+                    # 网络抖动、JS 上下文繁忙)就会让 updated_at_ts 停滞,30s 一到即误判
+                    # "信号丢失" -> 销毁重建 LiveFetcher(重学 API + reload 页面 + 数秒空窗),
+                    # 代价远大于瞬断本身。放宽到 90s 可容忍连续多轮失败。
                     last_ts = lf.updated_at_ts or 0
-                    info["is_live"] = bool(info.get("live_stats") and (now - last_ts < 30))
-                    # 自恢复:账号实际可能在播,但 check_live_status 捕获偶发瞬断(长驻页面常见)。
-                    # 信号丢失 >120s 不直接关页,而是重载 live_page 重触发捕获(最多 3 次,间隔 60s),
-                    # 成功拿到信号则继续流式;彻底失败(3 次仍无)才判定下播关页回收。
+                    signal_lost_sec = int(self.config.get("live_signal_lost_sec", 90))
+                    info["is_live"] = bool(info.get("live_stats") and (now - last_ts < signal_lost_sec))
                     if not info["is_live"]:
+                        # rev16 F2: 判定信号丢失后,先原地快速重试 poll(不销毁重建)。
+                        # 绝大多数瞬断在 1~2 轮重试内恢复;仅重试耗尽才走代价高昂的 reload/关页。
+                        max_retry = int(self.config.get("live_poll_retry", 3))
+                        retry_gap = int(self.config.get("live_poll_retry_gap_sec", 8))
+                        if (self._live_poll_retry or 0) < max_retry:
+                            self._live_poll_retry = (self._live_poll_retry or 0) + 1
+                            logger.info(f"[{self.account['id']}] 直播信号中断"
+                                        f"(距今{int(now - last_ts)}s),原地重试 poll "
+                                        f"(第{self._live_poll_retry}次/最多{max_retry}次)")
+                            await asyncio.sleep(retry_gap)
+                            continue
+                        # 重试耗尽:确认真丢失,走原自愈/关页流程
+                        # 自恢复:账号实际可能在播,但 check_live_status 捕获偶发瞬断(长驻页面常见)。
+                        # 信号丢失 >120s 不直接关页,而是重载 live_page 重触发捕获(最多 3 次,间隔 60s),
+                        # 成功拿到信号则继续流式;彻底失败(3 次仍无)才判定下播关页回收。
                         idle = (now - self._live_opened_ts) if last_ts == 0 else (now - last_ts)
                         page_alive = bool(self.live_page) and "liveBuild" in (self.live_page.url or "")
                         can_reload = page_alive and (self._live_nosignal_reloads or 0) < 3 \
@@ -586,10 +624,15 @@ class AccountWorker:
                             self._live_nosignal_reloads = (self._live_nosignal_reloads or 0) + 1
                             self._live_last_reload_attempt = now
                             try:
+                                # rev16 F4: 先取出旧实例已学的 API 规格,重建后继承,
+                                # 避免重新走 requestWillBeSent 学习流程(省去数秒恢复空窗)。
+                                # 注意必须先取值再 close(),close() 可能清空 _learned。
+                                inherited_learned = dict(lf._learned) if (lf and getattr(lf, "_learned", None)) else None
                                 if lf:
                                     await lf.close()
                                 await self.live_page.reload(wait_until="domcontentloaded")
-                                lf = LiveFetcher(self.live_page, self.account["id"])
+                                lf = LiveFetcher(self.live_page, self.account["id"],
+                                                 learned=inherited_learned)
                                 self.live_fetcher = lf
                                 await lf.goto_live()
                                 self._last_live_reload = now
@@ -628,6 +671,8 @@ class AccountWorker:
                             continue
                     # 成功拿到直播信号:重置自愈重试计数,便于下次真正瞬断时重新自愈
                     self._live_nosignal_reloads = 0
+                    # rev16 F2: 信号恢复即清零 poll 重试计数,下次真瞬断时重新走满重试额度
+                    self._live_poll_retry = 0
                     # dashboardV4 指标,按 config.dashboard_interval_sec 抓(需 live_object_id,账号在直播)
                     if lf.live_object_id and now - (lf._dashboard_ts or 0) >= dash_interval:
                         try:

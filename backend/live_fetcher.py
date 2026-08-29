@@ -73,7 +73,13 @@ _SLIM_FLV_URLS = ["*.flv*", "*.m3u8*", "*wxlivecdn*", "*trtc*"]
 
 
 class LiveFetcher:
-    def __init__(self, page, account_id):
+    def __init__(self, page, account_id, learned=None):
+        """learned: rev16 F4 —— 继承上一实例的 API 规格 {name: spec}。
+
+        重建 live_page(信号丢失自愈 / 定期释放 renderer)时传入旧实例的 _learned,
+        新实例可跳过 requestWillBeSent 学习流程直接 poll,消除重学期间的数秒恢复空窗。
+        继承来的 spec 仍可能因会话失效而重放失败,因此 poll 的"连续失败回退 CDP"兜底不变。
+        """
         self.page = page
         self.account_id = account_id
         self.live_stats = None
@@ -95,8 +101,10 @@ class LiveFetcher:
         self._cdp_ready = False  # Network.enable 是否已发送
         self._slim_task = None   # route 内异步触发精简的 task 引用(防 GC)
         # rev13: 主动轮询相关
-        self._learned = {}              # {"live_info": spec, "live_status": spec} 动态学到的请求规格
-        self._learning = True           # 是否仍在监听页面请求以学习 API
+        # rev16 F4: learned 非空时视为"已学会",跳过 requestWillBeSent 监听直接 poll
+        self._learned = dict(learned) if learned else {}   # {"live_info": spec, "live_status": spec}
+        self._inherited = bool(learned)                    # 规格是否来自继承(用于日志区分)
+        self._learning = not self._learned                 # 已继承则无需再学
         self._learn_deadline = 0.0      # 学习超时阈值(>此时间未学到则回退 CDP)
         self._poll_fail_streak = 0      # 主动轮询连续失败计数
         self._cdp_fallback = False      # 主动轮询不可用回退到 CDP 响应捕获
@@ -116,10 +124,15 @@ class LiveFetcher:
             self._cdp = await self.page.context.new_cdp_session(self.page)
             await self._cdp.send("Network.enable")
             self._cdp_ready = True
-            # 仅短暂监听请求以【动态学到】直播检测 API(学到后由 _on_req_learn 自动关闭)
-            self._cdp.on("Network.requestWillBeSent", self._on_req_learn)
-            self._learn_deadline = time.time() + 15  # 15s 内学不到则回退 CDP
-            logger.debug(f"[live:{self.account_id}] CDP session 已建(Network 域已启用,启动 API 学习)")
+            if self._learning:
+                # 仅短暂监听请求以【动态学到】直播检测 API(学到后由 _on_req_learn 自动关闭)
+                self._cdp.on("Network.requestWillBeSent", self._on_req_learn)
+                self._learn_deadline = time.time() + 15  # 15s 内学不到则回退 CDP
+                logger.debug(f"[live:{self.account_id}] CDP session 已建(Network 域已启用,启动 API 学习)")
+            else:
+                # rev16 F4: 继承到规格,不注册学习监听 —— 零事件 churn,首轮 poll 即可出数
+                logger.info(f"[live:{self.account_id}] 继承已学 API 规格(跳过学习监听),"
+                            f"可直接主动轮询: {sorted(self._learned.keys())}")
         except Exception as e:
             logger.warning(f"[live:{self.account_id}] CDP session 创建失败(降级:主动轮询不可用,将无直播数据): {e}")
         await self._install_flv_route()
