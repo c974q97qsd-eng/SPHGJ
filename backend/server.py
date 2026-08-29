@@ -8,6 +8,7 @@ import csv
 import json
 import sys
 import gc
+import types
 import itertools
 import asyncio
 from collections import Counter
@@ -291,6 +292,52 @@ async def mem_diagnose(holders: bool = False):
                     break
         return out
 
+    def _referrer_chain(target, depth=3, min_len=20000):
+        """自大容器向上追引用链,找出"谁持有它"。
+
+        gc.get_referrers 是 O(全部gc对象) 的重操作,故只对最大的 1 个容器做、
+        且限制深度。每层报告:持有者类型/长度/瞥一眼内容,并挑出其中最大的
+        容器作为下一环 —— 这样能一路追到真正的根(模块级缓存/实例属性等)。
+        """
+        chain = []
+        cur = target
+        seen = {id(target)}
+        for _ in range(depth):
+            try:
+                refs = gc.get_referrers(cur)
+            except Exception:
+                break
+            best, best_len, kinds = None, -1, Counter()
+            for r in refs:
+                if r is cur or isinstance(r, (types.FrameType, types.TracebackType)):
+                    continue
+                tn = type(r).__name__
+                try:
+                    ln = len(r)
+                except Exception:
+                    ln = -1
+                kinds[f"{tn}(len={ln})" if ln >= 0 else tn] += 1
+                if ln > best_len and id(r) not in seen:
+                    best, best_len = r, ln
+            # len = 当前这一环自身的长度;held_by = 谁持有它(两者语义不同,不可混用)
+            try:
+                self_len = len(cur)
+            except Exception:
+                self_len = None
+            chain.append({
+                "type": type(cur).__name__,
+                "len": self_len,
+                "held_by": (f"{type(best).__name__}(len={best_len})" if best is not None else None),
+                "referrer_kinds": [f"{k} x{v}" for k, v in kinds.most_common(6)],
+                "peek": _peek(cur),
+            })
+            del refs
+            if best is None or best_len < min_len:
+                break
+            seen.add(id(best))
+            cur = best
+        return chain
+
     def _collect():
         gc.collect()
         objs = gc.get_objects()
@@ -320,16 +367,28 @@ async def mem_diagnose(holders: bool = False):
                         "type": t,
                         "len": ln,
                         "peek": _peek(o),
+                        "__obj": o,   # 仅内部用于追链,序列化前剔除
                     })
+        chain = []
         if holders_on:
             holders.sort(key=lambda x: -x["len"])
             holders = holders[:15]
             samples = _sample_dict_keys(objs)
-        del objs  # 尽早释放这份巨大的临时列表
-        return counts, sizes, holders, samples
+            # 追链必须在 del objs 之后:objs 自身引用了所有对象,
+            # 否则 get_referrers 会把这个巨大的临时 list 当成"持有者",污染结果。
+            top_obj = holders[0]["__obj"] if holders else None
+            del objs  # 尽早释放这份巨大的临时列表
+            if top_obj is not None:
+                chain = _referrer_chain(top_obj)
+            top_obj = None
+        else:
+            del objs  # 尽早释放这份巨大的临时列表
+        for h in holders:
+            h.pop("__obj", None)
+        return counts, sizes, holders, samples, chain
 
     # 重量级同步遍历放线程池,避免卡住 uvicorn 事件循环
-    counts, sizes, holders, samples = await asyncio.to_thread(_collect)
+    counts, sizes, holders, samples, chain = await asyncio.to_thread(_collect)
     top = [
         {"type": t, "count": counts[t], "size_mb": round(sizes[t] / 1024 / 1024, 2)}
         for t, _ in sizes.most_common(20)
@@ -346,6 +405,7 @@ async def mem_diagnose(holders: bool = False):
     if holders_on:
         out["big_holders"] = holders
         out["dict_key_samples"] = samples
+        out["referrer_chain"] = chain  # 自最大容器向上追持有者
     return out
 
 
