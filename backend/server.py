@@ -8,6 +8,7 @@ import csv
 import json
 import sys
 import gc
+import itertools
 import asyncio
 from collections import Counter
 from datetime import datetime
@@ -229,7 +230,7 @@ async def manual_memtrim():
 
 
 @app.get("/api/system/memdiag")
-async def mem_diagnose():
+async def mem_diagnose(holders: bool = False):
     """rev15: 内存诊断 —— 报告进程 RSS,并按类型统计 gc 跟踪的存活对象。
 
     判读方法(关键):
@@ -240,6 +241,11 @@ async def mem_diagnose():
              Chromium 残留进程/共享内存、内存映射文件、未释放的原生 buffer。
              此时优化 Python 对象【无效】,应改查浏览器生命周期与原生资源释放。
 
+    ?holders=1 追加"大容器定位"(rev17):找出 len >= 20000 的容器并瞥一眼内容,
+      用于回答"这几百个小对象到底被谁持有" —— 数量与容器数不匹配时(如 849 万个 dict
+      却只有 16 万个 list),大容器就是持有者。仅瞥前 3 个键/元素,绝不 repr 整个容器。
+      另附 dict key 采样,用于判断 dict 的种类(CDP 事件 / 业务指标 / 评论 / 其它)。
+
     注意:这是重量级操作(遍历全部 gc 对象,大进程上需数秒且临时占用可观内存),
     仅用于排查,不要高频调用。
     """
@@ -249,12 +255,51 @@ async def mem_diagnose():
         raise HTTPException(500, "未安装 psutil,无法读取进程内存")
     proc = psutil.Process()
     rss_mb = proc.memory_info().rss / 1024 / 1024
+    holders_on = bool(holders)
+
+    def _peek(o, n=3):
+        """安全地瞥一眼大容器内容(绝不 repr 整个容器 —— 百万级容器会炸内存)。"""
+        try:
+            if isinstance(o, dict):
+                ks = list(itertools.islice(o.keys(), n))
+                return "keys: " + ", ".join(repr(k)[:38] for k in ks)
+            if isinstance(o, (list, tuple, set, frozenset)):
+                els = list(itertools.islice(o, n))
+                return "els: " + ", ".join(type(e).__name__ for e in els)
+        except Exception:
+            pass
+        return ""
+
+    def _sample_dict_keys(objs, want=10, lo=3, hi=14):
+        """采样小 dict 的 key 集合 —— 用于判断 dict 是 CDP 事件/业务指标/评论 还是别的。"""
+        out = []
+        for o in objs:
+            if type(o) is not dict:
+                continue
+            try:
+                n = len(o)
+            except Exception:
+                continue
+            if lo <= n <= hi:
+                try:
+                    ks = sorted(str(k) for k in o.keys())[:12]
+                except Exception:
+                    continue
+                if ks not in out:
+                    out.append(ks)
+                if len(out) >= want:
+                    break
+        return out
 
     def _collect():
         gc.collect()
         objs = gc.get_objects()
         counts = Counter()
         sizes = Counter()
+        holders = []
+        samples = []
+        # 容器长度阈值:只关心"大到不正常"的容器(普通业务容器远达不到)
+        HOLD_MIN = int(os.environ.get("MEMDIAG_HOLD_MIN", 20000))
         for o in objs:
             try:
                 t = type(o).__name__
@@ -265,11 +310,26 @@ async def mem_diagnose():
                 sizes[t] += sys.getsizeof(o)
             except Exception:
                 pass
+            if holders_on and t not in ("str", "bytes", "bytearray"):
+                try:
+                    ln = len(o)
+                except Exception:
+                    ln = -1
+                if ln >= HOLD_MIN:
+                    holders.append({
+                        "type": t,
+                        "len": ln,
+                        "peek": _peek(o),
+                    })
+        if holders_on:
+            holders.sort(key=lambda x: -x["len"])
+            holders = holders[:15]
+            samples = _sample_dict_keys(objs)
         del objs  # 尽早释放这份巨大的临时列表
-        return counts, sizes
+        return counts, sizes, holders, samples
 
     # 重量级同步遍历放线程池,避免卡住 uvicorn 事件循环
-    counts, sizes = await asyncio.to_thread(_collect)
+    counts, sizes, holders, samples = await asyncio.to_thread(_collect)
     top = [
         {"type": t, "count": counts[t], "size_mb": round(sizes[t] / 1024 / 1024, 2)}
         for t, _ in sizes.most_common(20)
@@ -277,12 +337,16 @@ async def mem_diagnose():
     tracked_mb = sum(sizes.values()) / 1024 / 1024
     logger.info(f"[memdiag] RSS={rss_mb:.1f}MB 可跟踪对象={tracked_mb:.1f}MB "
                 f"(原生/未跟踪 {rss_mb - tracked_mb:.1f}MB)")
-    return {
+    out = {
         "rss_mb": round(rss_mb, 1),
         "tracked_mb": round(tracked_mb, 1),
         "untracked_mb": round(rss_mb - tracked_mb, 1),
         "top_types": top,
     }
+    if holders_on:
+        out["big_holders"] = holders
+        out["dict_key_samples"] = samples
+    return out
 
 
 # ===================== 扫码登录(须在 {account_id} 路由之前注册,否则
