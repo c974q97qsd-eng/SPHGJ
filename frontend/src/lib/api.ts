@@ -1,4 +1,5 @@
 /** REST API 客户端:薄封装 fetch,统一错误处理。 */
+import type { LogLine } from "@/lib/ws"
 
 export interface AccountStatus {
   id: string
@@ -113,6 +114,12 @@ export interface AppConfig {
   live_check_interval_sec: number
 }
 
+/** 运行日志拉取结果(seq 为当前最大序号,用于增量续拉)。 */
+export interface LogsResult {
+  lines: LogLine[]
+  seq: number
+}
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const r = await fetch(`/api${path}`, {
     headers: { "Content-Type": "application/json" },
@@ -132,6 +139,10 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  // 运行日志(after=0 拉全量;轮询时用上次 seq 拉增量)
+  getLogs: (after = 0) => req<LogsResult>(`/logs?after=${after}`),
+  clearLogs: () => req<{ ok: boolean }>("/logs", { method: "DELETE" }),
+
   getConfig: () => req<AppConfig>("/config"),
   patchConfig: (body: Partial<{ fetch_interval_sec: number; auto_reply_enabled: boolean; card_fields: string[]; dashboard_interval_sec: number; live_check_interval_sec: number }>) =>
     req<{ ok: boolean; config: AppConfig }>("/config", { method: "PATCH", body: JSON.stringify(body) }),

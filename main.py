@@ -20,22 +20,28 @@ import urllib.request
 # 软件版本(与 git tag revXX 对应)。rev12=CDP 捕获基线;rev13=主动轮询替代常驻响应监听 + 修复直播信号抖动;rev14=内存优化(browser headless 参数 + flv.js 缓冲上限)
 VERSION = "14.0"
 
-# exe 内置浏览器定位
+# exe 内置浏览器定位(打包模式)
 if getattr(sys, "frozen", False):
     base = os.path.dirname(sys.executable)
     os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", os.path.join(base, "browsers"))
-    # --noconsole 模式下 sys.stdout/stderr 为 None,uvicorn 日志 formatter 会调
-    # sys.stdout.isatty() 报 AttributeError,print 也会写 None 崩溃。
-    # 重定向到 exe 同级 pinlun.log,既避免崩溃也便于排查。
-    if sys.stdout is None or sys.stderr is None:
-        try:
-            _logf = open(os.path.join(base, "pinlun.log"), "a", encoding="utf-8")
-            if sys.stdout is None:
-                sys.stdout = _logf
-            if sys.stderr is None:
-                sys.stderr = _logf
-        except Exception:
-            pass
+else:
+    base = os.path.dirname(os.path.abspath(__file__))
+
+# 无控制台模式(--noconsole 打包 / pythonw 启动)下 sys.stdout/stderr 为 None:
+# uvicorn 日志会调 sys.stdout.isatty() 报 AttributeError,部分库写 None 也会崩。
+# 重定向到 run.log 既避免崩溃,也保留崩溃后排查的线索。
+# (界面上的「运行日志」板块由 backend/log_hub.py 提供,与此文件互补)
+if sys.stdout is None or sys.stderr is None:
+    try:
+        _logf = open(os.path.join(base, "run.log"), "a", encoding="utf-8")
+        if sys.stdout is None:
+            sys.stdout = _logf
+        if sys.stderr is None:
+            sys.stderr = _logf
+        _logf.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} 启动 =====\n")
+        _logf.flush()
+    except Exception:
+        pass
 
 
 def _free_port(preferred: int = 8712) -> int:

@@ -12,6 +12,16 @@ export type WsEvent =
   | { event: "live_screen_update"; payload: { account_id: string; name: string; live_stats: unknown; stream_url: string | null; updated_at: string; is_live?: boolean; metrics?: Record<string, number | null> } }
   | { event: "relogin_queue"; payload: { active: string | null; active_name?: string; pending: string[] } }
   | { event: "accounts_updated"; payload: { reason: string; sid?: string } }
+  | { event: "log"; payload: LogLine }
+
+/** 后端推送的单条运行日志(无控制台运行时在界面上查看)。 */
+export interface LogLine {
+  seq: number
+  ts: string
+  level: string
+  name: string
+  msg: string
+}
 
 /**
  * WebSocket 订阅。自动重连。返回最近事件 + 订阅回调注册。

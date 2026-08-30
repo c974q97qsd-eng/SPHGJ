@@ -9,6 +9,7 @@ import { Input } from "@/components/ui/input"
 import { Separator } from "@/components/ui/separator"
 import { AdSlot } from "@/components/common/ad-slot"
 import { TextAdSlot } from "@/components/common/text-ad-slot"
+import { LogPanel } from "@/components/common/LogPanel"
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
 import { useTheme } from "@/lib/theme"
 import { api } from "@/lib/api"
@@ -160,6 +161,8 @@ export function AppShell({ children }: { children: ReactNode }) {
           <AdSlot />
           {children}
         </main>
+        {/* 运行日志:无控制台运行时(打包 exe / pythonw)唯一能看日志的地方 */}
+        <LogPanel />
       </div>
     </div>
   )

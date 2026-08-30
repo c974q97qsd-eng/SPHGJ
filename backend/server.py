@@ -27,6 +27,7 @@ logger = logging.getLogger("sphgj")
 from .storage import Storage
 from .account_manager import AccountManager
 from .login_capture import LoginLockError
+from .log_hub import install as install_log_hub
 from . import schemas
 from .metrics import metric_dictionary, validate_card_fields, DEFAULT_CARD_FIELDS
 from .memtrim import trim_now
@@ -76,6 +77,8 @@ class Hub:
 
 
 hub = Hub()
+# 日志中心:无控制台运行时(stdout/stderr 为 None 或不可见),日志走这里推到界面
+log_hub = install_log_hub()
 config = load_config()
 storage = Storage(os.path.join(ROOT, config.get("db_path", "./data/comments.db")) or os.path.join(ROOT, "data/comments.db"))
 manager = AccountManager(config, storage, emit=hub.emit)
@@ -91,6 +94,8 @@ _LOOP: Optional[asyncio.AbstractEventLoop] = None
 async def _capture_loop():
     global _LOOP
     _LOOP = asyncio.get_event_loop()
+    # 日志中心绑定事件循环,之后可从任意工作线程安全地推送到界面
+    log_hub.attach(_LOOP, hub.emit)
     asyncio.create_task(_mem_monitor())
     # 打印运行版本(懒导入 main.VERSION,避免与 main 的循环依赖)
     try:
@@ -159,6 +164,19 @@ def graceful_shutdown(timeout: float = 15.0):
 
 
 # ===================== 配置 =====================
+@app.get("/api/logs")
+async def get_logs(after: int = 0):
+    """拉取运行日志。after=0 取全部缓冲;否则只取 seq > after 的增量。"""
+    lines = log_hub.history(after)
+    return {"lines": lines, "seq": log_hub.seq}
+
+
+@app.delete("/api/logs")
+async def clear_logs():
+    log_hub.clear()
+    return {"ok": True}
+
+
 @app.get("/api/config")
 async def get_config():
     return {
