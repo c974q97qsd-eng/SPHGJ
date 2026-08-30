@@ -16,6 +16,7 @@ from datetime import datetime
 from typing import Optional
 import socket
 import time
+import random
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query, Request
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -97,6 +98,8 @@ async def _capture_loop():
     # 日志中心绑定事件循环,之后可从任意工作线程安全地推送到界面
     log_hub.attach(_LOOP, hub.emit)
     asyncio.create_task(_mem_monitor())
+    # rev18: 泄漏高发期(启动后 ~3.5h)自动深采样,结果落盘 mem_deep.log
+    asyncio.create_task(_deep_autopsy_loop())
     # 打印运行版本(懒导入 main.VERSION,避免与 main 的循环依赖)
     try:
         from main import VERSION
@@ -251,8 +254,146 @@ async def manual_memtrim():
     }
 
 
+# ===================== rev18 内存深采样 =====================
+# 背景: 取证发现泄漏为【2374 万个小 dict / 4.2GB, gc.collect 后仍存活】,
+# 且无 len>=20000 的大容器 —— 被海量中型容器/闭包/实例属性分散持有。
+# holders 模式(抓大容器)对此无效,只能随机抽样小 dict 统计"谁引用了它"。
+DEEP_LOG = os.path.join(ROOT, ".workbuddy", "mem_deep.log")
+
+
+def _deep_impl(sample_n=120, max_len=60):
+    """随机小 dict 深采样: referrer 直方图 + key 分桶 + 数字 key 二层上溯。
+
+    每个 gc.get_referrers 都是 O(全部 gc 对象) 的重操作,sample_n 不宜过大。
+    """
+    import psutil
+    gc.collect()
+    objs = gc.get_objects()
+    pool = []
+    for o in objs:
+        if type(o) is dict:
+            try:
+                ln = len(o)
+            except Exception:
+                continue
+            if 1 <= ln <= max_len:
+                pool.append(o)
+    n_small = len(pool)
+    n = min(sample_n, n_small)
+    sample = random.sample(pool, n) if n else []
+    # 立刻释放全量池与 objs:否则它们会出现在每个样本的 referrers 里,污染直方图
+    del objs, pool
+
+    internal = {id(sample)}
+    key_mix = Counter()    # 首 key 分桶: numeric-str / dunder / str / 其它类型
+    has_numeric = 0        # 含纯数字字符串 key 的样本数(重点嫌疑: id() 注册表特征)
+    len_hist = Counter()
+    ref_kinds = Counter()      # 一层引用者直方图(全部样本)
+    num_ref_kinds = Counter()  # 数字 key 样本的引用者直方图
+    parent_kinds = Counter()   # 数字 key 中间容器的二层上溯
+    peeks = []
+
+    def _peek(o):
+        try:
+            if isinstance(o, dict):
+                return "keys: " + ", ".join(repr(k)[:30] for k in itertools.islice(o.keys(), 3))
+            if isinstance(o, (list, tuple, set)):
+                return "els: " + ", ".join(type(e).__name__ for e in itertools.islice(o, 3))
+        except Exception:
+            pass
+        return ""
+
+    def _bucket(r):
+        tn = type(r).__name__
+        try:
+            ln = len(r)
+        except Exception:
+            return tn
+        if ln <= 8:
+            return f"{tn}(len<=8)"
+        if ln <= 64:
+            return f"{tn}(len<=64)"
+        if ln <= 512:
+            return f"{tn}(len<=512)"
+        return f"{tn}(len>512)"
+
+    parents_done = 0
+    for d in sample:
+        try:
+            ks = list(d.keys())
+        except Exception:
+            continue
+        ln = len(ks)
+        len_hist["1" if ln == 1 else ("2-8" if ln <= 8 else "9-60")] += 1
+        num = any(isinstance(k, str) and k.isdigit() for k in ks)
+        if num:
+            has_numeric += 1
+        k0 = ks[0]
+        if isinstance(k0, str):
+            key_mix["numeric-str" if k0.isdigit() else ("dunder" if k0.startswith("__") else "str")] += 1
+        else:
+            key_mix[type(k0).__name__] += 1
+        try:
+            refs = gc.get_referrers(d)
+        except Exception:
+            continue
+        for r in refs:
+            if type(r) in (types.FrameType, types.TracebackType) or id(r) in internal:
+                continue
+            rb = _bucket(r)
+            ref_kinds[rb] += 1
+            if num:
+                num_ref_kinds[rb] += 1
+                # 数字 key 的中间容器上溯一层找根(限次数,get_referrers 太重)
+                if parents_done < 15 and isinstance(r, (dict, list, tuple)):
+                    parents_done += 1
+                    try:
+                        refs2 = gc.get_referrers(r)
+                    except Exception:
+                        continue
+                    for r2 in refs2:
+                        if type(r2) in (types.FrameType, types.TracebackType) or id(r2) in internal:
+                            continue
+                        parent_kinds[_bucket(r2)] += 1
+                        p = _peek(r2)
+                        if p and len(peeks) < 12:
+                            peeks.append(f"{type(r2).__name__}: {p}")
+    return {
+        "rss_mb": round(psutil.Process().memory_info().rss / 1048576, 1),
+        "n_small_dicts": n_small,
+        "sampled": len(sample),
+        "has_numeric_key": has_numeric,
+        "key_mix": dict(key_mix),
+        "len_hist": dict(len_hist),
+        "ref_kinds": dict(ref_kinds.most_common(20)),
+        "numeric_key_ref_kinds": dict(num_ref_kinds.most_common(20)),
+        "numeric_key_parent_kinds": dict(parent_kinds.most_common(20)),
+        "peeks": peeks,
+    }
+
+
+async def _deep_autopsy_loop(runs=8, gap_sec=1500):
+    """泄漏高发期自动深采样: 启动后每 25 分钟一次,共 8 次(~3.5h),之后自动停止。
+
+    取证显示泄漏 dict 集中产生于启动后前 ~2.8h,故只在该窗口采样,无常驻开销。
+    结果追加写 .workbuddy/mem_deep.log,供离线分析定位持有者。
+    """
+    os.makedirs(os.path.dirname(DEEP_LOG), exist_ok=True)
+    for i in range(runs):
+        await asyncio.sleep(gap_sec)
+        try:
+            d = await asyncio.to_thread(_deep_impl)
+            with open(DEEP_LOG, "a", encoding="utf-8") as f:
+                f.write(time.strftime("[%Y-%m-%d %H:%M:%S] ")
+                        + json.dumps(d, ensure_ascii=False) + "\n")
+            logger.info(f"[memdeep] 深采样 #{i + 1}: RSS={d['rss_mb']}MB "
+                        f"小dict={d['n_small_dicts']:,} 数字key样本={d['has_numeric_key']}")
+        except Exception as e:
+            logger.debug(f"[memdeep] 深采样失败: {type(e).__name__}: {e}")
+
+
 @app.get("/api/system/memdiag")
-async def mem_diagnose(holders: bool = False):
+async def mem_diagnose(holders: bool = False, deep: bool = False):
     """rev15: 内存诊断 —— 报告进程 RSS,并按类型统计 gc 跟踪的存活对象。
 
     判读方法(关键):
@@ -262,6 +403,7 @@ async def mem_diagnose(holders: bool = False):
           -> 差值 untracked_mb 是【原生内存】:Playwright 的 C++ driver、
              Chromium 残留进程/共享内存、内存映射文件、未释放的原生 buffer。
              此时优化 Python 对象【无效】,应改查浏览器生命周期与原生资源释放。
+    ?deep=1: rev18 随机小 dict 深采样(见 _deep_impl),定位海量小 dict 的持有者。
 
     ?holders=1 追加"大容器定位"(rev17):找出 len >= 20000 的容器并瞥一眼内容,
       用于回答"这几百个小对象到底被谁持有" —— 数量与容器数不匹配时(如 849 万个 dict
@@ -275,6 +417,8 @@ async def mem_diagnose(holders: bool = False):
         import psutil
     except ImportError:
         raise HTTPException(500, "未安装 psutil,无法读取进程内存")
+    if deep:
+        return await asyncio.to_thread(_deep_impl)
     proc = psutil.Process()
     rss_mb = proc.memory_info().rss / 1024 / 1024
     holders_on = bool(holders)
