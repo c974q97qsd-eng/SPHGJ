@@ -95,8 +95,6 @@ class AccountWorker:
         self._live_last_reload_attempt = 0.0
         # rev16 F2: 判定信号丢失后原地重试 poll 的计数(信号恢复即清零)
         self._live_poll_retry = 0
-        # 配置落盘回调(manager 注入,启动时刷新名字等需要写回 config.json)
-        self._save_config = None  # type: callable | None
 
     async def start(self, playwright, headless=True):
         self._pw = playwright
@@ -172,37 +170,11 @@ class AccountWorker:
         if self.auto_delete is not None: self.auto_delete.api = self.api
         if self.fetcher is not None: self.fetcher.api = self.api
         try:
-            wxn = (await self.api.fetch_wx_name() or "").strip()
+            wxn = await self.api.fetch_wx_name()
             if wxn:
                 self.account["_wx_name"] = wxn
-                # 启动时用微信实际昵称同步显示名(用户要求:不需要实时推送,启动时更新即可)。
-                # 注意:auth/auth_data 的 userAttr.nickname 可能是个人微信昵称(如 'H'),
-                # 并非店铺/视频号名。过短(<4)或纯 ASCII 单词视为可疑,不覆盖已有显示名,
-                # 避免把正确的店名(如 "U.S.POLOASSN.免税仓")冲成 'H'。
-                old_name = (self.account.get("name") or "").strip()
-                if wxn != old_name and self._looks_like_store_name(wxn):
-                    logger.info(f"[{self.account['id']}] 启动刷新名字: {old_name!r} -> {wxn!r}")
-                    self.account["name"] = wxn
-                    if self._save_config:
-                        self._save_config()
-                elif wxn != old_name:
-                    logger.debug(f"[{self.account['id']}] 忽略可疑昵称 {wxn!r},保留显示名 {old_name!r}")
         except Exception as e:
             logger.warning(f"[{self.account['id']}] 取登录微信名失败: {e}")
-
-    @staticmethod
-    def _looks_like_store_name(s: str) -> bool:
-        """判断取到的昵称是否像店铺/视频号名(而非个人昵称碎片)。
-
-        规则:长度 >=4 且含非 ASCII(中文/全角)或含 '.'/'-' 分隔的品牌结构。
-        单字母('H')、纯短 ASCII 单词会被拒绝。
-        """
-        s = (s or "").strip()
-        if len(s) < 4:
-            return False
-        if any(ord(ch) > 127 for ch in s):
-            return True          # 含中文/全角 → 店铺名特征
-        return "." in s or "-" in s or "_" in s
 
     async def _close_context(self):
         """关 context 收回 Chromium 进程(兜底 kill 残留 chrome)。清所有页面引用。"""
@@ -919,7 +891,6 @@ class AccountManager:
 
     async def add_account(self, account, headless=True):
         worker = AccountWorker(account, self.storage, self.config, self._emit)
-        worker._save_config = self._save_config
         try:
             await worker.start(self._playwright, headless=headless)
         except Exception:
@@ -944,7 +915,6 @@ class AccountManager:
         total = max(1, len(self.config.get("accounts", [])))
         w._fetch_lock = self._fetch_lock
         w._cycle_offset = idx * self.config.get("fetch_interval_sec", 600) / total
-        w._save_config = self._save_config
         await w.start(self._playwright, headless=True)
         if w.logged_in:
             w.start_loop()
