@@ -81,7 +81,10 @@ class LoginSession:
             return
         self.status = "waiting_scan"
         await self.emit("login_status", {"sid": self.sid, "status": "waiting_scan"})
-        # headed 默认:二维码在弹出的浏览器窗口显示,主弹窗不截图,无需 _qr_loop
+        # headed 模式:二维码在弹出的浏览器窗口显示,无需截图推送
+        # headless 模式(网页二维码):必须启动 _qr_loop 推送二维码图片
+        if not headed:
+            self._tasks.append(asyncio.create_task(self._qr_loop()))
         self._tasks.append(asyncio.create_task(self._wait_login_loop()))
 
     async def open_window(self):
@@ -164,28 +167,50 @@ class LoginSession:
             elif not png and not no_qr_warned:
                 no_qr_warned = True
                 logger.warning(f"[login:{self.sid}] 截图未取到任何图像,检查页面是否正常加载")
-            await asyncio.sleep(2)
+            await asyncio.sleep(3)
 
     async def _capture_qr(self):
-        # 1. 优先按选择器截二维码元素
+        """截取二维码图片(优先 iframe clip → 主文档选择器 → 整页 fallback)。
+
+        headless 下微信 OAuth 二维码在跨域 iframe 内(frame locator 截图超时),
+        但主文档 iframe 元素的 bounding_box 可取,用 page.screenshot(clip=box)
+        可精确裁剪到二维码区域(实测 208x208 / ~10KB)。
+        """
+        # 1. iframe clip(最可靠:headless/headed 均可用,精确裁剪二维码区域)
+        try:
+            iframes = self.page.locator("iframe")
+            cnt = await iframes.count()
+            for i in range(cnt):
+                el = iframes.nth(i)
+                box = await el.bounding_box(timeout=3000)
+                if box and box["width"] > 50 and box["height"] > 50:
+                    png = await self.page.screenshot(clip=box, timeout=5000)
+                    if len(png) > 500:  # 过滤空白/占位图(<500B 不是有效二维码)
+                        logger.info(f"[login:{self.sid}] 二维码命中 iframe clip[{i}] {box} bytes={len(png)}")
+                        return "data:image/png;base64," + base64.b64encode(png).decode()
+        except Exception as e:
+            logger.debug(f"[login:{self.sid}] iframe clip 失败: {e}")
+        # 2. 主文档选择器(兼容非 iframe 登录页布局)
         for sel in QR_CANDIDATES:
             try:
                 loc = self.page.locator(sel).first
                 if await loc.count():
                     png = await loc.screenshot(timeout=3000)
-                    logger.info(f"[login:{self.sid}] 二维码命中选择器: {sel}")
-                    return "data:image/png;base64," + base64.b64encode(png).decode()
+                    if len(png) > 500:
+                        logger.info(f"[login:{self.sid}] 二维码命中选择器: {sel}")
+                        return "data:image/png;base64," + base64.b64encode(png).decode()
             except Exception as e:
                 logger.debug(f"[login:{self.sid}] 选择器 {sel} 失败: {e}")
                 continue
-        # 2. fallback:选择器都没命中,截整页(真实窗口下必含二维码)
+        # 3. fallback:整页截图(必含二维码区域,但尺寸大)
         try:
             png = await self.page.screenshot(timeout=5000)
-            logger.info(f"[login:{self.sid}] 二维码选择器未命中,fallback 截整页")
-            return "data:image/png;base64," + base64.b64encode(png).decode()
+            if len(png) > 1000:
+                logger.info(f"[login:{self.sid}] 二维码选择器未命中,fallback 整页截图 bytes={len(png)}")
+                return "data:image/png;base64," + base64.b64encode(png).decode()
         except Exception as e:
             logger.warning(f"[login:{self.sid}] 整页截图失败: {e}")
-            return None
+        return None
 
     # ---------- 等扫码 ----------
     def _is_logged_in(self):

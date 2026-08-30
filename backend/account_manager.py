@@ -924,7 +924,7 @@ class AccountManager:
         await self._emit("engine_status", self.status_snapshot())
         return w
 
-    async def start_relogin(self, account_id, auto=False, on_finished=None):
+    async def start_relogin(self, account_id, auto=False, on_finished=None, headed=True):
         """已存在账号重新扫码登录:复用原 profile_dir(headed),成功后更新原账号字段。
 
         auto=True 用于失效账号自动依次扫码:on_finished 在终态回调以推进队列。
@@ -938,7 +938,7 @@ class AccountManager:
         sess = LoginSession(pw, self.config, self._emit, account=acc,
                             auto_finalize=auto, on_finished=on_finished)
         self.login_sessions[sess.sid] = sess
-        await sess.start(headed=True)
+        await sess.start(headed=headed)
         return sess
 
     # ---------- 失效账号自动依次扫码 ----------

@@ -413,9 +413,8 @@ async def mem_diagnose(holders: bool = False):
 # POST /api/accounts/login/start 会被 /api/accounts/{account_id}/start 抢匹配,
 # account_id="login" -> 404 账号不存在)=====================
 @app.post("/api/accounts/login/start")
-async def login_start():
-    # 视频号拒绝在 headless 下渲染二维码(即使加 stealth),必须真实浏览器窗口
-    sess = await manager.start_login(headed=True)
+async def login_start(headed: bool = Query(True)):
+    sess = await manager.start_login(headed=headed)
     return {"sid": sess.sid, "status": sess.status}
 
 
@@ -486,9 +485,9 @@ async def start_account(account_id: str):
 
 
 @app.post("/api/accounts/{account_id}/relogin")
-async def relogin_account(account_id: str):
+async def relogin_account(account_id: str, headed: bool = Query(True)):
     """已存在账号重新扫码登录(离线时前端启动失败转此)。"""
-    sess = await manager.start_relogin(account_id)
+    sess = await manager.start_relogin(account_id, headed=headed)
     if not sess:
         raise HTTPException(404, "账号不存在")
     return {"sid": sess.sid, "status": sess.status}
