@@ -95,10 +95,17 @@ def _fatal(msg: str):
 
 
 def main():
+    # --headless: 只启动后端服务,不创建桌面窗口。
+    # 用途: AI/命令行环境下做内存诊断、数据采集等后台任务。
+    # pywebview(WebView2) 在非用户交互会话的进程树里启动会崩溃
+    # (msedgewebview2 报 "Error launching CrashSender.exe"),窗口必须由
+    # 用户双击 VBS/BAT 启动;headless 模式不创建窗口,不受此限制。
+    headless = "--headless" in sys.argv
+
     import uvicorn
     from backend import server
 
-    print(f"[启动] 视频号工具 v{VERSION}")
+    print(f"[启动] 视频号工具 v{VERSION}" + (" (headless)" if headless else ""))
 
     try:
         sys.stdout.reconfigure(line_buffering=True)
@@ -120,6 +127,18 @@ def main():
         return
 
     url = f"http://127.0.0.1:{port}/"
+    if headless:
+        print(f"[OK] headless 模式:后端已就绪 {url},Ctrl+C 或进程终止即退出")
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            server.graceful_shutdown()
+            srv.should_exit = True
+        return
+
     print("[OK] 正在打开桌面窗口…")
 
     # 仅无图形服务器开发调试时允许回退浏览器(显式开关,默认关闭)
