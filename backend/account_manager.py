@@ -95,6 +95,8 @@ class AccountWorker:
         self._live_last_reload_attempt = 0.0
         # rev16 F2: 判定信号丢失后原地重试 poll 的计数(信号恢复即清零)
         self._live_poll_retry = 0
+        # 配置落盘回调(manager 注入,启动时刷新名字等需要写回 config.json)
+        self._save_config = None  # type: callable | None
 
     async def start(self, playwright, headless=True):
         self._pw = playwright
@@ -173,6 +175,13 @@ class AccountWorker:
             wxn = await self.api.fetch_wx_name()
             if wxn:
                 self.account["_wx_name"] = wxn
+                # 启动时用微信实际昵称同步显示名(用户要求:不需要实时推送,启动时更新即可)
+                old_name = (self.account.get("name") or "").strip()
+                if wxn != old_name and wxn.strip():
+                    logger.info(f"[{self.account['id']}] 启动刷新名字: {old_name!r} -> {wxn!r}")
+                    self.account["name"] = wxn
+                    if self._save_config:
+                        self._save_config()
         except Exception as e:
             logger.warning(f"[{self.account['id']}] 取登录微信名失败: {e}")
 
@@ -891,6 +900,7 @@ class AccountManager:
 
     async def add_account(self, account, headless=True):
         worker = AccountWorker(account, self.storage, self.config, self._emit)
+        worker._save_config = self._save_config
         try:
             await worker.start(self._playwright, headless=headless)
         except Exception:
@@ -915,6 +925,7 @@ class AccountManager:
         total = max(1, len(self.config.get("accounts", [])))
         w._fetch_lock = self._fetch_lock
         w._cycle_offset = idx * self.config.get("fetch_interval_sec", 600) / total
+        w._save_config = self._save_config
         await w.start(self._playwright, headless=True)
         if w.logged_in:
             w.start_loop()
