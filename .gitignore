@@ -11,10 +11,13 @@ frontend/*.tsbuildinfo
 frontend/vite.config.d.ts
 frontend/vite.config.js
 
-# 运行时数据
+# 运行时数据(整目录排除,防止新类型子文件漏网上传)
 profiles/
-data/*.db
-data/*.db-journal
+data/
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
 
 # agent 本地工作数据(内存采样日志等,非源码)
 .workbuddy/
@@ -27,8 +30,12 @@ build/
 # 日志
 *.log
 
-# 本地配置 / 账号数据(含本地账号,禁止提交)
+# 本地配置 / 账号数据(含本地账号与登录态,禁止提交)
 config.json
+config.*.json
+!config.example.json
+.env
+.env.*
 
 # 前端构建产物(不应纳入版本库)
 frontend/dist/
