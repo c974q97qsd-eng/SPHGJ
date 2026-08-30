@@ -47,7 +47,7 @@ export function AdSlot() {
 
   if (!show) {
     return (
-      <div className="flex justify-center px-4 md:px-6 pt-3">
+      <div className="flex justify-center pb-4">
         <div
           className="flex h-[90px] w-[728px] max-w-full items-center justify-center rounded-md border border-dashed border-muted-foreground/30 bg-muted/30 text-xs text-muted-foreground/80"
           role="complementary"
@@ -60,7 +60,7 @@ export function AdSlot() {
   }
 
   return (
-    <div className="flex justify-center px-4 md:px-6 pt-3">
+    <div className="flex justify-center pb-4">
       <div ref={ref} className="min-h-[90px] w-[728px] max-w-full overflow-hidden" role="complementary" aria-label="广告位" />
     </div>
   )

@@ -155,8 +155,11 @@ export function AppShell({ children }: { children: ReactNode }) {
             <ThemeToggle />
           </div>
         </header>
-        <AdSlot />
-        <main className="flex-1 overflow-auto p-4 md:p-6">{children}</main>
+        {/* 广告放在滚动容器(main)内部,跟随页面一起滚动;置于 main 之外则会被固定置顶 */}
+        <main className="flex-1 overflow-auto p-4 md:p-6">
+          <AdSlot />
+          {children}
+        </main>
       </div>
     </div>
   )
