@@ -95,6 +95,16 @@ async def new_session(page):
     return s
 
 
+async def stub_finalize(s):
+    """截断抓取落盘:mock 页上没有真实的评论页,让它空转。"""
+
+    async def _noop():
+        return None
+
+    s._capture_fields_and_finalize = _noop
+    return s
+
+
 async def main():
     d = tempfile.mkdtemp(prefix="_selftst_")
     async with async_playwright() as pw:
@@ -163,6 +173,38 @@ async def main():
         await s._click_select_confirm()
         confirmed = await page.evaluate("window.__confirmed")
         check(confirmed == 1, f"确认按钮被点击(__confirmed={confirmed})")
+
+        # ---- 8. select_account():前端回调主路径(按名字查表点击) ----
+        print("\n[8] select_account():按 names 缓存查表点击")
+        await load(page, select_page(4))
+        await page.evaluate("window.__clicked = null")
+        s = await stub_finalize(await new_session(page))
+        s._select_names = NAMES  # 模拟 _enumerate_select_accounts 的缓存
+        ok = await s.select_account(2)
+        clicked = await page.evaluate("window.__clicked")
+        check(ok and clicked == "acc2",
+              f"select_account(2) -> acc2(ok={ok} clicked={clicked})")
+        check(s.status == "scanned", f"状态推进到 scanned(实际 {s.status})")
+
+        # ---- 9. 状态守卫:非 selecting_account 时不得点击 ----
+        print("\n[9] 状态守卫")
+        await load(page, select_page(4))
+        await page.evaluate("window.__clicked = null")
+        s = await stub_finalize(await new_session(page))
+        s._select_names = NAMES
+        s.status = "waiting_scan"
+        ok = await s.select_account(0)
+        clicked = await page.evaluate("window.__clicked")
+        check(ok is False and clicked is None,
+              f"waiting_scan 下拒绝选择(ok={ok} clicked={clicked})")
+
+        # ---- 10. 越界 index:不崩、明确失败 ----
+        print("\n[10] 越界 index")
+        await load(page, select_page(4))
+        s = await stub_finalize(await new_session(page))
+        s._select_names = NAMES
+        ok = await s.select_account(99)
+        check(ok is False, f"index=99 超出范围 -> False(实际 {ok})")
 
         await close_context_safely(ctx, d, "[selftest]")
 
