@@ -477,6 +477,16 @@ async def login_cancel(sid: str):
     return {"ok": True}
 
 
+@app.post("/api/accounts/login/{sid}/select-account")
+async def login_select_account(sid: str, body: dict):
+    """前端选择账号(选择页出现时推送列表给用户,用户选后回调此接口)。"""
+    index = body.get("index", 0)
+    ok = await manager.select_login(sid, index)
+    if not ok:
+        raise HTTPException(404, "登录会话不存在或选择失败")
+    return {"ok": True}
+
+
 @app.post("/api/accounts/login/{sid}/finalize")
 async def login_finalize(sid: str, body: schemas.LoginFinalize):
     acc = await manager.finalize_login(sid, body.account_id, body.name)

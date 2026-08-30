@@ -3,7 +3,8 @@ import { useEffect, useRef, useState, useCallback } from "react"
 /** 后端推送事件类型。 */
 export type WsEvent =
   | { event: "qr_update"; payload: { sid: string; image: string } }
-  | { event: "login_status"; payload: { sid: string; status: string; captured?: { aid: string; finder_id: string; name: string }; error?: string } }
+  | { event: "login_status"; payload: { sid: string; status: string; captured?: { aid: string; finder_id: string; name: string }; error?: string; headed?: boolean; auto_selected?: string } }
+  | { event: "account_select"; payload: { sid: string; accounts: { name: string; role: string }[] } }
   | { event: "engine_status"; payload: { running: boolean; accounts: unknown[] } }
   | { event: "comments_update"; payload: { account_id: string; comments: unknown[] } }
   | { event: "comment_replied"; payload: { comment_id: string } }

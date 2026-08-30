@@ -816,6 +816,13 @@ class AccountManager:
         if s:
             await s.cancel()
 
+    async def select_login(self, sid, index=0):
+        """前端选择账号(选择页出现时回调)。"""
+        s = self.login_sessions.get(sid)
+        if not s:
+            return False
+        return await s.select_account(index)
+
     async def finalize_login(self, sid, account_id=None, name=None):
         s = self.login_sessions.pop(sid, None)
         if not s:

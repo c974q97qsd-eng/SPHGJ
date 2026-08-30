@@ -1,12 +1,12 @@
 import { useEffect, useRef, useState } from "react"
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "@/components/ui/dialog"
 import { Button } from "@/components/ui/button"
-import { Loader2, ExternalLink, AlertCircle, Smartphone, Monitor, QrCode } from "lucide-react"
+import { Loader2, ExternalLink, AlertCircle, Smartphone, Monitor, QrCode, Users } from "lucide-react"
 import { api } from "@/lib/api"
 import { useWebSocket, type WsEvent } from "@/lib/ws"
 import { toast } from "sonner"
 
-type Status = "starting" | "waiting_scan" | "scanned" | "capturing" | "captured" | "failed" | "cancelled"
+type Status = "starting" | "waiting_scan" | "scanned" | "capturing" | "captured" | "failed" | "cancelled" | "selecting_account"
 
 const STATUS_TEXT: Record<Status, string> = {
   starting: "正在准备登录环境…",
@@ -16,10 +16,16 @@ const STATUS_TEXT: Record<Status, string> = {
   captured: "扫码成功,正在保存账号…",
   failed: "登录失败",
   cancelled: "已取消",
+  selecting_account: "请选择要登录的视频号",
 }
 
 /** auto=后端按客户端是否本机自动决定(未拿到结果前不高亮任何按钮) */
 type ScanMode = "auto" | "window" | "web"
+
+interface SelectAccount {
+  name: string
+  role: string
+}
 
 export function AddAccountDialog({ open, onOpenChange, onDone, reloginAccountId, reloginAccountName, reloginWxName }: {
   open: boolean
@@ -34,6 +40,8 @@ export function AddAccountDialog({ open, onOpenChange, onDone, reloginAccountId,
   const [error, setError] = useState<string | null>(null)
   const [mode, setMode] = useState<ScanMode>("auto")
   const [qrImage, setQrImage] = useState<string | null>(null)
+  const [selectAccounts, setSelectAccounts] = useState<SelectAccount[]>([])
+  const [autoSelectedName, setAutoSelectedName] = useState<string | null>(null)
   const sidRef = useRef<string | null>(null)
   sidRef.current = sid
   const finalizingRef = useRef(false)
@@ -44,6 +52,7 @@ export function AddAccountDialog({ open, onOpenChange, onDone, reloginAccountId,
     if (old) { void api.loginCancel(old).catch(() => {}) }
     finalizingRef.current = false
     setStatus("starting"); setError(null); setSid(null); setQrImage(null)
+    setSelectAccounts([]); setAutoSelectedName(null)
     if (scanMode) setMode(scanMode)
     try {
       // 未指定模式 -> 不传 headed,由后端按客户端是否本机自动决定:
@@ -93,13 +102,30 @@ export function AddAccountDialog({ open, onOpenChange, onDone, reloginAccountId,
     }
   }
 
-  // WS:登录状态(按 sid 过滤) + 二维码推送
+  // 选择账号(前端用户点击后回调后端)
+  const handleSelectAccount = async (index: number) => {
+    const s = sidRef.current
+    if (!s) return
+    try {
+      await api.selectLoginAccount(s, index)
+      setStatus("scanned") // 后端会推进到 scanned → captured → autoFinalize
+    } catch (e) {
+      setError("选择失败:" + (e as Error).message)
+      setStatus("failed")
+    }
+  }
+
+  // WS:登录状态(按 sid 过滤) + 二维码推送 + 账号选择推送
   useWebSocket((e: WsEvent) => {
     const mySid = sidRef.current
     if (!mySid) return
     if (e.event === "login_status" && e.payload.sid === mySid) {
       const p = e.payload
       setStatus(p.status as Status)
+      if (p.auto_selected) {
+        setAutoSelectedName(p.auto_selected)
+        toast(`已自动选择账号: ${p.auto_selected}`)
+      }
       if (p.status === "captured" && !finalizingRef.current) {
         finalizingRef.current = true
         void autoFinalize(p.captured?.name)
@@ -110,6 +136,11 @@ export function AddAccountDialog({ open, onOpenChange, onDone, reloginAccountId,
       setQrImage(e.payload.image || null)
       // 收到二维码推送 => 后端必然走的 headless 网页模式(兼容后端未返回 headed 字段)
       setMode((m) => (m === "auto" ? "web" : m))
+    }
+    if (e.event === "account_select" && e.payload.sid === mySid) {
+      const accts = (e.payload.accounts || []) as SelectAccount[]
+      setSelectAccounts(accts)
+      setStatus("selecting_account")
     }
   })
 
@@ -162,10 +193,48 @@ export function AddAccountDialog({ open, onOpenChange, onDone, reloginAccountId,
         <div className="flex flex-col items-center gap-3 py-6">
           {status === "failed" ? <AlertCircle className="h-10 w-10 text-destructive" />
             : processing ? <Loader2 className="h-10 w-10 animate-spin text-primary" />
+            : status === "selecting_account" ? <Users className="h-10 w-10 text-primary" />
             : <Smartphone className="h-10 w-10 text-primary" />}
           <p className={`text-sm font-medium text-center ${status === "failed" ? "text-destructive" : "text-foreground"}`}>
             {error ? error : STATUS_TEXT[status]}
           </p>
+          {autoSelectedName && (
+            <p className="text-xs text-muted-foreground">已自动匹配: {autoSelectedName}</p>
+          )}
+
+          {/* 账号选择列表 */}
+          {status === "selecting_account" && selectAccounts.length > 0 && (
+            <div className="w-full space-y-1.5 max-h-[240px] overflow-y-auto">
+              {selectAccounts.map((acc, i) => (
+                <button
+                  key={i}
+                  onClick={() => handleSelectAccount(i)}
+                  className="w-full flex items-center gap-3 rounded-lg border bg-card px-4 py-3 text-left hover:bg-accent transition-colors"
+                >
+                  <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-primary/10 text-sm font-bold text-primary">
+                    {(acc.name?.[0] || "?").toUpperCase()}
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <p className="text-sm font-medium truncate">{acc.name}</p>
+                    {acc.role && <p className="text-xs text-muted-foreground">{acc.role}</p>}
+                  </div>
+                </button>
+              ))}
+            </div>
+          )}
+
+          {/* 枚举失败:没拿到账号列表,给出可操作出路(否则只能取消) */}
+          {status === "selecting_account" && selectAccounts.length === 0 && (
+            <div className="flex flex-col items-center gap-2">
+              <p className="text-xs text-muted-foreground text-center max-w-[300px]">
+                未能自动识别账号列表。
+                {mode === "window"
+                  ? "请直接在弹出的浏览器窗口里点选要登录的视频号,选完会自动继续。"
+                  : "请点击下方按钮改用「本机窗口」模式重试。"}
+              </p>
+            </div>
+          )}
+
           {showScan && (
             <>
               {/* 网页二维码模式:渲染二维码图片 */}
@@ -196,6 +265,12 @@ export function AddAccountDialog({ open, onOpenChange, onDone, reloginAccountId,
           )}
           {status === "failed" && (
             <Button onClick={() => startLogin()} className="gap-1.5">重试</Button>
+          )}
+          {/* 网页二维码模式下识别不到账号列表 -> 切本机窗口重试 */}
+          {status === "selecting_account" && selectAccounts.length === 0 && mode === "web" && (
+            <Button onClick={() => startLogin("window")} className="gap-1.5">
+              <Monitor className="h-3.5 w-3.5" />改用本机窗口
+            </Button>
           )}
         </DialogFooter>
       </DialogContent>

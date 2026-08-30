@@ -146,6 +146,8 @@ export const api = {
 
   loginStart: (headed?: boolean) =>
     req<{ sid: string; status: string; headed?: boolean }>(`/accounts/login/start${headed === undefined ? "" : `?headed=${headed}`}`, { method: "POST" }),
+  selectLoginAccount: (sid: string, index: number) =>
+    req<{ ok: boolean }>(`/accounts/login/${sid}/select-account`, { method: "POST", body: JSON.stringify({ index }) }),
   loginOpenWindow: (sid: string) => req<{ sid: string; status: string }>(`/accounts/login/${sid}/open-window`, { method: "POST" }),
   loginCancel: (sid: string) => req<{ ok: boolean }>(`/accounts/login/${sid}/cancel`, { method: "POST" }),
   loginFinalize: (sid: string, account_id?: string, name?: string) =>

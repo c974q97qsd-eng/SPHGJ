@@ -26,6 +26,19 @@ ACCOUNT_NAME_CANDIDATES = [
     ".header-account-name",
 ]
 
+# 扫码后「选择视频号登录」页标记词。
+# 该页 URL 仍含 /login(实测),因此只能按 DOM 文本判定;标记词不得与二维码登录页
+# 文案(如「登录视频号助手」「扫码登录」)重合,否则会把二维码页误判成选择页。
+ACCOUNT_SELECT_MARKERS = (
+    "选择视频号登录",
+    "请选择要登录的视频号",
+    "选择要登录的视频号",
+    "选择登录的视频号",
+    "使用其他账号登录",
+)
+# 兜底:仍在 /login 且角色词出现 >=2 次(选择页每个账号卡片都带角色)
+ACCOUNT_SELECT_ROLE_WORDS = ("超级管理员", "管理员", "运营者", "创作者")
+
 LOGIN_URL = "https://channels.weixin.qq.com/platform/login"
 COMMENT_URL = "https://channels.weixin.qq.com/platform/interaction/comment"
 POST_CREATE_URL = "https://channels.weixin.qq.com/platform/post/create"  # 「打开」按钮 goto 此页(发布作品)

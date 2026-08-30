@@ -18,7 +18,8 @@ from urllib.parse import urlparse, parse_qs
 import logging
 logger = logging.getLogger("sphgj")
 from .browser import launch_stealth, close_context_safely
-from .selectors import QR_CANDIDATES, ACCOUNT_NAME_CANDIDATES, COMMENT_URL, LOGIN_URL
+from .selectors import (QR_CANDIDATES, ACCOUNT_NAME_CANDIDATES, COMMENT_URL, LOGIN_URL,
+                        ACCOUNT_SELECT_MARKERS, ACCOUNT_SELECT_ROLE_WORDS)
 
 
 class LoginSession:
@@ -42,6 +43,8 @@ class LoginSession:
         self.auto_finalize = auto_finalize  # auto 模式:captured 后后端自动落盘,不等前端调 finalize
         self.on_finished = on_finished      # 终态回调(sid, status, account_id),供 auto 队列调度
         self._finished_called = False
+        # 网络拦截缓存:二维码原图(优先于截图)
+        self._qr_raw = None  # bytes | None
 
     def _finished(self, status):
         """终态通知(防重复):auto 模式下触发 manager 推进下一个 relogin。"""
@@ -66,6 +69,18 @@ class LoginSession:
         self.context = await launch_stealth(self.pw, self.profile_dir, headless=not headed)
         self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
         self.page.on("request", self._on_request)
+        # 网络拦截:缓存二维码原图(/connect/qrcode/ 返回 JPEG/PNG 二进制,
+        # 比 iframe clip 截图更稳(即使页面显示"加载失败"也能拿到 46KB 清晰原图))
+        def _on_resp(resp):
+            if "/connect/qrcode/" in resp.url:
+                try:
+                    b = resp.body() if hasattr(resp, "body") else None
+                    if b and len(b) > 200:  # 有效二维码图片 >200B
+                        self._qr_raw = b
+                        logger.debug(f"[login:{self.sid}] 拦截到二维码原图 {len(b)}B")
+                except Exception:
+                    pass
+        self.page.on("response", _on_resp)
         try:
             # 直接开登录页:扫码登录场景几乎都是未登录,省去"评论页->重定向登录页"一跳。
             # cookie 仍有效时视频号会从此重定向回 /platform 首页,_is_logged_in 照样判定。
@@ -170,13 +185,22 @@ class LoginSession:
             await asyncio.sleep(3)
 
     async def _capture_qr(self):
-        """截取二维码图片(优先 iframe clip → 主文档选择器 → 整页 fallback)。
+        """获取二维码图片(三级策略:网络拦截原图 > iframe clip > 整页 fallback)。
 
-        headless 下微信 OAuth 二维码在跨域 iframe 内(frame locator 截图超时),
-        但主文档 iframe 元素的 bounding_box 可取,用 page.screenshot(clip=box)
-        可精确裁剪到二维码区域(实测 208x208 / ~10KB)。
+        1. 网络拦截:page.on('response') 缓存 /connect/qrcode/ 的 resp.body(),
+           返回原始 JPEG/PNG 图片(实测 46KB,清晰可扫),即使页面显示"加载失败"也能拿到。
+        2. iframe clip:主文档 iframe 元素 bounding_box → page.screenshot(clip=box),
+           headless 下精确裁剪二维码区域(208x208 / ~10KB)。
+        3. fallback:整页截图。
         """
-        # 1. iframe clip(最可靠:headless/headed 均可用,精确裁剪二维码区域)
+        # 1. 网络拦截缓存(最稳:不依赖渲染状态)
+        if self._qr_raw:
+            raw = self._qr_raw
+            # 每次取后清空,下次循环等新 QR(过期或刷新时服务端会返回新图)
+            self._qr_raw = None
+            mime = "image/jpeg" if raw[:4] == b'\xff\xd8\xff' else "image/png"
+            return f"data:{mime};base64," + base64.b64encode(raw).decode()
+        # 2. iframe clip
         try:
             iframes = self.page.locator("iframe")
             cnt = await iframes.count()
@@ -185,12 +209,12 @@ class LoginSession:
                 box = await el.bounding_box(timeout=3000)
                 if box and box["width"] > 50 and box["height"] > 50:
                     png = await self.page.screenshot(clip=box, timeout=5000)
-                    if len(png) > 500:  # 过滤空白/占位图(<500B 不是有效二维码)
+                    if len(png) > 500:
                         logger.info(f"[login:{self.sid}] 二维码命中 iframe clip[{i}] {box} bytes={len(png)}")
                         return "data:image/png;base64," + base64.b64encode(png).decode()
         except Exception as e:
             logger.debug(f"[login:{self.sid}] iframe clip 失败: {e}")
-        # 2. 主文档选择器(兼容非 iframe 登录页布局)
+        # 3. 主文档选择器
         for sel in QR_CANDIDATES:
             try:
                 loc = self.page.locator(sel).first
@@ -202,7 +226,7 @@ class LoginSession:
             except Exception as e:
                 logger.debug(f"[login:{self.sid}] 选择器 {sel} 失败: {e}")
                 continue
-        # 3. fallback:整页截图(必含二维码区域,但尺寸大)
+        # 4. fallback:整页截图
         try:
             png = await self.page.screenshot(timeout=5000)
             if len(png) > 1000:
@@ -219,10 +243,198 @@ class LoginSession:
         # 只要离开了登录页即视为已登录,后续 _capture_fields_and_finalize 会主动跳评论页
         return ("channels.weixin.qq.com/platform" in url and "/login" not in url) if self.page else False
 
+    async def _body_text(self):
+        """安全取页面正文(导航中 evaluate 会抛异常,统一吞掉)。"""
+        try:
+            return await self.page.evaluate("(document.body && document.body.innerText) || ''") or ""
+        except Exception:
+            return ""
+
+    def _is_select_page_text(self, txt):
+        """判定当前正文是否为「选择视频号登录」页。
+
+        注意:该页 URL 仍含 /login,只能按 DOM 文本判定(曾按 URL 判定导致漏检)。
+        标记词必须只在选择页出现,不能与二维码登录页文案重合。
+        兜底:仍在 /login 但角色词(管理员/运营者/创作者)出现 >=2 次也判为选择页。
+        """
+        if any(m in txt for m in ACCOUNT_SELECT_MARKERS):
+            return True
+        return sum(txt.count(w) for w in ACCOUNT_SELECT_ROLE_WORDS) >= 2
+
+    async def _enumerate_select_accounts(self, retries=5):
+        """枚举选择页上的账号卡片,返回 [{name, role, _raw}, ...]。
+
+        以「勾选控件」为锚点向上找账号行(最稳:选择页每行都有勾选框),
+        失败再退回按 class 关键字猜容器,最后退回按正文行切分。
+        同时向下滚动触发懒加载(列表不止 3 个)。
+        """
+        js = """() => {
+            const out = [];
+            const seen = new Set();
+            const push = (el, txt) => {
+                txt = (txt || '').replace(/\\s+/g, ' ').trim();
+                if (!txt || txt.length > 80 || seen.has(txt)) return;
+                const r = el.getBoundingClientRect();
+                seen.add(txt);
+                out.push({ txt, x: r.left, y: r.top });
+            };
+            // 策略A:以勾选控件为锚点,向上找最近的"账号行"(有文本且尺寸够)
+            const marks = Array.from(document.querySelectorAll(
+                'input[type=checkbox], input[type=radio], [class*=checkbox], [class*=radio], [class*=check]'
+            ));
+            for (const m of marks) {
+                let el = m;
+                for (let d = 0; d < 6 && el; d++) {
+                    el = el.parentElement;
+                    if (!el) break;
+                    const t = el.innerText || '';
+                    const r = el.getBoundingClientRect();
+                    if (t.trim() && t.trim().length < 80 && r.width > 100 && r.height > 30) {
+                        push(el, t); break;
+                    }
+                }
+            }
+            // 策略B:按 class 关键字找卡片容器
+            if (!out.length) {
+                document.querySelectorAll(
+                    '[class*=account], [class*=item], [class*=card], [class*=finder]'
+                ).forEach(el => {
+                    const r = el.getBoundingClientRect();
+                    if (r.width > 100 && r.height > 30) push(el, el.innerText);
+                });
+            }
+            // 策略C:按正文行切分,取像账号名的短行
+            if (!out.length) {
+                const SKIP = new Set(['选择视频号登录', '使用其他账号登录', '登录', '取消', '确定', '确认']);
+                for (const l of (document.body.innerText || '').split('\\n')) {
+                    const s = l.trim();
+                    if (s.length < 2 || s.length > 60 || SKIP.has(s)) continue;
+                    push(document.body, s);
+                }
+            }
+            return out.sort((a, b) => (a.y - b.y) || (a.x - b.x));
+        }"""
+        for attempt in range(retries):
+            raw = []
+            try:
+                # 向下滚动触发懒加载,再回到顶部
+                for _ in range(4):
+                    await self.page.evaluate("window.scrollBy(0, 500)")
+                    await asyncio.sleep(0.25)
+                await self.page.evaluate("window.scrollTo(0, 0)")
+                await asyncio.sleep(0.3)
+                raw = await self.page.evaluate(js) or []
+            except Exception as e:
+                logger.debug(f"[login:{self.sid}] 枚举选择页异常(第{attempt + 1}次): {e}")
+            items = []
+            seen = set()
+            for r in raw:
+                t = str(r.get("txt", "")).strip()
+                if not t or t in seen:
+                    continue
+                seen.add(t)
+                role = ""
+                name = t
+                for kw in ("超级管理员", "管理员", "运营者", "创作者"):
+                    if kw in t:
+                        role = kw
+                        name = t.replace(kw, "").strip().strip("\u00b7|\uff0c\u2014\u2013, ")
+                        break
+                if name:
+                    items.append({"name": name, "role": role, "_raw": t})
+            if items:
+                logger.info(f"[login:{self.sid}] 选择页枚举到 {len(items)} 个账号: "
+                            f"{[(i['name'], i['role']) for i in items]}")
+                self._select_names = [i["name"] for i in items]  # select_account(index) 按名字点击
+                return items
+            await asyncio.sleep(1.5)
+        logger.warning(f"[login:{self.sid}] 选择页 {retries} 次枚举均未取到账号")
+        return []
+
+    async def _click_select_account(self, index, name=None):
+        """点击选择页第 index 个账号;点完若仍在 /login,再尝试点确认按钮。
+
+        name 优先:有名字就按文本精确匹配点击,避免枚举顺序与 DOM 顺序错位。
+        """
+        try:
+            clicked = await self.page.evaluate("""([idx, name]) => {
+                let target = null;
+                // 1. 按名字找包含该文本的最深可点元素
+                if (name) {
+                    const hits = Array.from(document.querySelectorAll('*')).filter(e => {
+                        const t = e.innerText || '';
+                        return t.includes(name) && t.length < 80 &&
+                               e.getBoundingClientRect().width > 100;
+                    });
+                    if (hits.length) target = hits[hits.length - 1];  // 最深(最内层)节点
+                }
+                // 2. 退回按序号点勾选控件所在行
+                if (!target) {
+                    const cand = Array.from(document.querySelectorAll(
+                        'input[type=checkbox], input[type=radio], [class*=checkbox], [class*=radio]'
+                    ));
+                    if (cand[idx]) {
+                        let el = cand[idx];
+                        for (let d = 0; d < 6 && el; d++) {
+                            el = el.parentElement;
+                            if (el && el.getBoundingClientRect().width > 100) { target = el; break; }
+                        }
+                        if (!target) target = cand[idx];
+                    }
+                }
+                if (!target) return false;
+                target.scrollIntoView({block: 'center'});
+                target.click();
+                return true;
+            }""", [index, name or ""])
+            if not clicked:
+                logger.warning(f"[login:{self.sid}] 选择页未找到可点击元素 idx={index} name={name!r}")
+                return False
+            logger.info(f"[login:{self.sid}] 已点击选择页账号 idx={index} name={name!r}")
+            await asyncio.sleep(2)
+            # 点了账号可能还要点确认(登录/确定/进入)
+            if "/login" in (self.page.url or ""):
+                await self._click_select_confirm()
+            await asyncio.sleep(2)
+            return True
+        except Exception as e:
+            logger.warning(f"[login:{self.sid}] 点击选择页账号失败: {e}")
+            return False
+
+    async def _click_select_confirm(self):
+        """账号选中后若仍停留在选择页,尝试点确认按钮(登录/确定/确认/进入)。"""
+        try:
+            hit = await self.page.evaluate("""() => {
+                const words = ['登录', '确定', '确认', '进入', '下一步'];
+                const all = Array.from(document.querySelectorAll(
+                    'button, a, [role=button], [class*=btn], [class*=button]'
+                ));
+                for (const w of words) {
+                    for (const e of all) {
+                        const t = (e.innerText || '').trim();
+                        const r = e.getBoundingClientRect();
+                        if (t === w && r.width > 40 && r.height > 20) { e.click(); return w; }
+                    }
+                }
+                return '';
+            }""")
+            if hit:
+                logger.info(f"[login:{self.sid}] 已点击选择页确认按钮: {hit}")
+        except Exception as e:
+            logger.debug(f"[login:{self.sid}] 点确认按钮失败: {e}")
+
     async def _wait_login_loop(self):
         loop = asyncio.get_event_loop()
         deadline = loop.time() + 300
         while self.status == "waiting_scan" and loop.time() < deadline:
+            # 账号选择页必须按 DOM 文本判定(其 URL 仍含 /login,按 URL 判定会漏检);
+            # 限定只看 /login 页,避免进平台后角色词触发误判
+            url = self.page.url or ""
+            if "/login" in url:
+                txt = await self._body_text()
+                if txt and self._is_select_page_text(txt):
+                    await self._handle_account_select()
+                    return
             if self._is_logged_in():
                 self.status = "scanned"
                 logger.info(f"[login:{self.sid}] 检测到登录成功(URL={self.page.url})")
@@ -236,6 +448,74 @@ class LoginSession:
             await self.emit("login_status", {"sid": self.sid, "status": "failed", "error": "扫码超时(5分钟)"})
             await self._close(keep_profile=False)
             self._finished("failed")
+
+    async def _handle_account_select(self):
+        """处理「选择视频号登录」页:relogin 自动匹配点击,否则推列表给前端选。"""
+        logger.info(f"[login:{self.sid}] 检测到账号选择页(URL={self.page.url})")
+        accounts = await self._enumerate_select_accounts()
+
+        # relogin 且能匹配到目标账号 -> 自动点击,不再打扰用户
+        auto_idx = -1
+        target_name = ""
+        if accounts and self.account:
+            target_name = (self.account.get("name") or "").strip()
+            wx_name = (self.account.get("_wx_name") or "").strip()
+            fid = (self.account.get("_log_finder_id") or "").strip()
+            for i, acc in enumerate(accounts):
+                nm = acc["name"]
+                if (target_name and (nm == target_name or target_name in nm or nm in target_name)) \
+                        or (wx_name and nm == wx_name) or (fid and fid in acc.get("_raw", "")):
+                    auto_idx = i
+                    break
+        if auto_idx >= 0:
+            nm = accounts[auto_idx]["name"]
+            logger.info(f"[login:{self.sid}] 自动选择账号 #{auto_idx + 1} {nm!r}(匹配目标 {target_name!r})")
+            if await self._click_select_account(auto_idx, nm):
+                self.status = "scanned"
+                await self.emit("login_status", {"sid": self.sid, "status": "scanned",
+                                                 "auto_selected": nm})
+                await self._capture_fields_and_finalize()
+                return
+            logger.warning(f"[login:{self.sid}] 自动点击失败,降级推给前端选择")
+
+        # 新登录 / 自动匹配失败 / 枚举为空 -> 推给前端(为空时前端提示"未识别到账号")
+        logger.info(f"[login:{self.sid}] 推送 {len(accounts)} 个账号给前端选择")
+        self.status = "selecting_account"
+        await self.emit("account_select", {
+            "sid": self.sid,
+            "accounts": [{"name": a["name"], "role": a["role"]} for a in accounts],
+        })
+        # 等前端回调 select_account();兜底轮询:用户直接在浏览器里选完 URL 会离开 /login
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + 120
+        while self.status == "selecting_account" and loop.time() < deadline:
+            if self._is_logged_in():
+                logger.info(f"[login:{self.sid}] 检测到已登录(可能是用户手动选的)")
+                self.status = "scanned"
+                await self.emit("login_status", {"sid": self.sid, "status": "scanned"})
+                await self._capture_fields_and_finalize()
+                return
+            await asyncio.sleep(1)
+        if self.status == "selecting_account":
+            self.status = "failed"
+            logger.warning(f"[login:{self.sid}] 选择账号超时(2分钟)")
+            await self.emit("login_status", {"sid": self.sid, "status": "failed",
+                                             "error": "选择账号超时(2分钟)"})
+            await self._close(keep_profile=False)
+            self._finished("failed")
+
+    async def select_account(self, index):
+        """前端回调:用户选了第 index 个账号,后端点击对应卡片并继续抓取字段。"""
+        if self.status != "selecting_account":
+            return False
+        names = getattr(self, "_select_names", [])
+        name = names[index] if 0 <= index < len(names) else ""
+        if not await self._click_select_account(index, name):
+            return False
+        self.status = "scanned"
+        await self.emit("login_status", {"sid": self.sid, "status": "scanned"})
+        await self._capture_fields_and_finalize()
+        return True
 
     async def _capture_fields_and_finalize(self):
         self.status = "capturing"
