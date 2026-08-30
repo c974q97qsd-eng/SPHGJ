@@ -660,6 +660,7 @@ class LoginSession:
             acc["name"] = (name or self.captured["name"] or acc.get("name") or acc["id"]).strip()
             acc["_wx_name"] = self.captured.get("wx_name") or acc.get("_wx_name", "")
             self._save_config()
+            await self.emit("accounts_updated", {"reason": "login_finalize", "sid": self.sid})
             self._finalized = True
             self._finished("finalized")
             logger.info(f"[login:{self.sid}] 账号已更新(relogin): {acc['id']} ({acc['name']})")
@@ -680,6 +681,7 @@ class LoginSession:
             dup["_wx_name"] = self.captured.get("wx_name") or dup.get("_wx_name", "")
             dup["profile_dir"] = final_dir
             self._save_config()
+            await self.emit("accounts_updated", {"reason": "login_finalize_dedup", "sid": self.sid})
             self._finalized = True
             self._finished("finalized")
             logger.info(f"[login:{self.sid}] 扫到已存在账号(_log_finder_id={fid[:20]}),已更新: {dup['id']} ({dup['name']})")
@@ -711,6 +713,7 @@ class LoginSession:
         }
         self.config.setdefault("accounts", []).append(acc)
         self._save_config()
+        await self.emit("accounts_updated", {"reason": "login_finalize_new", "sid": self.sid})
         self._finalized = True
         self._finished("finalized")
         logger.info(f"[login:{self.sid}] 账号已保存: {acc_id} ({acc['name']})")

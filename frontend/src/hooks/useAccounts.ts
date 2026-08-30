@@ -27,10 +27,11 @@ export function useAccounts() {
     return () => clearInterval(timer.current)
   }, [refresh])
 
-  // WS:引擎状态变化立即更新
+  // WS:引擎状态变化立即更新;账号列表变更(登录/改名/删除)立即刷新
   useWebSocket(useCallback((e: WsEvent) => {
     if (e.event === "engine_status") setStatus(e.payload as EngineStatus)
-  }, []))
+    if (e.event === "accounts_updated") refresh()
+  }, [refresh]))
 
   return { status, accounts: status.accounts, loading, error, refresh }
 }
