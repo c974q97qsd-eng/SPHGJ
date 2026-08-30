@@ -454,22 +454,32 @@ class LoginSession:
         logger.info(f"[login:{self.sid}] 检测到账号选择页(URL={self.page.url})")
         accounts = await self._enumerate_select_accounts()
 
-        # relogin 且能匹配到目标账号 -> 自动点击,不再打扰用户
+        # relogin 且能**精确**匹配到目标账号 -> 自动点击,不再打扰用户
+        # 精准匹配规则: name 必须完全相等(==),禁止子串包含(in)——
+        #   "免税仓"与"免税2号"前缀相近,泛匹配必然误选错号。
+        # wx_name 同理精确匹配;finder_id 是全局唯一标识符,允许子串匹配。
         auto_idx = -1
         target_name = ""
         if accounts and self.account:
             target_name = (self.account.get("name") or "").strip()
             wx_name = (self.account.get("_wx_name") or "").strip()
-            fid = (self.account.get("_log_finder_id") or "").strip()
+            fid = (self.account.get("_log_finder_id") or self.account.get("finder_id") or "").strip()
             for i, acc in enumerate(accounts):
                 nm = acc["name"]
-                if (target_name and (nm == target_name or target_name in nm or nm in target_name)) \
-                        or (wx_name and nm == wx_name) or (fid and fid in acc.get("_raw", "")):
+                # 仅 name 精确相等 或 wx_name 精确相等 或 fid 子串命中(raw 含 finder id)
+                if (target_name and nm == target_name) \
+                        or (wx_name and nm == wx_name) \
+                        or (fid and fid in acc.get("_raw", "")):
                     auto_idx = i
                     break
         if auto_idx >= 0:
             nm = accounts[auto_idx]["name"]
-            logger.info(f"[login:{self.sid}] 自动选择账号 #{auto_idx + 1} {nm!r}(匹配目标 {target_name!r})")
+            # 记录命中方式,便于排查
+            how = ("name" if nm == target_name else
+                   "wx_name" if wx_name and nm == wx_name else
+                   "finder_id")
+            logger.info(f"[login:{self.sid}] 精确匹配账号 #{auto_idx + 1} {nm!r}"
+                        f"(方式={how}, 目标 name={target_name!r})")
             if await self._click_select_account(auto_idx, nm):
                 self.status = "scanned"
                 await self.emit("login_status", {"sid": self.sid, "status": "scanned",
