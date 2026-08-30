@@ -14,7 +14,9 @@ import asyncio
 from collections import Counter
 from datetime import datetime
 from typing import Optional
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query
+import socket
+import time
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query, Request
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -412,10 +414,52 @@ async def mem_diagnose(holders: bool = False):
 # ===================== 扫码登录(须在 {account_id} 路由之前注册,否则
 # POST /api/accounts/login/start 会被 /api/accounts/{account_id}/start 抢匹配,
 # account_id="login" -> 404 账号不存在)=====================
+
+# 本机 IP 集合缓存(网卡 IP 极少变动,5 分钟 TTL 避免每次请求遍历网卡)
+_LOCAL_IP_CACHE = {"ts": 0.0, "ips": set()}
+
+
+def _local_ips():
+    """本机所有 IP(回环 + 主机名解析 + 各网卡地址),用于判断客户端是否本机。"""
+    now = time.time()
+    if _LOCAL_IP_CACHE["ips"] and now - _LOCAL_IP_CACHE["ts"] < 300:
+        return _LOCAL_IP_CACHE["ips"]
+    ips = {"127.0.0.1", "::1", "localhost", ""}
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None):
+            ips.add(info[4][0])
+    except Exception:
+        pass
+    try:
+        import psutil
+        for addrs in psutil.net_if_addrs().values():
+            for a in addrs:
+                if a.family == socket.AF_INET:
+                    ips.add(a.address)
+    except Exception:
+        pass
+    _LOCAL_IP_CACHE.update(ts=now, ips=ips)
+    return ips
+
+
+def _client_is_local(request: Request) -> bool:
+    """HTTP 客户端是否运行在本机。
+
+    本机 -> headed 弹浏览器窗口扫码;远程(局域网其他主机) -> 服务器弹窗用户看不到,
+    必须走 headless + 网页二维码推送。
+    """
+    host = (request.client.host if request.client else "") or ""
+    host = host.replace("::ffff:", "")  # IPv4-mapped IPv6 归一化
+    return host in _local_ips()
+
+
 @app.post("/api/accounts/login/start")
-async def login_start(headed: bool = Query(True)):
+async def login_start(request: Request, headed: Optional[bool] = Query(None)):
+    # 未显式指定 -> 按客户端是否本机自动决定模式
+    if headed is None:
+        headed = _client_is_local(request)
     sess = await manager.start_login(headed=headed)
-    return {"sid": sess.sid, "status": sess.status}
+    return {"sid": sess.sid, "status": sess.status, "headed": headed}
 
 
 @app.post("/api/accounts/login/{sid}/open-window")
@@ -485,12 +529,18 @@ async def start_account(account_id: str):
 
 
 @app.post("/api/accounts/{account_id}/relogin")
-async def relogin_account(account_id: str, headed: bool = Query(True)):
-    """已存在账号重新扫码登录(离线时前端启动失败转此)。"""
+async def relogin_account(account_id: str, request: Request,
+                          headed: Optional[bool] = Query(None)):
+    """已存在账号重新扫码登录(离线时前端启动失败转此)。
+
+    headed 未指定时按客户端是否本机自动决定(远程走网页二维码)。
+    """
+    if headed is None:
+        headed = _client_is_local(request)
     sess = await manager.start_relogin(account_id, headed=headed)
     if not sess:
         raise HTTPException(404, "账号不存在")
-    return {"sid": sess.sid, "status": sess.status}
+    return {"sid": sess.sid, "status": sess.status, "headed": headed}
 
 
 @app.post("/api/accounts/{account_id}/stop")

@@ -138,12 +138,14 @@ export const api = {
   deleteAccount: (id: string, remove_profile = false) =>
     req<{ ok: boolean; accounts: AccountStatus[] }>(`/accounts/${id}?remove_profile=${remove_profile}`, { method: "DELETE" }),
   startAccount: (id: string) => req<{ ok: boolean; logged_in: boolean }>(`/accounts/${id}/start`, { method: "POST" }),
-  reloginAccount: (id: string, headed = true) => req<{ sid: string; status: string }>(`/accounts/${id}/relogin?headed=${headed}`, { method: "POST" }),
+  reloginAccount: (id: string, headed?: boolean) =>
+    req<{ sid: string; status: string; headed?: boolean }>(`/accounts/${id}/relogin${headed === undefined ? "" : `?headed=${headed}`}`, { method: "POST" }),
   stopAccount: (id: string) => req<{ ok: boolean }>(`/accounts/${id}/stop`, { method: "POST" }),
   openAccountBrowser: (id: string) => req<{ ok: boolean }>(`/accounts/${id}/open-browser`, { method: "POST" }),
   openDashboard: (id: string) => req<{ ok: boolean }>(`/accounts/${id}/open-dashboard`, { method: "POST" }),
 
-  loginStart: (headed = true) => req<{ sid: string; status: string }>(`/accounts/login/start?headed=${headed}`, { method: "POST" }),
+  loginStart: (headed?: boolean) =>
+    req<{ sid: string; status: string; headed?: boolean }>(`/accounts/login/start${headed === undefined ? "" : `?headed=${headed}`}`, { method: "POST" }),
   loginOpenWindow: (sid: string) => req<{ sid: string; status: string }>(`/accounts/login/${sid}/open-window`, { method: "POST" }),
   loginCancel: (sid: string) => req<{ ok: boolean }>(`/accounts/login/${sid}/cancel`, { method: "POST" }),
   loginFinalize: (sid: string, account_id?: string, name?: string) =>

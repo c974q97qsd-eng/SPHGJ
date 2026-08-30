@@ -18,7 +18,8 @@ const STATUS_TEXT: Record<Status, string> = {
   cancelled: "已取消",
 }
 
-type ScanMode = "window" | "web"
+/** auto=后端按客户端是否本机自动决定(未拿到结果前不高亮任何按钮) */
+type ScanMode = "auto" | "window" | "web"
 
 export function AddAccountDialog({ open, onOpenChange, onDone, reloginAccountId, reloginAccountName, reloginWxName }: {
   open: boolean
@@ -31,27 +32,30 @@ export function AddAccountDialog({ open, onOpenChange, onDone, reloginAccountId,
   const [sid, setSid] = useState<string | null>(null)
   const [status, setStatus] = useState<Status>("starting")
   const [error, setError] = useState<string | null>(null)
-  const [mode, setMode] = useState<ScanMode>("window")
+  const [mode, setMode] = useState<ScanMode>("auto")
   const [qrImage, setQrImage] = useState<string | null>(null)
   const sidRef = useRef<string | null>(null)
   sidRef.current = sid
   const finalizingRef = useRef(false)
 
   const startLogin = async (scanMode?: ScanMode) => {
-    const m = scanMode ?? mode
     // 重试时先清理旧会话(异步,不阻塞)
     const old = sidRef.current
     if (old) { void api.loginCancel(old).catch(() => {}) }
     finalizingRef.current = false
     setStatus("starting"); setError(null); setSid(null); setQrImage(null)
+    if (scanMode) setMode(scanMode)
     try {
-      const headed = m === "window"
+      // 未指定模式 -> 不传 headed,由后端按客户端是否本机自动决定:
+      // 本机走浏览器窗口弹窗,远程(局域网其他主机)走 headless + 网页二维码
+      const headed = scanMode ? scanMode === "window" : undefined
       const r = reloginAccountId
         ? await api.reloginAccount(reloginAccountId, headed)
         : await api.loginStart(headed)
       setSid(r.sid)
       setStatus((r.status as Status) || "waiting_scan")
-      if (m !== mode) setMode(m)
+      // 跟随后端实际采用的模式
+      if (r.headed !== undefined) setMode(r.headed ? "window" : "web")
     } catch (e) {
       setError((e as Error).message)
       setStatus("failed")
@@ -104,6 +108,8 @@ export function AddAccountDialog({ open, onOpenChange, onDone, reloginAccountId,
     }
     if (e.event === "qr_update" && e.payload.sid === mySid) {
       setQrImage(e.payload.image || null)
+      // 收到二维码推送 => 后端必然走的 headless 网页模式(兼容后端未返回 headed 字段)
+      setMode((m) => (m === "auto" ? "web" : m))
     }
   })
 
