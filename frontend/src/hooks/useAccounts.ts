@@ -50,6 +50,8 @@ export function useAccountActions(refresh: () => void) {
     openBrowser: (id: string) => act(id, api.openAccountBrowser),
     openDashboard: (id: string) => act(id, api.openDashboard),
     remove: (id: string, removeProfile: boolean) => act(id, (i) => api.deleteAccount(i, removeProfile)),
+    // 锁定/解锁微信身份:锁定后该账号只接受锁定的微信登录
+    setLock: (id: string, locked: boolean) => act(id, (i) => (locked ? api.lockAccount(i) : api.unlockAccount(i))),
   }
 }
 

@@ -97,8 +97,10 @@ export function AddAccountDialog({ open, onOpenChange, onDone, reloginAccountId,
       onOpenChange(false)
       onDone()
     } catch (e) {
-      setError("保存失败:" + (e as Error).message)
+      const msg = (e as Error).message
+      setError("保存失败:" + msg)
       setStatus("failed")
+      toast.error(msg)  // 后端拒绝原因(如账号锁定)直接弹给用户
     }
   }
 

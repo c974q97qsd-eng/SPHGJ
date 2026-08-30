@@ -22,6 +22,31 @@ from .selectors import (QR_CANDIDATES, ACCOUNT_NAME_CANDIDATES, COMMENT_URL, LOG
                         ACCOUNT_SELECT_MARKERS, ACCOUNT_SELECT_ROLE_WORDS)
 
 
+class LoginLockError(Exception):
+    """账号已锁定微信身份,本次登录的不是该微信 -> 拒绝保存。"""
+
+
+def check_account_lock(acc: dict, captured: dict) -> str:
+    """账号处于锁定态时,校验本次登录的微信身份是否允许保存。
+
+    返回 "" 表示通过;非空返回拒绝原因(展示给用户)。
+    优先用稳定唯一标识 finder_id 比对,其次用选择页账号名精确比对;
+    两者都无法比对(均为空)时按"未通过"处理,宁可不保存也不能存错。
+    """
+    locked_fid = (acc.get("locked_finder_id") or "").strip()
+    locked_name = (acc.get("locked_name") or "").strip()
+    if not locked_fid and not locked_name:
+        return ""
+    fid = (captured.get("finder_id") or "").strip()
+    nm = (captured.get("name") or "").strip()
+    if locked_fid and fid and fid == locked_fid:
+        return ""
+    if locked_name and nm and nm == locked_name:
+        return ""
+    return (f"该账号已锁定微信「{locked_name or '未知'}」,"
+            f"本次登录的是「{nm or '未知'}」,已拒绝保存")
+
+
 class LoginSession:
     def __init__(self, playwright, config, emit, account=None, auto_finalize=False, on_finished=None):
         self.sid = uuid.uuid4().hex[:12]
@@ -460,18 +485,32 @@ class LoginSession:
         # wx_name 同理精确匹配;finder_id 是全局唯一标识符,允许子串匹配。
         auto_idx = -1
         target_name = ""
+        wx_name = ""
         if accounts and self.account:
             target_name = (self.account.get("name") or "").strip()
             wx_name = (self.account.get("_wx_name") or "").strip()
             fid = (self.account.get("_log_finder_id") or self.account.get("finder_id") or "").strip()
-            for i, acc in enumerate(accounts):
-                nm = acc["name"]
-                # 仅 name 精确相等 或 wx_name 精确相等 或 fid 子串命中(raw 含 finder id)
-                if (target_name and nm == target_name) \
-                        or (wx_name and nm == wx_name) \
-                        or (fid and fid in acc.get("_raw", "")):
-                    auto_idx = i
-                    break
+            locked_fid = (self.account.get("locked_finder_id") or "").strip()
+            locked_name = (self.account.get("locked_name") or "").strip()
+            if locked_fid or locked_name:
+                # 锁定态:只认锁定的那个微信,其余一律不自动点(宁可交给用户,也不误选)
+                for i, acc in enumerate(accounts):
+                    if (locked_fid and locked_fid in acc.get("_raw", "")) \
+                            or (locked_name and acc["name"] == locked_name):
+                        auto_idx = i
+                        break
+                if auto_idx < 0:
+                    logger.warning(f"[login:{self.sid}] 账号已锁定「{locked_name or locked_fid}」,"
+                                   f"选择页 {len(accounts)} 项中无匹配,不自动点击")
+            else:
+                for i, acc in enumerate(accounts):
+                    nm = acc["name"]
+                    # 仅 name 精确相等 或 wx_name 精确相等 或 fid 子串命中(raw 含 finder id)
+                    if (target_name and nm == target_name) \
+                            or (wx_name and nm == wx_name) \
+                            or (fid and fid in acc.get("_raw", "")):
+                        auto_idx = i
+                        break
         if auto_idx >= 0:
             nm = accounts[auto_idx]["name"]
             # 记录命中方式,便于排查
@@ -655,6 +694,12 @@ class LoginSession:
         if self.account:
             # relogin:更新原账号 _aid/_log_finder_id/name,保留 id 与 profile_dir
             acc = self.account
+            # 锁定态:本次登录的不是锁定的那个微信 -> 拒绝保存(不写 config)
+            reason = check_account_lock(acc, self.captured)
+            if reason:
+                logger.warning(f"[login:{self.sid}] 账号 {acc['id']} 锁定校验未通过: {reason}")
+                await self.emit("login_error", {"sid": self.sid, "message": reason})
+                raise LoginLockError(reason)
             acc["_aid"] = self.captured["aid"] or acc.get("_aid", "")
             acc["_log_finder_id"] = self.captured["finder_id"] or acc.get("_log_finder_id", "")
             acc["name"] = (name or self.captured["name"] or acc.get("name") or acc["id"]).strip()

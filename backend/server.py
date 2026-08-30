@@ -26,6 +26,7 @@ logger = logging.getLogger("sphgj")
 
 from .storage import Storage
 from .account_manager import AccountManager
+from .login_capture import LoginLockError
 from . import schemas
 from .metrics import metric_dictionary, validate_card_fields, DEFAULT_CARD_FIELDS
 from .memtrim import trim_now
@@ -489,7 +490,11 @@ async def login_select_account(sid: str, body: dict):
 
 @app.post("/api/accounts/login/{sid}/finalize")
 async def login_finalize(sid: str, body: schemas.LoginFinalize):
-    acc = await manager.finalize_login(sid, body.account_id, body.name)
+    try:
+        acc = await manager.finalize_login(sid, body.account_id, body.name)
+    except LoginLockError as e:
+        # 账号已锁定微信,本次登录的不是该微信 -> 不落盘,直接告知前端
+        raise HTTPException(403, str(e))
     if not acc:
         raise HTTPException(404, "登录会话不存在或已完成")
     return {"ok": True, "account": acc, "accounts": manager.status_snapshot()["accounts"]}
@@ -528,6 +533,22 @@ async def del_account(account_id: str, remove_profile: bool = False):
     if not manager.delete_account(account_id, remove_profile=remove_profile):
         raise HTTPException(404, "账号不存在")
     return {"ok": True, "accounts": manager.status_snapshot()["accounts"]}
+
+
+@app.post("/api/accounts/{account_id}/lock")
+async def lock_account(account_id: str):
+    """锁定账号微信身份:之后该卡片只接受锁定的那个微信登录。"""
+    if not manager.set_account_lock(account_id, True):
+        raise HTTPException(400, "账号不存在或尚无微信标识(请先成功登录一次再锁定)")
+    return {"ok": True, "locked": True, "accounts": manager.status_snapshot()["accounts"]}
+
+
+@app.post("/api/accounts/{account_id}/unlock")
+async def unlock_account(account_id: str):
+    """解锁:清除锁定的微信身份,恢复任意微信登录。"""
+    if not manager.set_account_lock(account_id, False):
+        raise HTTPException(404, "账号不存在")
+    return {"ok": True, "locked": False, "accounts": manager.status_snapshot()["accounts"]}
 
 
 @app.post("/api/accounts/{account_id}/start")

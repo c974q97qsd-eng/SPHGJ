@@ -1144,6 +1144,28 @@ class AccountManager:
         self._save_config()
         return True
 
+    def set_account_lock(self, account_id, locked):
+        """锁定/解锁账号的微信身份。
+
+        锁定:把当前账号的微信标识(_log_finder_id + name)存为 locked_*,
+        之后该账号只接受这个微信登录;解锁:清除 locked_* 恢复自由登录。
+        """
+        acc = next((a for a in self.config.get("accounts", []) if a["id"] == account_id), None)
+        if not acc:
+            return False
+        if locked:
+            fid = (acc.get("_log_finder_id") or "").strip()
+            nm = (acc.get("name") or "").strip()
+            if not fid and not nm:
+                return False  # 尚无可用微信标识(未登录过),无法锁定
+            acc["locked_finder_id"] = fid
+            acc["locked_name"] = nm
+        else:
+            acc.pop("locked_finder_id", None)
+            acc.pop("locked_name", None)
+        self._save_config()
+        return True
+
     def delete_account(self, account_id, remove_profile=False):
         before = len(self.config.get("accounts", []))
         self.config["accounts"] = [a for a in self.config.get("accounts", []) if a["id"] != account_id]
@@ -1184,6 +1206,8 @@ class AccountManager:
             "auto_comment_content": acc.get("auto_comment_content", ""),
             "has_aid": bool(acc.get("_aid")),
             "wx_name": acc.get("_wx_name", ""),
+            "locked": bool(acc.get("locked_finder_id") or acc.get("locked_name")),
+            "locked_name": acc.get("locked_name", ""),
         }
 
     async def stop_all(self):

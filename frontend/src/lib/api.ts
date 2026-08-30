@@ -14,6 +14,8 @@ export interface AccountStatus {
   auto_comment_content: string
   has_aid: boolean
   wx_name: string
+  locked: boolean
+  locked_name: string
 }
 
 export interface EngineStatus {
@@ -118,7 +120,11 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
   })
   if (!r.ok) {
     let msg = `${r.status}`
-    try { msg += " " + (JSON.stringify(await r.json())) } catch { /* ignore */ }
+    try {
+      const j = await r.json()
+      // 优先展示后端 detail(如锁定拒绝原因),便于用户直接看懂
+      msg = j?.detail ?? JSON.stringify(j)
+    } catch { /* ignore */ }
     throw new Error(msg)
   }
   if (r.status === 204) return undefined as T
@@ -141,6 +147,10 @@ export const api = {
   reloginAccount: (id: string, headed?: boolean) =>
     req<{ sid: string; status: string; headed?: boolean }>(`/accounts/${id}/relogin${headed === undefined ? "" : `?headed=${headed}`}`, { method: "POST" }),
   stopAccount: (id: string) => req<{ ok: boolean }>(`/accounts/${id}/stop`, { method: "POST" }),
+  lockAccount: (id: string) =>
+    req<{ ok: boolean; locked: boolean; accounts: AccountStatus[] }>(`/accounts/${id}/lock`, { method: "POST" }),
+  unlockAccount: (id: string) =>
+    req<{ ok: boolean; locked: boolean; accounts: AccountStatus[] }>(`/accounts/${id}/unlock`, { method: "POST" }),
   openAccountBrowser: (id: string) => req<{ ok: boolean }>(`/accounts/${id}/open-browser`, { method: "POST" }),
   openDashboard: (id: string) => req<{ ok: boolean }>(`/accounts/${id}/open-dashboard`, { method: "POST" }),
 
