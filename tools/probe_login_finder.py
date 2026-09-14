@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from playwright.async_api import async_playwright
 from backend.browser import launch_stealth
 
-PROFILE = "./profiles/_probe_as_1788087132"
+PROFILE = "./profiles/<探测profile>"
 
 
 async def main():

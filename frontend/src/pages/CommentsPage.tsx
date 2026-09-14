@@ -8,7 +8,9 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetDescription, SheetFooter } from "@/components/ui/sheet"
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from "@/components/ui/table"
 import { Checkbox } from "@/components/ui/checkbox"
+import { Separator } from "@/components/ui/separator"
 import { EmptyState, LoadingState, ErrorState } from "@/components/common/states"
+import { Switch } from "@/components/ui/switch"
 import { useComments } from "@/hooks/useComments"
 import { useAccounts } from "@/hooks/useAccounts"
 import { api, type Comment } from "@/lib/api"
@@ -24,13 +26,17 @@ export function CommentsPage() {
   const [q, setQ] = useState("")
   const [replied, setReplied] = useState<RepliedFilter>("all")
   const [selected, setSelected] = useState<Comment | null>(null)
+  // 「隐藏发出的评论」开关(自动评论+置顶/自动回复/手动回复发出的),默认开,本地持久化
+  const [hideOwn, setHideOwn] = useState<boolean>(() => localStorage.getItem("sphgj.hide_own_comments") !== "0")
+  useEffect(() => { localStorage.setItem("sphgj.hide_own_comments", hideOwn ? "1" : "0") }, [hideOwn])
 
   const params = useMemo(() => ({
     account_id: accountId === "all" ? undefined : accountId,
     replied: replied === "all" ? undefined : replied === "replied",
     q: q.trim() || undefined,
+    hide_own: hideOwn ? 1 : undefined,
     limit: 300,
-  }), [accountId, q, replied])
+  }), [accountId, q, replied, hideOwn])
 
   const { items, total, loading, error, refresh } = useComments(params)
 
@@ -109,6 +115,11 @@ export function CommentsPage() {
           <Button variant="outline" size="sm" asChild className="gap-1.5">
             <a href={api.exportCsvUrl(accountId === "all" ? undefined : accountId)}><Download className="h-3.5 w-3.5" />导出 CSV</a>
           </Button>
+          <Separator orientation="vertical" className="hidden sm:block h-5" />
+          <div className="flex items-center gap-2" title="隐藏由自动评论+置顶、自动回复、手动回复发出的评论">
+            <Switch checked={hideOwn} onCheckedChange={setHideOwn} aria-label="隐藏发出的评论" />
+            <span className="text-xs text-muted-foreground whitespace-nowrap">隐藏发出的评论</span>
+          </div>
         </div>
       </Card>
 

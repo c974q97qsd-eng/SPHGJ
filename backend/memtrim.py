@@ -30,6 +30,7 @@ import platform
 logger = logging.getLogger("sphgj")
 
 
+
 def _trim_windows():
     """Windows: SetProcessWorkingSetSize(-1,-1) 请求 OS 压缩物理工作集。"""
     try:
@@ -103,3 +104,4 @@ class MemoryTrimmer:
             self._task.cancel()
             self._task = None
             logger.info("[memtrim] 已停止定时内存归还")
+

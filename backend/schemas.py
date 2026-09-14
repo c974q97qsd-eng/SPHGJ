@@ -46,6 +46,11 @@ class ConfigUpdate(BaseModel):
     dashboard_interval_sec: Optional[int] = Field(default=None, ge=10)
     live_check_interval_sec: Optional[int] = Field(default=None, ge=2)
     manual_release_delay_sec: Optional[int] = Field(default=None, ge=0)
+    # 界面缩放档位:large=大(100%) / medium=中(88%) / small=小(75%)
+    ui_scale: Optional[str] = None
+    # 作品管理配置(每日自动刷新等)
+    posts_auto_refresh_enabled: Optional[bool] = None
+    posts_auto_refresh_hour: Optional[int] = Field(default=None, ge=0, le=23)
 
 
 class AutoReplyRule(BaseModel):
@@ -67,3 +72,17 @@ class PinCommentBody(BaseModel):
     account_id: str
     export_id: str
     op_type: int = 1  # 1 置顶 / 0 取消
+
+
+class PostsRefreshBody(BaseModel):
+    account_id: Optional[str] = None  # None = 全部已登录账号
+
+
+class PostOpItem(BaseModel):
+    account_id: str
+    object_id: str
+
+
+class PostsBatchBody(BaseModel):
+    action: str  # hide / unhide / sticky / unsticky
+    items: List[PostOpItem]

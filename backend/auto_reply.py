@@ -30,6 +30,19 @@ class AutoReply:
                 return rule
         return None
 
+    @staticmethod
+    def _parse_new_comment_id(resp):
+        """从 create_comment 响应解析新评论 id(data.comment.commentId 或 data.commentId)。"""
+        data = resp.get("data") or {}
+        if not isinstance(data, dict):
+            return None
+        cmt = data.get("comment") or {}
+        if isinstance(cmt, dict):
+            cid = cmt.get("commentId") or cmt.get("comment_id")
+            if cid:
+                return cid
+        return data.get("commentId") or data.get("comment_id")
+
     async def reply_comment(self, cmt):
         """单条评论:命中关键字则回复。返回是否回复成功。"""
         if not self.is_enabled():
@@ -50,6 +63,11 @@ class AutoReply:
             resp = await self.api.reply_comment(cid, reply_text)
             if resp and not resp.get("__err"):
                 await asyncio.to_thread(self.storage.mark_replied, cid)
+                # 记录本工具发出的评论(评论列表「隐藏发出的评论」开关用)
+                new_cid = self._parse_new_comment_id(resp)
+                if new_cid:
+                    await asyncio.to_thread(self.storage.mark_own_comment,
+                                            self.account_id, new_cid, "auto_reply")
                 logger.info(f"[{self.account_id}] 自动回复 {cid}({content[:15]})-> {reply_text}")
                 return True
             logger.warning(f"[{self.account_id}] 回复失败 {cid}: {resp}")

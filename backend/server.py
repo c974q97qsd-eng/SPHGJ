@@ -32,6 +32,7 @@ from .log_hub import install as install_log_hub
 from . import schemas
 from .metrics import metric_dictionary, validate_card_fields, DEFAULT_CARD_FIELDS
 from .memtrim import trim_now
+from .post_fetcher import PostFetcher
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 CONFIG_PATH = os.path.join(ROOT, "config.json")
@@ -100,6 +101,8 @@ async def _capture_loop():
     asyncio.create_task(_mem_monitor())
     # rev18: 泄漏高发期(启动后 ~3.5h)自动深采样,结果落盘 mem_deep.log
     asyncio.create_task(_deep_autopsy_loop())
+    # 作品每日定时刷新(手动刷新不受影响)
+    asyncio.create_task(_posts_auto_refresh_loop())
     # 打印运行版本(懒导入 main.VERSION,避免与 main 的循环依赖)
     try:
         from main import VERSION
@@ -190,6 +193,13 @@ async def get_config():
         "dashboard_interval_sec": config.get("dashboard_interval_sec", 60),
         "live_check_interval_sec": config.get("live_check_interval_sec", 8),
         "manual_release_delay_sec": config.get("manual_release_delay_sec", 120),
+        "ui_scale": config.get("ui_scale", "medium"),
+        "posts": {
+            "auto_refresh_enabled": bool((config.get("posts") or {}).get("auto_refresh_enabled", True)),
+            "auto_refresh_hour": int((config.get("posts") or {}).get("auto_refresh_hour", 9)),
+            "refresh_cooldown_sec": int((config.get("posts") or {}).get("refresh_cooldown_sec", 60)),
+            "max_pages": int((config.get("posts") or {}).get("max_pages", 20)),
+        },
     }
 
 
@@ -221,6 +231,14 @@ async def patch_config(body: schemas.ConfigUpdate):
         config["manual_release_delay_sec"] = body.manual_release_delay_sec
         for w in manager.workers.values():
             w.config = config
+    if body.ui_scale is not None:
+        if body.ui_scale not in ("large", "medium", "small"):
+            raise HTTPException(400, "ui_scale 仅支持 large/medium/small")
+        config["ui_scale"] = body.ui_scale
+    if body.posts_auto_refresh_enabled is not None:
+        config.setdefault("posts", {})["auto_refresh_enabled"] = body.posts_auto_refresh_enabled
+    if body.posts_auto_refresh_hour is not None:
+        config.setdefault("posts", {})["auto_refresh_hour"] = body.posts_auto_refresh_hour
     save_config(config)
     return {"ok": True, "config": await get_config()}
 
@@ -252,6 +270,7 @@ async def manual_memtrim():
         "rss_mb_after": round(after, 1),
         "rss_mb_saved": round(before - after, 1),
     }
+
 
 
 # ===================== rev18 内存深采样 =====================
@@ -372,6 +391,193 @@ def _deep_impl(sample_n=120, max_len=60):
     }
 
 
+def _chain_impl(max_lists=6, depth=6):
+    """rev19: 对一个具体 list 逐层上溯引用链,定位海量小 dict 的真实持有者。
+
+    与 _deep_impl 的区别(_deep_impl 到此为止,拿不到根):
+      - _deep_impl 只统计"直接引用者类型"的直方图 —— 只能说"93% 被 list 持有",
+        看不到 list 之上是谁,所以一直定位不到根因;
+      - 本函数挑出"装满了小 dict 的 list"作为起点,逐层上溯到根
+        (module / 实例属性 / frame),并且【保留 frame】—— 旧版把 FrameType 排除掉了,
+        而"某个卡住的协程的局部变量"恰恰是最常见的持有者,排除它等于蒙上眼睛。
+        frame 会被翻译成 函数名@文件:行号,直接指向代码位置。
+
+    只读,不修改任何对象。随机性:取长度最大的若干 list(最具代表性)。
+    """
+    import psutil
+    gc.collect()
+    objs = gc.get_objects()
+
+    # 1) 找"装满了 dict"的 list —— 泄漏批次的载体
+    cands = []
+    for o in objs:
+        if type(o) is not list:
+            continue
+        n = len(o)
+        if n < 8 or n > 4096:
+            continue
+        try:
+            nd = sum(1 for e in o[:24] if type(e) is dict)
+        except Exception:
+            continue
+        if nd >= max(4, int(min(24, n) * 0.6)):
+            cands.append(o)
+    if not cands:
+        del objs, cands
+        return {"error": "未找到 dict 批次 list(泄漏结构可能已变化)"}
+    cands.sort(key=len, reverse=True)
+    picks = cands[:max_lists]
+    internal = {id(objs), id(cands), id(picks)}
+    # 必须先释放全量对象表再追链:它引用了堆里的一切,会让每个对象的
+    # referrers 里都出现这个巨大临时 list,彻底污染结果。
+    del objs, cands
+
+    def _peek(o, n=3):
+        try:
+            if isinstance(o, dict):
+                return "keys: " + ", ".join(repr(k)[:26] for k in itertools.islice(o.keys(), n))
+            if isinstance(o, (list, tuple, set, frozenset)):
+                return "els: " + ", ".join(type(e).__name__ for e in itertools.islice(o, n))
+        except Exception:
+            pass
+        return ""
+
+    def _describe(o):
+        d = {"type": type(o).__name__}
+        try:
+            d["len"] = len(o)
+        except Exception:
+            pass
+        t = type(o)
+        try:
+            if t is types.FrameType:
+                # 关键:报出代码位置,直接指向持有它的局部变量所在处
+                fn = o.f_code.co_filename.rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
+                d["frame"] = f"{o.f_code.co_name}@{fn}:{o.f_lineno}"
+            elif t is types.ModuleType:
+                d["module"] = getattr(o, "__name__", "?")
+            elif hasattr(o, "__dict__") and not isinstance(o, (int, float, str, bytes, bool)):
+                d["class"] = f"{t.__module__}.{t.__qualname__}"
+        except Exception:
+            pass
+        p = _peek(o)
+        if p:
+            d["peek"] = p
+        return d
+
+    chains = []
+    for c in picks:
+        keys = []
+        try:
+            for e in c[:3]:
+                if type(e) is dict:
+                    keys.append(sorted(str(k) for k in itertools.islice(e.keys(), 8)))
+        except Exception:
+            pass
+        node = {"list_len": len(c), "elem_key_samples": keys, "chain": []}
+        cur, seen = c, {id(c)}
+        for _ in range(depth):
+            try:
+                refs = gc.get_referrers(cur)
+            except Exception:
+                break
+            pool = [r for r in refs
+                    if id(r) not in seen and id(r) not in internal
+                    and not isinstance(r, types.TracebackType)]
+            if not pool:
+                break
+
+            def score(r):
+                if isinstance(r, (list, dict, tuple, set)):
+                    return 0
+                if isinstance(r, types.FrameType):
+                    return 1
+                if isinstance(r, types.ModuleType):
+                    return 2
+                return 3
+            pool.sort(key=score)
+            top_score = score(pool[0])
+            best = None
+            for r in pool:
+                if score(r) != top_score:
+                    continue
+                if best is None:
+                    best = r
+                    continue
+                try:
+                    if len(r) > len(best):
+                        best = r
+                except Exception:
+                    pass
+            if best is None:
+                best = pool[0]
+            node["chain"].append(_describe(best))
+            seen.add(id(best))
+            cur = best
+            if isinstance(best, types.ModuleType):
+                break
+        chains.append(node)
+    return {
+        "rss_mb": round(psutil.Process().memory_info().rss / 1048576, 1),
+        "mode": "chain",
+        "chains": chains,
+    }
+
+
+def _tasks_impl():
+    """rev21: asyncio 任务体检 —— 回答"这些 Task 是挂住了还是已完成却没人回收"。
+
+    取证背景:2026-09-03 实测进程里有 7343 个 asyncio.Task 存活(每个 Task 自带一个
+    contextvars.Context,故 Context/hamt 计数同步走高)。Task 挂起 = 协程帧常驻 =
+    局部变量(含数百 KB 响应体文本)永久钉在堆上,而 str 不被 gc 跟踪,表现为
+    untracked 内存。所以必须能区分:
+      - done=False 且长时间不推进 -> 真挂起(CDP send / page.evaluate 未返回);
+      - done=True 但仍被引用     -> 已完成却无人回收(持有者问题)。
+    两种成因的修法完全不同,必须先分清。
+    """
+    try:
+        import psutil as _ps
+        rss_mb = round(_ps.Process().memory_info().rss / 1048576, 1)
+    except Exception:
+        rss_mb = -1
+    try:
+        all_t = asyncio.all_tasks()
+    except RuntimeError:
+        all_t = set()
+    pending, done = [], []
+    for t in all_t:
+        try:
+            coro = t.get_coro()
+            code = getattr(coro, "cr_code", None)
+            loc = f"{code.co_filename.rsplit(chr(92), 1)[-1].rsplit('/', 1)[-1]}:{code.co_name}" if code else "?"
+            # 挂起在哪一行:协程当前 yield 点(cr_frame 的 f_lineno)
+            fr = getattr(coro, "cr_frame", None)
+            if fr is not None:
+                loc = f"{loc}@{fr.f_lineno}"
+            rec = {"name": t.get_name(), "loc": loc}
+            (done if t.done() else pending).append(rec)
+        except Exception:
+            continue
+    def _top(records, n=12):
+        c = Counter(r["loc"] for r in records)
+        return [{"loc": k, "n": v} for k, v in c.most_common(n)]
+    return {
+        "rss_mb": rss_mb,
+        "mode": "tasks",
+        "total": len(all_t),
+        "pending": len(pending),
+        "done_unreclaimed": len(done),
+        "pending_top": _top(pending),
+        "done_top": _top(done),
+        "verdict": (
+            "大量 done=True 且长期不减 -> 已完成但被持有,查持有者"
+            if len(done) > max(50, len(pending))
+            else "大量 pending -> 真挂起,查 CDP/CDP send / page.evaluate 缺超时"
+            if len(pending) > 50
+            else "任务数正常"),
+    }
+
+
 async def _deep_autopsy_loop(runs=8, gap_sec=1500):
     """泄漏高发期自动深采样: 启动后每 25 分钟一次,共 8 次(~3.5h),之后自动停止。
 
@@ -381,6 +587,19 @@ async def _deep_autopsy_loop(runs=8, gap_sec=1500):
     os.makedirs(os.path.dirname(DEEP_LOG), exist_ok=True)
     for i in range(runs):
         await asyncio.sleep(gap_sec)
+        # rev19: 先跑引用链上溯(能直接给出持有者/代码位置),再跑类型直方图。
+        # chain 会逐层调用 gc.get_referrers,代价随堆增大而上升,故仅在堆还小时执行,
+        # 避免在内存已经吃紧的大进程上雪上加霜。
+        try:
+            import psutil as _ps
+            if _ps.Process().memory_info().rss / 1048576 < 3000:
+                c = await asyncio.to_thread(_chain_impl)
+                with open(DEEP_LOG, "a", encoding="utf-8") as f:
+                    f.write(time.strftime("[%Y-%m-%d %H:%M:%S] ")
+                            + json.dumps(c, ensure_ascii=False) + "\n")
+                logger.info(f"[memdeep] 引用链 #{i + 1}: 已写入 {len(c.get('chains', []))} 条链")
+        except Exception as e:
+            logger.debug(f"[memdeep] 引用链采样失败: {type(e).__name__}: {e}")
         try:
             d = await asyncio.to_thread(_deep_impl)
             with open(DEEP_LOG, "a", encoding="utf-8") as f:
@@ -393,7 +612,8 @@ async def _deep_autopsy_loop(runs=8, gap_sec=1500):
 
 
 @app.get("/api/system/memdiag")
-async def mem_diagnose(holders: bool = False, deep: bool = False):
+async def mem_diagnose(holders: bool = False, deep: bool = False, chain: bool = False,
+                       tasks: bool = False):
     """rev15: 内存诊断 —— 报告进程 RSS,并按类型统计 gc 跟踪的存活对象。
 
     判读方法(关键):
@@ -412,6 +632,11 @@ async def mem_diagnose(holders: bool = False, deep: bool = False):
 
     注意:这是重量级操作(遍历全部 gc 对象,大进程上需数秒且临时占用可观内存),
     仅用于排查,不要高频调用。
+
+    ?tasks=1: rev21 asyncio 任务体检(见 _tasks_impl),代价极小,可高频调用。
+      用于区分「Task 真挂起」与「已完成但被持有」—— 两者修法完全不同:
+      前者补超时,后者查持有者。Task 挂起时协程帧会钉住局部变量(含响应体文本),
+      且 str 不被 gc 跟踪,表现为 untracked 内存上涨。
     """
     try:
         import psutil
@@ -419,6 +644,11 @@ async def mem_diagnose(holders: bool = False, deep: bool = False):
         raise HTTPException(500, "未安装 psutil,无法读取进程内存")
     if deep:
         return await asyncio.to_thread(_deep_impl)
+    if chain:
+        return await asyncio.to_thread(_chain_impl)
+    if tasks:
+        # 只读当前存活 Task,代价极小,可放心高频调用
+        return _tasks_impl()
     proc = psutil.Process()
     rss_mb = proc.memory_info().rss / 1024 / 1024
     holders_on = bool(holders)
@@ -814,10 +1044,12 @@ async def get_comments(
     account_id: Optional[str] = None,
     replied: Optional[bool] = None,
     q: Optional[str] = None,
+    hide_own: int = Query(0, ge=0, le=1),
     limit: int = Query(200, ge=1, le=2000),
     offset: int = Query(0, ge=0),
 ):
     items, total = storage.query_comments(account_id=account_id, replied=replied, q=q,
+                                          hide_own=bool(hide_own),
                                           limit=limit, offset=offset)
     return {"items": items, "total": total, "limit": limit, "offset": offset}
 
@@ -878,6 +1110,16 @@ async def reply_comment(comment_id: str, body: schemas.ManualReply):
     if not resp or resp.get("__err"):
         raise HTTPException(502, f"回复失败: {resp}")
     storage.mark_replied(comment_id)
+    # 记录本工具发出的评论(「隐藏发出的评论」开关用)
+    _data = resp.get("data") or {}
+    _ncid = None
+    if isinstance(_data, dict):
+        _cmt = _data.get("comment") or {}
+        if isinstance(_cmt, dict):
+            _ncid = _cmt.get("commentId") or _cmt.get("comment_id")
+        _ncid = _ncid or _data.get("commentId") or _data.get("comment_id")
+    if _ncid:
+        storage.mark_own_comment(body.account_id, _ncid, "manual_reply")
     await hub.emit("comment_replied", {"comment_id": comment_id, "account_id": body.account_id})
     return {"ok": True}
 
@@ -993,6 +1235,239 @@ async def clear_auto_delete_logs(account_id: Optional[str] = None):
     return {"ok": True}
 
 
+# ===================== 作品管理 =====================
+def _parse_new_comment_id(resp):
+    """从 create_comment 响应解析新评论 id。"""
+    data = resp.get("data") or {}
+    if not isinstance(data, dict):
+        return None
+    cmt = data.get("comment") or {}
+    if isinstance(cmt, dict):
+        cid = cmt.get("commentId") or cmt.get("comment_id")
+        if cid:
+            return cid
+    return data.get("commentId") or data.get("comment_id")
+
+
+class PostsJob:
+    """作品刷新/批量操作后台任务(同一时间只允许一个,避免抢浏览器)。"""
+
+    def __init__(self):
+        self.lock = asyncio.Lock()
+        self.state = {"running": False, "kind": None, "accounts": {}, "total": 0,
+                      "done": 0, "failed": [], "started_at": None, "finished_at": None}
+
+    async def start(self, kind, coro):
+        async with self.lock:
+            if self.state["running"]:
+                return False, f"已有任务在跑({self.state['kind']})"
+            self.state = {"running": True, "kind": kind, "accounts": {}, "total": 0,
+                          "done": 0, "failed": [], "started_at": datetime.now().isoformat(),
+                          "finished_at": None}
+        asyncio.create_task(self._run(kind, coro))
+        return True, ""
+
+    async def _run(self, kind, coro):
+        try:
+            await coro
+        except Exception as e:
+            logger.error(f"[posts:{kind}] 任务异常: {e}")
+            self.state["failed"].append({"error": str(e)[:200]})
+        finally:
+            self.state["running"] = False
+            self.state["finished_at"] = datetime.now().isoformat()
+
+
+posts_job = PostsJob()
+_posts_auto_done = {}
+
+
+async def _do_posts_refresh(aids):
+    st_all = posts_job.state
+    st_all["accounts"] = {aid: {"status": "pending", "pages": 0, "fetched": 0,
+                                "covers": 0, "error": ""} for aid in aids}
+    st_all["total"] = len(aids)
+    for aid in aids:
+        st = st_all["accounts"][aid]
+        st_all["done"] += 1
+        w = manager.get_worker(aid)
+        if not w:
+            st["status"] = "not_found"; continue
+        if not w.logged_in:
+            st["status"] = "not_logged_in"; continue
+        if not await w.ensure_browser():
+            st["status"] = "browser_fail"; continue
+        try:
+            r = await PostFetcher(storage, w.account, config).refresh(w)
+            st.update(r)
+            if r.get("skipped"):
+                st["status"] = "cooldown"
+            elif r.get("error"):
+                st["status"] = "error"
+            else:
+                st["status"] = "ok"
+                storage.set_post_fetch_meta(
+                    aid, last_refresh=datetime.now().isoformat(),
+                    last_pages=int(r.get("pages") or 0),
+                    add_requests=int(r.get("pages") or 0) + int(r.get("covers") or 0))
+            logger.info(f"[posts] {aid} 刷新完成: {st}")
+        except Exception as e:
+            st["status"] = "error"; st["error"] = str(e)[:200]
+        finally:
+            await w.release_idle_browser()
+        await hub.emit("posts_refresh_progress", {"account_id": aid, **st})
+
+
+async def _do_posts_batch(action, items):
+    st_all = posts_job.state
+    groups = {}
+    for it in items:
+        groups.setdefault(it.account_id, []).append(it.object_id)
+    st_all["accounts"] = {aid: {"status": "pending", "updated": 0, "skipped": 0, "failed": []}
+                          for aid in groups}
+    st_all["total"] = len(items)
+    VIS = {"hide": 3, "unhide": 1}
+    for aid, oids in groups.items():
+        st = st_all["accounts"][aid]
+        w = manager.get_worker(aid)
+        if not w or not w.logged_in:
+            st["status"] = "not_logged_in"
+            for oid in oids:
+                st["failed"].append({"object_id": oid, "error": "账号未启动或未登录"})
+                st_all["done"] += 1
+            continue
+        try:
+            for oid in oids:
+                # hold 续期(浏览器保持),写操作经 api 客户端节流(4-8s/条) + 每日上限
+                await w.hold_for_manual(delay=600)
+                p = storage.get_post(aid, oid)
+                if not p:
+                    st["failed"].append({"object_id": oid, "error": "本地无记录,请先刷新"})
+                    st_all["done"] += 1; continue
+                skip = False
+                if action == "hide" and p["visible_type"] == 3: skip = True
+                if action == "unhide" and p["visible_type"] == 1: skip = True
+                if action == "sticky" and p["sticky_op"] == 2: skip = True
+                if action == "unsticky" and p["sticky_op"] != 2: skip = True
+                if skip:
+                    st["skipped"] += 1; st_all["done"] += 1; continue
+                if action in ("hide", "unhide"):
+                    resp = await w.api.update_post_visible(p["export_id"], VIS[action])
+                    ok_call = bool(resp) and not resp.get("__err")
+                    if ok_call:
+                        storage.update_post_flags(aid, oid, visible_type=VIS[action])
+                elif action == "sticky":
+                    resp = await w.api.update_post_sticky(p["export_id"], 1)
+                    ok_call = bool(resp) and not resp.get("__err")
+                    if ok_call:
+                        storage.update_post_flags(aid, oid, sticky_op=2)
+                else:  # unsticky
+                    resp = await w.api.update_post_sticky(p["export_id"], 2)
+                    ok_call = bool(resp) and not resp.get("__err")
+                    if ok_call:
+                        storage.update_post_flags(aid, oid, sticky_op=0)
+                if ok_call:
+                    st["updated"] += 1
+                else:
+                    st["failed"].append({"object_id": oid,
+                                         "error": str((resp or {}).get("__err") or resp)[:160]})
+                st_all["done"] += 1
+            st["status"] = "ok"
+        except Exception as e:
+            st["status"] = "error"; st["failed"].append({"error": str(e)[:200]})
+        await hub.emit("posts_batch_progress", {"account_id": aid, **st})
+
+
+@app.get("/api/posts")
+async def get_posts(
+    account_id: Optional[str] = None,
+    q: Optional[str] = None,
+    visible: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    sort: str = "create_time",
+    order: str = "desc",
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    """作品查询(本地库,零官方请求)。visible: public/follow/hidden/sticky。"""
+    items, total = storage.query_posts(
+        account_id=account_id, q=q, visible=visible,
+        date_from=date_from, date_to=date_to, sort=sort, order=order,
+        limit=limit, offset=offset)
+    name_map = {a["id"]: a.get("name", a["id"]) for a in config.get("accounts", [])}
+    for it in items:
+        it["account_name"] = name_map.get(it["account_id"], it["account_id"])
+    return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+
+@app.get("/api/posts/meta")
+async def get_posts_meta():
+    """各账号抓取账本(上次刷新/今日请求次数)。"""
+    out = {}
+    for a in config.get("accounts", []):
+        out[a["id"]] = storage.get_post_fetch_meta(a["id"])
+    return {"meta": out}
+
+
+@app.post("/api/posts/refresh")
+async def posts_refresh(body: schemas.PostsRefreshBody):
+    """手动刷新作品(增量,后台任务)。account_id 空 = 全部已登录账号。"""
+    if body.account_id:
+        aids = [body.account_id]
+    else:
+        aids = [aid for aid, w in manager.workers.items() if w.logged_in]
+    if not aids:
+        raise HTTPException(400, "没有已登录账号,请先启动引擎")
+    ok, msg = await posts_job.start("refresh", _do_posts_refresh(list(aids)))
+    if not ok:
+        raise HTTPException(409, msg)
+    return {"ok": True, "accounts": aids}
+
+
+@app.post("/api/posts/batch")
+async def posts_batch(body: schemas.PostsBatchBody):
+    """批量操作:hide/unhide/sticky/unsticky(后台任务,写操作逐条节流)。"""
+    if body.action not in ("hide", "unhide", "sticky", "unsticky"):
+        raise HTTPException(400, "action 仅支持 hide/unhide/sticky/unsticky")
+    if not body.items:
+        raise HTTPException(400, "未选择作品")
+    ok, msg = await posts_job.start("batch", _do_posts_batch(body.action, body.items))
+    if not ok:
+        raise HTTPException(409, msg)
+    return {"ok": True, "total": len(body.items)}
+
+
+@app.get("/api/posts/job")
+async def posts_job_status():
+    """当前任务状态(刷新/批量进度轮询)。"""
+    return posts_job.state
+
+
+async def _posts_auto_refresh_loop():
+    """每日定时:到达配置小时(默认 9 点)后,对已登录账号各刷一次(1h 内每小时整点重试直到成功)。"""
+    while True:
+        await asyncio.sleep(600)
+        try:
+            pc = config.get("posts") or {}
+            if not pc.get("auto_refresh_enabled", True):
+                continue
+            if datetime.now().hour != int(pc.get("auto_refresh_hour", 9)):
+                continue
+            today = datetime.now().strftime("%Y-%m-%d")
+            if _posts_auto_done.get("date") == today:
+                continue
+            aids = [aid for aid, w in manager.workers.items() if w.logged_in]
+            if not aids:
+                continue
+            ok, _ = await posts_job.start("refresh", _do_posts_refresh(list(aids)))
+            if ok:
+                _posts_auto_done["date"] = today
+                logger.info(f"[posts] 每日自动刷新已触发({len(aids)} 账号)")
+        except Exception as e:
+            logger.warning(f"[posts] 自动刷新循环异常: {e}")
+
+
 # ===================== WebSocket =====================
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
@@ -1011,6 +1486,11 @@ async def websocket_endpoint(ws: WebSocket):
 
 
 # ===================== 前端静态托管 =====================
+# 作品封面(本地化落盘,前端永不直连 CDN)
+_covers_dir = os.path.join(ROOT, "data", "covers")
+os.makedirs(_covers_dir, exist_ok=True)
+app.mount("/media/covers", StaticFiles(directory=_covers_dir), name="covers")
+
 if os.path.isdir(FRONTEND_DIST):
     assets = os.path.join(FRONTEND_DIST, "assets")
     if os.path.isdir(assets):

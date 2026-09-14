@@ -46,9 +46,10 @@ import json
 import re
 import time
 import logging
+from collections import deque
 from datetime import datetime
 from .selectors import LIVE_URL
-from .metrics import extract_all
+from .metrics import extract_all, shrink_conv
 
 logger = logging.getLogger("sphgj")
 
@@ -61,6 +62,41 @@ DASHBOARD_PAGE_URL_ENC = "https%3A%2F%2Fchannels.weixin.qq.com%2Fmicro%2Fstatist
 # 渠道大类:newLiveDstChannelType 1=公域 / 2=加热 / 4=私域
 PUBLIC_CHANNEL_TYPE = 1
 DASHBOARD_INTERVAL = 60  # dashboard 数据抓取间隔(秒);实际由 account_manager 读 config.dashboard_interval_sec 控制
+
+# ======================== rev21: 超时闸 + 并发闸 ========================
+# 取证背景(2026-09-03,见 .workbuddy/mem/):进程长跑 49h 后 RSS 1670MB,
+# 其中 tracked 891MB(349 万个 dict,全是 dashboard conv 响应的序列骨架)、
+# untracked 779MB;同时有 7343 个 asyncio Task 存活(每个 Task 自带一个
+# contextvars.Context,故 Context/hamt 计数同步走高)。
+#
+# 两大成因:
+#  1) dashboard 每轮抓取的 conv 响应骨架被某个外部容器永久持有,一轮留 ~476 个 dict;
+#  2) CDP 回退模式下 _on_cdp_response 对每个响应 asyncio.create_task 一个
+#     fire-and-forget 任务 —— 无超时、无并发上限、无追踪。Playwright 的
+#     cdp.send / page.evaluate / page.unroute 在会话异常时【可能永不返回】,
+#     挂住的任务其协程帧会永久钉住局部变量(含响应体文本),且 str 不被 gc 跟踪
+#     -> 这就是 untracked 内存的主要来源。
+#
+# 因此:所有可能悬挂的 await 一律套超时;fire-and-forget 任务一律有并发上限 +
+# 引用追踪 + 可取消。
+_EVAL_TIMEOUT = 20.0       # page.evaluate / page.unroute 单次超时(秒)
+_CDP_OP_TIMEOUT = 10.0     # 单次 CDP send 超时(秒)
+_CDP_BODY_TIMEOUT = 6.0    # Network.getResponseBody 超时(秒)
+_CDP_MAX_INFLIGHT = 4      # 每个 LiveFetcher 同时在飞的 CDP 回退任务上限
+_CDP_SEEN_MAX = 256        # requestId 去重窗口(有界,不能无限增长)
+
+
+async def _with_timeout(coro, timeout):
+    """await 一个协程并强制超时。超时/异常一律返回 None,绝不把异常抛给调用方。
+
+    超时会【取消】协程 —— 这一点是关键:被取消的协程其帧会被销毁,局部变量
+    (可能钉着数 MB 的响应文本)随之释放;不加超时则会永久悬挂并泄漏。
+    """
+    try:
+        return await asyncio.wait_for(coro, timeout)
+    except Exception:
+        # 超时(TimeoutError)与 CDP/Playwright 异常一视同仁:本轮放弃,下轮重试
+        return None
 
 # ======================== rev10: 阶段化内存精简 ========================
 # stage1(拿到 liveStats/liveObjectId): 浏览器层拦图片+媒体(不含 css/js/api)
@@ -108,6 +144,10 @@ class LiveFetcher:
         self._learn_deadline = 0.0      # 学习超时阈值(>此时间未学到则回退 CDP)
         self._poll_fail_streak = 0      # 主动轮询连续失败计数
         self._cdp_fallback = False      # 主动轮询不可用回退到 CDP 响应捕获
+        # rev21: CDP 回退任务的并发闸与追踪(防 fire-and-forget 任务无限堆积)
+        self._cdp_tasks = set()         # 在飞的回退任务引用(完成自动 discard,close 时全部 cancel)
+        self._cdp_seen = deque(maxlen=_CDP_SEEN_MAX)   # 最近处理过的 requestId(有界去重)
+        self._cdp_drop_warned = False   # 并发打满时只 warn 一次,避免日志刷屏
 
     async def goto_live(self):
         """建 CDP session(精简+学习共用) + flv 精确路由,然后导航到 liveBuild 页。
@@ -163,13 +203,26 @@ class LiveFetcher:
                 logger.info(f"[live:{self.account_id}] 拿到 .flv 流 URL(来自 route): {u[:80]}...")
             # 拿到 stream_url: 触发 stage2(在 route handler 里用 create_task 避免阻塞 abort)
             if self._slim_stage < 2:
-                self._slim_task = asyncio.create_task(self._apply_slimming(2))
+                # rev21: 任务完成后立刻解绑引用 —— 已完成的 Task 仍持有协程帧与其局部变量
+                _t = asyncio.create_task(self._apply_slimming(2))
+                _t.add_done_callback(self._on_slim_task_done)
+                self._slim_task = _t
         try:
             await route.abort()
         except Exception:
             pass
 
     # ======================== rev10: 阶段化内存精简 ========================
+
+    def _on_slim_task_done(self, t):
+        """rev21: stage2 精简任务结束后释放引用(完成的 Task 仍持有协程帧+局部变量)。"""
+        try:
+            if not t.cancelled():
+                t.exception()   # 取走异常,避免 "exception never retrieved" 常驻
+        except Exception:
+            pass
+        if self._slim_task is t:   # 只清自己,别误清新任务
+            self._slim_task = None
 
     async def _apply_slimming(self, stage: int):
         """拿到直播信号后,在浏览器层(CDP)阻断非必要资源(0 Python 对象)。
@@ -188,14 +241,21 @@ class LiveFetcher:
             cdp = self._cdp
             if cdp is None:
                 # CDP session 在 goto_live 时建;若失败则尝试重建(极端情况)
-                cdp = await self.page.context.new_cdp_session(self.page)
-                await cdp.send("Network.enable")
+                # rev21: 加超时 —— new_cdp_session 在浏览器无响应时会永久挂起
+                cdp = await _with_timeout(
+                    self.page.context.new_cdp_session(self.page), _CDP_OP_TIMEOUT)
+                if cdp is None:
+                    return
+                await _with_timeout(cdp.send("Network.enable"), _CDP_OP_TIMEOUT)
                 self._cdp = cdp
                 self._cdp_ready = True
             urls = list(_SLIM_MEDIA_URLS)
             if stage >= 2:
                 urls += _SLIM_FLV_URLS
-            await cdp.send("Network.setBlockedURLs", {"urls": urls})
+            # rev21: 超时闸 —— cdp.send 永不返回会把调用方(可能是 fire-and-forget 任务)永久挂住
+            if await _with_timeout(
+                    cdp.send("Network.setBlockedURLs", {"urls": urls}), _CDP_OP_TIMEOUT) is None:
+                return
             logger.info(f"[live:{self.account_id}] 内存精简 stage{stage} 生效(浏览器层阻断 {len(urls)} 类资源)")
         except Exception as e:
             logger.debug(f"[live:{self.account_id}] 内存精简 stage{stage} 失败(不影响抓取): {e}")
@@ -203,19 +263,14 @@ class LiveFetcher:
         if stage >= 2:
             # FLV 已有 CDP 兜底拦截,解除 page.route(每次播放器重试都会创建 Route 对象)
             for pat in ("**/*.flv*", "**/*.m3u8*"):
-                try:
-                    await self.page.unroute(pat)
-                except Exception:
-                    pass
+                # rev21: unroute 同样可能挂起(页面正导航时)
+                await _with_timeout(self.page.unroute(pat), _CDP_OP_TIMEOUT)
             # 停掉页面预览播放器,源头减少 FLV 重试
-            try:
-                await self.page.evaluate("""()=>{
+            await _with_timeout(self.page.evaluate("""()=>{
                     document.querySelectorAll('video').forEach(v=>{
                         try{v.pause();v.removeAttribute('src');v.load();}catch(e){}
                     });
-                }""")
-            except Exception:
-                pass
+                }"""), _EVAL_TIMEOUT)
 
     # ======================== rev13: 主动轮询(替代常驻响应监听) ========================
 
@@ -321,11 +376,12 @@ class LiveFetcher:
             const r = await fetch(spec.url, init);
             return await r.text();
         }"""
-        try:
-            return await self.page.evaluate(js, spec)
-        except Exception as e:
-            logger.debug(f"[live:{self.account_id}] fetch 重放失败: {e}")
+        # rev21: page.evaluate 没有内建超时,页面卡死时会永久挂住整个 poll 循环
+        r = await _with_timeout(self.page.evaluate(js, spec), _EVAL_TIMEOUT)
+        if r is None:
+            logger.debug(f"[live:{self.account_id}] fetch 重放超时/失败")
             return ""
+        return r
 
     async def _enable_cdp_fallback(self):
         """主动轮询失败/学不到 URL 时回退: 重臂 rev11 的 CDP 响应捕获(功能优先,内存次之)。"""
@@ -421,43 +477,81 @@ class LiveFetcher:
         两个目标 URL 调用 getResponseBody 读体,其余数千请求立即返回。用 create_task 避免
         阻塞 CDP 事件分发线程。
         """
+        # rev21: 这是此前 7343 个僵尸 Task 的源头 —— 原实现对每个响应无条件
+        # create_task,而 cdp.send 可能永不返回 -> 任务永久悬挂,其协程帧钉住
+        # 局部变量(含响应体文本),任务本身也被 set 持有而无法回收。
+        # 三道闸: ① requestId 有界去重 ② 在飞任务数上限 ③ 任务套超时并可取消。
         try:
             url = (event.get("response") or {}).get("url", "")
             if "channels.weixin.qq.com" not in url:
                 return
             if "get_live_info" in url:
-                asyncio.create_task(self._capture_cdp(event.get("requestId", "")))
+                target = self._capture_cdp
             elif "check_live_status" in url:
-                asyncio.create_task(self._capture_live_status_cdp(event.get("requestId", "")))
+                target = self._capture_live_status_cdp
+            else:
+                return
+            rid = event.get("requestId", "")
+            if not rid or rid in self._cdp_seen:
+                return
+            self._cdp_seen.append(rid)
+            if len(self._cdp_tasks) >= _CDP_MAX_INFLIGHT:
+                if not self._cdp_drop_warned:
+                    self._cdp_drop_warned = True
+                    logger.warning(f"[live:{self.account_id}] CDP 回退任务已达上限"
+                                   f"({_CDP_MAX_INFLIGHT},疑似 getResponseBody 挂起),后续响应丢弃")
+                return
+            t = asyncio.create_task(self._run_cdp_capture(target, rid))
+            self._cdp_tasks.add(t)
+            t.add_done_callback(self._cdp_tasks.discard)
         except Exception:
             pass  # CDP 回调不允许异常上抛
+
+    async def _run_cdp_capture(self, fn, request_id):
+        """fire-and-forget 包装:强制超时 + 吞异常(异常不能留在 Task 里不取)。"""
+        try:
+            await asyncio.wait_for(fn(request_id), _CDP_BODY_TIMEOUT * 2)
+        except Exception:
+            pass
 
     async def _read_cdp_body(self, request_id: str) -> str:
         """通过 CDP Network.getResponseBody 读取指定请求的响应体文本(回退模式用)。"""
         try:
             if self._cdp is None:
                 return ""
-            result = await self._cdp.send("Network.getResponseBody", {"requestId": request_id})
-            return result.get("body", "") or ""
+            # rev21: 超时闸 —— 会话异常时这个 send 永不返回,会把任务永久挂住
+            result = await asyncio.wait_for(
+                self._cdp.send("Network.getResponseBody", {"requestId": request_id}),
+                _CDP_BODY_TIMEOUT)
+            return (result or {}).get("body", "") or ""
         except Exception as e:
             logger.debug(f"[live:{self.account_id}] CDP getResponseBody 失败: {e}")
             return ""
 
     async def _capture_cdp(self, request_id: str):
         """get_live_info 响应(CDP 回退版): 读体 -> 解析。"""
+        txt = None
         try:
             txt = await self._read_cdp_body(request_id)
-            await self._parse_live_info(txt)
+            if txt:
+                await self._parse_live_info(txt)
         except Exception as e:
             logger.debug(f"[live:{self.account_id}] get_live_info 解析失败: {e}")
+        finally:
+            # rev21: 响应体文本(可达数百 KB,str 不被 gc 跟踪)绝不能随帧常驻
+            txt = None
 
     async def _capture_live_status_cdp(self, request_id: str):
         """check_live_status 响应(CDP 回退版): 读体 -> 解析。"""
+        txt = None
         try:
             txt = await self._read_cdp_body(request_id)
-            await self._parse_live_status(txt)
+            if txt:
+                await self._parse_live_status(txt)
         except Exception as e:
             logger.debug(f"[live:{self.account_id}] check_live_status 解析失败: {e}")
+        finally:
+            txt = None
 
     # ======================== 关闭清理 ========================
 
@@ -466,6 +560,14 @@ class LiveFetcher:
 
         rev13: 可能注册过 requestWillBeSent(学习) 与 responseReceived(回退)两种监听,均移除。
         """
+        # rev21: 先取消在飞的 CDP 回退任务 —— 否则 close() 后它们仍持有协程帧与响应体,
+        # 且会继续往已 detach 的 CDP session 发请求,形成"关不干净"的常驻残留。
+        if self._cdp_tasks:
+            for t in list(self._cdp_tasks):
+                if not t.done():
+                    t.cancel()
+            self._cdp_tasks.clear()
+        self._cdp_seen.clear()
         # 移除 CDP 监听(学习 + 回退)
         if self._cdp is not None:
             try:
@@ -557,12 +659,14 @@ class LiveFetcher:
         if self._aid and self._log_finder_id:
             return
         try:
-            ids = await self.page.evaluate("""()=>{
+            ids = await _with_timeout(self.page.evaluate("""()=>{
                 const raw = localStorage.getItem('__ml::aid') || localStorage.getItem('__rx::aid') || '';
                 const fid = localStorage.getItem('finder_username') || '';
                 const unquote = s => s ? s.replace(/^"|"$/g, '') : '';
                 return {aid: unquote(raw), fid: unquote(fid)};
-            }""")
+            }"""), _EVAL_TIMEOUT)
+            if not ids:
+                return
             self._aid = self._aid or ids.get("aid")
             self._log_finder_id = self._log_finder_id or ids.get("fid")
         except Exception as e:
@@ -589,8 +693,17 @@ class LiveFetcher:
                 headers:{'Content-Type':'application/json'}, body: JSON.stringify(args.body)});
             return await r.text();
         }"""
-        txt = await self.page.evaluate(js, {"url": full_url, "body": payload})
-        return json.loads(txt)
+        # rev21: 超时闸(页面卡死时 evaluate 永不返回 -> fetch_dashboard_data 整轮悬挂)
+        txt = await _with_timeout(
+            self.page.evaluate(js, {"url": full_url, "body": payload}), _EVAL_TIMEOUT)
+        if not txt:
+            return None
+        try:
+            return json.loads(txt)
+        finally:
+            # rev20: json 解析失败时异常会带 traceback -> 帧局部变量,会把整份响应文本
+            # (可达数 MB)钉到异常对象上。finally 里先解绑再让异常上抛,切断这条引用。
+            del txt
 
     async def _fetch_conv(self):
         j = await self._dashboard_post(DASHBOARD_DATA_API, {
@@ -611,7 +724,10 @@ class LiveFetcher:
         })
         if not j:
             return None
-        return j.get("data") or {}
+        # rev20 根因修复:解析后立刻压缩时间序列(每份响应数万个 {ts,value} dict ->
+        # 每维度一个求和标量)。下游 metric 只用到整场求和,逐点数据是纯负担。
+        # 放在这里 = 最早的时机:大对象活的时间最短,没有机会被别的容器持有。
+        return shrink_conv(j.get("data") or {})
 
     @staticmethod
     def _calc_male_ratio(items):
@@ -634,13 +750,17 @@ class LiveFetcher:
         })
         if not j:
             return None
-        return j.get("data") or {}
+        # dist 同样可能携带时间序列结构,一并压缩(内部只认 trendingSource/portraitAudience,
+        # 没有这两个键时是空操作,零副作用)。
+        return shrink_conv(j.get("data") or {})
 
     async def _fetch_refund_rate(self):
         j = await self._dashboard_post(EC_DATA_SUMMARY_API, {"liveObjectId": self.live_object_id})
         if not j:
             return None
-        return j.get("data") or {}
+        # dist 同样可能携带时间序列结构,一并压缩(内部只认 trendingSource/portraitAudience,
+        # 没有这两个键时是空操作,零副作用)。
+        return shrink_conv(j.get("data") or {})
 
     async def fetch_dashboard_data(self):
         if not self.live_object_id:
@@ -648,23 +768,42 @@ class LiveFetcher:
         results = await asyncio.gather(
             self._fetch_conv(), self._fetch_dist(), self._fetch_refund_rate(),
             return_exceptions=True)
-        conv = dist = summary = None
-        for idx, name in enumerate(("conv", "dist", "summary")):
-            r = results[idx]
-            if isinstance(r, Exception):
-                logger.debug(f"[live:{self.account_id}] {name} 抓取失败: {r}")
-            elif name == "conv":
-                conv = r
-            elif name == "dist":
-                dist = r
-            else:
-                summary = r
-        metrics = extract_all(conv, dist, summary)
-        # rev15 P1: 立即释放原始大响应。conv 含 trendingSource(时间序列,数百点)与
-        # portraitAudience(多维人群画像),单响应可达数 MB;三个经 asyncio.gather 并行返回后
-        # 同时驻留 -> 形成每周期的峰值内存。extract_all 已提取出全部标量指标,原始 dict 不再
-        # 需要 -> 显式解除引用,不等 GC 分代周期(gen2 回收在长跑进程中可能滞留很久)。
-        del conv, dist, summary
+        conv = dist = summary = r = None
+        try:
+            for idx, name in enumerate(("conv", "dist", "summary")):
+                r = results[idx]
+                if isinstance(r, Exception):
+                    logger.debug(f"[live:{self.account_id}] {name} 抓取失败: {r}")
+                elif name == "conv":
+                    conv = r
+                elif name == "dist":
+                    dist = r
+                else:
+                    summary = r
+            metrics = extract_all(conv, dist, summary)
+        finally:
+            # rev21 核心:载荷就地消除(第二层)。
+            #
+            # rev20 只压掉了每条序列的 data 数组(数万个 {ts,value} -> 一个 _sum 标量),
+            # 但【骨架本身仍在】:每轮响应留下 ~476 个 {_sum,beginTs,data,dimensions,...}
+            # 序列 dict,被某个外部容器(引用链追到 Task 上)永久持有 —— 实测 49h 累积
+            # 349 万个 dict / 710MB,占 tracked 内存的 80%。
+            #
+            # 追持有者成本高且易被容器排序误导(见 .workbuddy/memory 取证教训),
+            # 因此改用源头消除:extract_all 只产出标量,之后把三个响应【原地清空】。
+            # 清空是【原地】的 —— 无论谁还握着这个 dict 引用,它都只剩一个空壳,
+            # 数 MB 的子树当场变成垃圾。持有者是谁已不再重要。
+            for _payload in (conv, dist, summary):
+                if isinstance(_payload, dict):
+                    _payload.clear()
+            # rev20: 彻底断开对原始大响应的引用。
+            # 原写法只 `del conv, dist, summary`,但 asyncio.gather 的结果列表 results
+            # 与循环变量 r 仍持有同一批对象,要等本协程帧销毁才释放;一旦该帧被任何东西
+            # (异常 traceback、挂起的 Task)钉住,整批响应就永久驻留 —— 这正是泄漏的
+            # 放大器。finally 里显式清空并解绑 results,把释放点提前到 extract_all 之后。
+            conv = dist = summary = r = None
+            results = None
+            del results
         # 原地复用缓存 dict:避免每周期丢弃旧 dict 再新建,减少堆碎片
         if self._dashboard_cache:
             self._dashboard_cache.clear()

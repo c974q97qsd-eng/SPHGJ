@@ -128,9 +128,9 @@ export function LogPanel() {
           {open ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronUp className="h-3.5 w-3.5" />}
         </Button>
 
-        <Badge variant="secondary" className="h-5 px-1.5 text-[10px]">{visible.length}</Badge>
+        <Badge variant="secondary" className="h-5 px-1.5 text-[0.625rem]">{visible.length}</Badge>
         {errCount > 0 && (
-          <Badge variant="destructive" className="h-5 px-1.5 text-[10px]">错误 {errCount}</Badge>
+          <Badge variant="destructive" className="h-5 px-1.5 text-[0.625rem]">错误 {errCount}</Badge>
         )}
 
         <div className="ml-auto flex items-center gap-1">
@@ -166,7 +166,7 @@ export function LogPanel() {
       {open && (
         <div
           ref={boxRef}
-          className="h-56 overflow-auto border-t bg-muted/30 px-4 py-2 font-mono text-[11px] leading-[1.5]"
+          className="h-56 overflow-auto border-t bg-muted/30 px-4 py-2 font-mono text-[0.6875rem] leading-[1.5]"
         >
           {visible.length === 0 ? (
             <div className="py-6 text-center text-muted-foreground">暂无日志</div>

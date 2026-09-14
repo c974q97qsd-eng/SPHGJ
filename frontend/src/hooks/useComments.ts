@@ -3,7 +3,7 @@ import { api, type Comment, type CommentPage } from "@/lib/api"
 import { useWebSocket, type WsEvent } from "@/lib/ws"
 
 /** 评论列表:分页查询 + WS 实时新增。 */
-export function useComments(params: { account_id?: string; replied?: boolean; q?: string; limit?: number; offset?: number }) {
+export function useComments(params: { account_id?: string; replied?: boolean; q?: string; hide_own?: number; limit?: number; offset?: number }) {
   const [page, setPage] = useState<CommentPage>({ items: [], total: 0, limit: params.limit ?? 200, offset: 0 })
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)

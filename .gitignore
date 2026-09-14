@@ -47,3 +47,11 @@ nul
 build - 副本.bat
 frontend/NPM RUN BUIID.BAT
 
+# 更新包 / 离线环境包(体积大且可再生,不入库)
+UP/
+配置环境安装/
+
+# 根目录临时脚本与中转文件
+/_*.py
+/_*.txt
+/_*.log

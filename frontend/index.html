@@ -4,6 +4,18 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>视频号工具</title>
+    <script>
+      // 界面缩放(DPI 档位)首屏预置:在样式/JS 加载前先按上次的档位设定根字号,
+      // 避免「先大后小」的闪烁。档位可在顶栏右侧切换。
+      (function () {
+        try {
+          var v = localStorage.getItem("sphgj.ui_scale");
+          var px = v === "large" ? "16px" : v === "small" ? "12px" : v === "medium" ? "14px" : "14px";
+          document.documentElement.style.fontSize = px;
+          document.documentElement.setAttribute("data-ui-scale", v || "medium");
+        } catch (e) { /* 隐私模式下忽略,走默认档 */ }
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

@@ -51,6 +51,56 @@ def _pct(v):
     return round(v * 100, 2)
 
 
+def _item_sum(item):
+    """单条序列的整场求和:优先取 shrink_conv 预压的 _sum,未压缩时回退现算。
+
+    两条路径结果【完全一致】(shrink_conv 用的就是同一套 `_num(x) or 0` 语义),
+    因此压缩对下游指标透明;未走 shrink_conv 的调用方(如单测)也能正常工作。
+    """
+    s = item.get("_sum")
+    if s is not None:
+        return s
+    return sum(_num(x.get("value")) or 0 for x in (item.get("data") or []))
+
+
+def shrink_conv(conv):
+    """rev20 根因修复:就地压缩 conv 的时间序列,释放数万个 {ts,value} 点。
+
+    背景(实测取证,见 .workbuddy/mem_deep.log 的 chain 记录):
+      dashboardV4 的 trendingSource / portraitAudience 返回【整场】逐点时间序列 ——
+      每个维度数百~上千个 {ts,value} 点,单份响应可达数万个 dict(实测单数组最大 722 点,
+      且随直播时长持续增长)。这些 dict 被长期持有,是 RSS 从 130MB 涨到 8.5GB 的
+      唯一来源;直播一停、抓取一停,泄漏立即归零(已实测验证)。
+
+    关键事实:下游 metric 只需要【每个维度的整场求和】——
+      _sum_new_watch(公域流量/直播加热)、_gender_ratio(男/女占比)——
+      逐点数据本身【完全没有被消费】。
+
+    因此:解析后立刻把 data 数组压成一个 _sum 标量并清空 data,让数万个 dict 在
+    json.loads 之后马上变成垃圾。这是源头治理:单份响应从数万对象降到数十对象,
+    即使仍被某个容器持有也无害(泄漏速率 1800 对象/秒 -> 约 1 对象/秒)。
+    """
+    if not isinstance(conv, dict):
+        return conv
+    for key in ("trendingSource", "portraitAudience"):
+        groups = conv.get(key)
+        if not isinstance(groups, dict):
+            continue
+        for items in groups.values():
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                data = item.get("data")
+                if not isinstance(data, list):
+                    continue
+                item["_sum"] = sum(
+                    _num(p.get("value")) or 0 for p in data if isinstance(p, dict))
+                item["data"] = []   # 释放时间序列点
+    return conv
+
+
 def _sum_new_watch(conv, label):
     """trendingSource.newWatchUv 里 dimensions value=label 的整场 sum。"""
     arr = ((conv or {}).get("trendingSource") or {}).get("newWatchUv") or []
@@ -60,7 +110,7 @@ def _sum_new_watch(conv, label):
             continue
         lab = dims[0].get("value") or dims[0].get("uxLabel") or ""
         if lab == label:
-            return sum(_num(x.get("value")) or 0 for x in (item.get("data") or []))
+            return _item_sum(item)
     return None
 
 
@@ -73,7 +123,7 @@ def _gender_ratio(conv, label):
         if len(dims) != 1 or str(dims[0].get("type")) != "3":
             continue
         lab = dims[0].get("value") or dims[0].get("uxLabel") or ""
-        counts[lab] = counts.get(lab, 0) + sum(_num(x.get("value")) or 0 for x in (item.get("data") or []))
+        counts[lab] = counts.get(lab, 0) + _item_sum(item)
     total = sum(counts.values())
     if total > 0:
         return round(counts.get(label, 0) / total * 100, 2)

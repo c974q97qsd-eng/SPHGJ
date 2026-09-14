@@ -2,16 +2,20 @@ import { useEffect, useState, type ReactNode } from "react"
 import { NavLink, useLocation } from "react-router-dom"
 import {
   LayoutDashboard, Users, MessageSquare, Reply, Moon, Sun,
-  Play, Square, RefreshCw, Loader2, Trash2, Monitor,
+  Play, Square, RefreshCw, Loader2, Trash2, Monitor, Type, Clapperboard,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Separator } from "@/components/ui/separator"
+import {
+  Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
+} from "@/components/ui/select"
 import { AdSlot } from "@/components/common/ad-slot"
 import { TextAdSlot } from "@/components/common/text-ad-slot"
 import { LogPanel } from "@/components/common/LogPanel"
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
 import { useTheme } from "@/lib/theme"
+import { useUiScale, UI_SCALE_OPTIONS, type UiScale } from "@/lib/uiScale"
 import { api } from "@/lib/api"
 import { useAccounts } from "@/hooks/useAccounts"
 import { cn } from "@/lib/utils"
@@ -24,9 +28,10 @@ const NAV = [
   { to: "/auto-reply", label: "自动回复", icon: Reply },
   { to: "/auto-delete", label: "自动删除", icon: Trash2 },
   { to: "/live-screen", label: "直播大屏", icon: Monitor },
+  { to: "/posts", label: "作品管理", icon: Clapperboard },
 ]
 
-const TITLES: Record<string, string> = { "/": "仪表盘", "/accounts": "账号管理", "/comments": "评论", "/auto-reply": "自动回复设置", "/auto-delete": "自动删除", "/live-screen": "直播大屏" }
+const TITLES: Record<string, string> = { "/": "仪表盘", "/accounts": "账号管理", "/comments": "评论", "/auto-reply": "自动回复设置", "/auto-delete": "自动删除", "/live-screen": "直播大屏", "/posts": "作品管理" }
 
 function EngineControls() {
   const { status, refresh } = useAccounts()
@@ -93,13 +98,43 @@ function ThemeToggle() {
   )
 }
 
+/** 界面缩放(DPI 档位):大 / 中 / 小。改根字号整体等比缩放,即时生效并持久化。 */
+function UiScaleSelect() {
+  const { scale, setScale } = useUiScale()
+  return (
+    <TooltipProvider>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <div>
+            <Select value={scale} onValueChange={(v) => setScale(v as UiScale)}>
+              <SelectTrigger className="h-8 w-[5.75rem] gap-1 px-2 text-xs" aria-label="界面缩放">
+                <Type className="h-3.5 w-3.5 shrink-0" />
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {UI_SCALE_OPTIONS.map((o) => (
+                  <SelectItem key={o.value} value={o.value} className="text-xs">
+                    显示 · {o.label}（{o.hint}）
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+        </TooltipTrigger>
+        <TooltipContent>界面缩放:1080P 屏建议「中」或「小」,一屏显示更多</TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  )
+}
+
 export function AppShell({ children }: { children: ReactNode }) {
   const loc = useLocation()
   const title = TITLES[loc.pathname] || "视频号工具"
   return (
     <div className="flex h-screen w-full overflow-hidden bg-background">
       {/* 侧栏 */}
-      <aside className="hidden md:flex w-[200px] shrink-0 flex-col border-r bg-card">
+      {/* 宽度用 rem(12.5rem = 大档位的 200px),这样切到中/小档时侧栏跟着一起缩 */}
+      <aside className="hidden md:flex w-[12.5rem] shrink-0 flex-col border-r bg-card">
         <div className="flex h-14 items-center gap-2 px-5">
           <div className="flex h-8 w-8 items-center justify-center rounded-md bg-primary text-primary-foreground">
             <MessageSquare className="h-4 w-4" />
@@ -153,6 +188,7 @@ export function AppShell({ children }: { children: ReactNode }) {
           <div className="flex items-center gap-2">
             <EngineControls />
             <Separator orientation="vertical" className="h-6" />
+            <UiScaleSelect />
             <ThemeToggle />
           </div>
         </header>

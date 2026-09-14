@@ -112,6 +112,59 @@ export interface AppConfig {
   card_fields: string[]
   dashboard_interval_sec: number
   live_check_interval_sec: number
+  /** 界面缩放档位:large=大(100%) / medium=中(88%) / small=小(75%) */
+  ui_scale?: "large" | "medium" | "small"
+  posts?: {
+    auto_refresh_enabled: boolean
+    auto_refresh_hour: number
+    refresh_cooldown_sec: number
+    max_pages: number
+  }
+}
+
+export interface PostItem {
+  account_id: string
+  account_name?: string
+  object_id: string
+  export_id: string
+  title: string
+  cover_url: string
+  cover_path: string
+  create_time: number
+  read_count: number
+  like_count: number
+  comment_count: number
+  forward_count: number
+  fav_count: number
+  visible_type: number
+  sticky_op: number
+  is_hidden: boolean
+  is_sticky: boolean
+  updated_at: string | null
+}
+
+export interface PostPage {
+  items: PostItem[]
+  total: number
+  limit: number
+  offset: number
+}
+
+export interface PostMeta {
+  last_refresh: string | null
+  last_pages: number
+  today_requests: number
+}
+
+export interface PostsJobState {
+  running: boolean
+  kind: "refresh" | "batch" | null
+  accounts: Record<string, Record<string, unknown>>
+  total: number
+  done: number
+  failed: { object_id?: string; error: string }[]
+  started_at: string | null
+  finished_at: string | null
 }
 
 /** 运行日志拉取结果(seq 为当前最大序号,用于增量续拉)。 */
@@ -144,7 +197,16 @@ export const api = {
   clearLogs: () => req<{ ok: boolean }>("/logs", { method: "DELETE" }),
 
   getConfig: () => req<AppConfig>("/config"),
-  patchConfig: (body: Partial<{ fetch_interval_sec: number; auto_reply_enabled: boolean; card_fields: string[]; dashboard_interval_sec: number; live_check_interval_sec: number }>) =>
+  patchConfig: (body: Partial<{
+    fetch_interval_sec: number
+    auto_reply_enabled: boolean
+    card_fields: string[]
+    dashboard_interval_sec: number
+    live_check_interval_sec: number
+    ui_scale: "large" | "medium" | "small"
+    posts_auto_refresh_enabled: boolean
+    posts_auto_refresh_hour: number
+  }>) =>
     req<{ ok: boolean; config: AppConfig }>("/config", { method: "PATCH", body: JSON.stringify(body) }),
 
   getAccounts: () => req<EngineStatus>("/accounts"),
@@ -181,7 +243,7 @@ export const api = {
   engineStop: () => req<EngineStatus>("/engine/stop", { method: "POST" }),
   engineFetchNow: () => req<{ ok: boolean }>("/engine/fetch-now", { method: "POST" }),
 
-  getComments: (params: { account_id?: string; replied?: boolean; q?: string; limit?: number; offset?: number } = {}) => {
+  getComments: (params: { account_id?: string; replied?: boolean; q?: string; hide_own?: number; limit?: number; offset?: number } = {}) => {
     const q = new URLSearchParams()
     Object.entries(params).forEach(([k, v]) => v !== undefined && v !== "" && q.set(k, String(v)))
     return req<CommentPage>(`/comments?${q.toString()}`)
@@ -211,6 +273,19 @@ export const api = {
   },
   clearDeleteLogs: (account_id?: string) =>
     req<{ ok: boolean }>(`/auto-delete/logs${account_id ? `?account_id=${account_id}` : ""}`, { method: "DELETE" }),
+
+  // ==================== 作品管理 ====================
+  getPosts: (params: { account_id?: string; q?: string; visible?: string; date_from?: string; date_to?: string; sort?: string; order?: string; limit?: number; offset?: number } = {}) => {
+    const q = new URLSearchParams()
+    Object.entries(params).forEach(([k, v]) => v !== undefined && v !== "" && q.set(k, String(v)))
+    return req<PostPage>(`/posts?${q.toString()}`)
+  },
+  getPostsMeta: () => req<{ meta: Record<string, PostMeta> }>("/posts/meta"),
+  postsRefresh: (account_id?: string) =>
+    req<{ ok: boolean; accounts: string[] }>("/posts/refresh", { method: "POST", body: JSON.stringify({ account_id }) }),
+  postsBatch: (action: "hide" | "unhide" | "sticky" | "unsticky", items: { account_id: string; object_id: string }[]) =>
+    req<{ ok: boolean; total: number }>("/posts/batch", { method: "POST", body: JSON.stringify({ action, items }) }),
+  postsJob: () => req<PostsJobState>("/posts/job"),
 
   getLiveScreenStatus: () => req<{ items: LiveScreenItem[]; card_fields: string[] }>("/live-screen/status"),
   getMetricsDictionary: () => req<{ metrics: MetricDef[]; card_fields: string[] }>("/metrics/dictionary"),

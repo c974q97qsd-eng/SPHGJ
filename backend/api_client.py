@@ -20,6 +20,9 @@ logger = logging.getLogger("sphgj")
 BASE = "https://channels.weixin.qq.com/micro/interaction/cgi-bin/mmfinderassistant-bin"
 AUTH_BASE = "https://channels.weixin.qq.com/cgi-bin/mmfinderassistant-bin"  # 认证/账号类接口(auth_data 等,路径无 micro/interaction)
 PAGE_URL = "https://channels.weixin.qq.com/micro/interaction/comment"
+# 内容管理页(作品列表/隐藏/置顶走这里,官方前端同源)
+CONTENT_BASE = "https://channels.weixin.qq.com/micro/content/cgi-bin/mmfinderassistant-bin"
+POST_PAGE_URL = "https://channels.weixin.qq.com/platform/post/list"
 
 
 class WxApiClient:
@@ -27,7 +30,7 @@ class WxApiClient:
     # 视频号风控阈值不公开,这里按腾讯系通用规律取偏保守值,可在 config.risk_control 覆盖。
     READ_INTERVAL = (1.0, 2.5)
     WRITE_INTERVAL = (4.0, 8.0)
-    WRITE_PATHS = ("create_comment", "set_top_comment", "del_comment")
+    WRITE_PATHS = ("create_comment", "set_top_comment", "del_comment", "update_visible", "update_sticky_status")
     BACKOFF_STEPS = (30, 120, 600)  # 连续失败退避秒数:30s -> 2min -> 10min(封顶)
 
     def __init__(self, page, account, config=None, storage=None):
@@ -104,7 +107,7 @@ class WxApiClient:
         b.update(extra)
         return b
 
-    async def _post(self, path, body):
+    async def _post(self, path, body, base=None, page_url=None):
         # 写操作每日上限:超限跳过,不调 API(不计退避)
         is_write = self._is_write(path)
         today = time.strftime("%Y-%m-%d") if is_write else None
@@ -112,7 +115,9 @@ class WxApiClient:
             logger.warning(f"[api] 写操作达每日上限 {self._daily_write_limit},跳过 {path}")
             return {"__err": "daily_write_limit", "limit": self._daily_write_limit}
         await self._throttle(path)
-        url = f"{BASE}/{path}?_aid={self.aid}&_pageUrl={quote(PAGE_URL)}"
+        base = base or BASE
+        page_url = page_url or PAGE_URL
+        url = f"{base}/{path}?_aid={self.aid}&_pageUrl={quote(page_url)}"
         js = """
         async (args) => {
             try {
@@ -219,3 +224,22 @@ class WxApiClient:
         """删除评论。"""
         return await self._post("comment/del_comment", self._body(
             exportId=export_id, commentId=comment_id))
+
+    # ==================== 作品管理(内容管理页接口,2026-09-15 探测实锤) ====================
+    async def fetch_post_list(self, page=1, page_size=200):
+        """作品列表(内容管理页口径)。返回 data.list,含 readCount/visibleType/stickyOpStatus。"""
+        return await self._post("post/post_list", self._body(
+            pageSize=page_size, currentPage=page, userpageType=11, stickyOrder=True),
+            base=self.CONTENT_BASE, page_url=self.POST_PAGE_URL)
+
+    async def update_post_visible(self, object_id, visible_type):
+        """改作品可见性。visible_type: 1=公开 3=仅自己可见(2=仅粉丝)。"""
+        return await self._post("post/post_update_visible", self._body(
+            objectId=object_id, visibleType=visible_type),
+            base=self.CONTENT_BASE, page_url=self.POST_PAGE_URL)
+
+    async def update_post_sticky(self, export_id, sticky_op):
+        """置顶/取消置顶。sticky_op: 1=Sticky(置顶) 2=UnSticky(取消)。0=NoOperation 不可操作。"""
+        return await self._post("post/update_sticky_status", self._body(
+            exportId=export_id, stickyOp=sticky_op),
+            base=self.CONTENT_BASE, page_url=self.POST_PAGE_URL)

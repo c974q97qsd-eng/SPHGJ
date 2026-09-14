@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from playwright.async_api import async_playwright
 from backend.browser import launch_stealth
 
-PROFILE = sys.argv[1] if len(sys.argv) > 1 else "./profiles/uspoloassn6"
+PROFILE = sys.argv[1] if len(sys.argv) > 1 else "./profiles/<账号profile>"
 MAIN = "https://channels.weixin.qq.com/platform"
 OUT = ".workbuddy/account_switch"
 

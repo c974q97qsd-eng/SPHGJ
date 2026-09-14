@@ -215,7 +215,7 @@ function Stat({ label, value, accent, small }: { label: string; value: number | 
   return (
     <div className="rounded-md bg-muted/40 px-2 py-1.5">
       <div className={`font-semibold ${small ? "text-xs" : "text-lg"} ${accent ? "text-primary" : ""}`}>{value}</div>
-      <div className="text-[10px] text-muted-foreground">{label}</div>
+      <div className="text-[0.625rem] text-muted-foreground">{label}</div>
     </div>
   )
 }

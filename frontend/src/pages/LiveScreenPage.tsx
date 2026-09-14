@@ -130,15 +130,15 @@ function LiveCard({ it, cardFields, metricDict }: { it: LiveScreenItem; cardFiel
         <div className="absolute bottom-0 left-0 right-0 flex items-baseline justify-around gap-2 bg-black/50 px-3 py-2 text-white backdrop-blur-sm">
           <div className="flex items-baseline gap-1">
             <span className="text-xl font-bold tabular-nums">{s?.currentOnlineCount ?? 0}</span>
-            <span className="text-[10px] opacity-80">当前在线</span>
+            <span className="text-[0.625rem] opacity-80">当前在线</span>
           </div>
           <div className="flex items-baseline gap-1">
             <span className="text-xl font-bold tabular-nums">{naturalTraffic != null ? naturalTraffic : "-"}</span>
-            <span className="text-[10px] opacity-80">自然流量</span>
+            <span className="text-[0.625rem] opacity-80">自然流量</span>
           </div>
           <div className="flex items-baseline gap-1">
             <span className="text-xl font-bold tabular-nums">{naturalGmv != null ? `${naturalGmv}%` : "-"}</span>
-            <span className="text-[10px] opacity-80">自然GMV</span>
+            <span className="text-[0.625rem] opacity-80">自然GMV</span>
           </div>
         </div>
       </div>
@@ -161,7 +161,7 @@ function LiveCard({ it, cardFields, metricDict }: { it: LiveScreenItem; cardFiel
             return <Stat key={k} label={def.display_name} value={formatMetric(it.metrics?.[k], def.format)} />
           })}
         </div>
-        {it.updated_at && <p className="text-[10px] text-muted-foreground">更新:{fmtTime(it.updated_at)}</p>}
+        {it.updated_at && <p className="text-[0.625rem] text-muted-foreground">更新:{fmtTime(it.updated_at)}</p>}
       </CardContent>
     </Card>
   )
@@ -171,7 +171,7 @@ function Stat({ label, value }: { label: string; value: number | string }) {
   return (
     <div className="rounded-md bg-muted/40 px-2 py-1.5">
       <div className="text-lg font-semibold tabular-nums">{value}</div>
-      <div className="text-[10px] text-muted-foreground">{label}</div>
+      <div className="text-[0.625rem] text-muted-foreground">{label}</div>
     </div>
   )
 }

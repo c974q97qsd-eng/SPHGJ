@@ -3,6 +3,7 @@ import { useRef } from "react"
 import { TooltipProvider } from "@/components/ui/tooltip"
 import { Toaster } from "@/components/ui/sonner"
 import { ThemeProvider } from "@/lib/theme"
+import { UiScaleProvider } from "@/lib/uiScale"
 import { AppShell } from "@/components/layout/AppShell"
 import { useWebSocket } from "@/lib/ws"
 import { toast } from "sonner"
@@ -12,6 +13,7 @@ import { CommentsPage } from "@/pages/CommentsPage"
 import { AutoReplyPage } from "@/pages/AutoReplyPage"
 import { LiveScreenPage } from "@/pages/LiveScreenPage"
 import { AutoDeletePage } from "@/pages/AutoDeletePage"
+import { PostsPage } from "@/pages/PostsPage"
 
 /** 失效账号自动依次扫码进度通知:后端驱动弹窗,前端只提示进度。 */
 function AutoReloginNotifier() {
@@ -34,22 +36,25 @@ function AutoReloginNotifier() {
 export default function App() {
   return (
     <ThemeProvider>
-      <TooltipProvider delayDuration={200}>
-        <BrowserRouter>
-          <AppShell>
-            <AutoReloginNotifier />
-            <Routes>
-              <Route path="/" element={<DashboardPage />} />
-              <Route path="/accounts" element={<AccountsPage />} />
-              <Route path="/comments" element={<CommentsPage />} />
-              <Route path="/auto-reply" element={<AutoReplyPage />} />
-              <Route path="/auto-delete" element={<AutoDeletePage />} />
-              <Route path="/live-screen" element={<LiveScreenPage />} />
-            </Routes>
-          </AppShell>
-          <Toaster />
-        </BrowserRouter>
-      </TooltipProvider>
+      <UiScaleProvider>
+        <TooltipProvider delayDuration={200}>
+          <BrowserRouter>
+            <AppShell>
+              <AutoReloginNotifier />
+              <Routes>
+                <Route path="/" element={<DashboardPage />} />
+                <Route path="/accounts" element={<AccountsPage />} />
+                <Route path="/comments" element={<CommentsPage />} />
+                <Route path="/auto-reply" element={<AutoReplyPage />} />
+                <Route path="/auto-delete" element={<AutoDeletePage />} />
+                <Route path="/live-screen" element={<LiveScreenPage />} />
+                <Route path="/posts" element={<PostsPage />} />
+              </Routes>
+            </AppShell>
+            <Toaster />
+          </BrowserRouter>
+        </TooltipProvider>
+      </UiScaleProvider>
     </ThemeProvider>
   )
 }

@@ -162,7 +162,7 @@ function DeleteLogsCard() {
                       <span className="truncate font-medium">{log.nickname || "匿名"}</span>
                       <Badge variant="secondary" className="shrink-0 font-normal">{log.account_name}</Badge>
                     </div>
-                    <span className="shrink-0 text-[10px] text-muted-foreground">{fmtTime(log.deleted_at)}</span>
+                    <span className="shrink-0 text-[0.625rem] text-muted-foreground">{fmtTime(log.deleted_at)}</span>
                   </div>
                   <p className="mt-1 line-clamp-2 text-muted-foreground">{log.content}</p>
                   <div className="mt-1.5">

@@ -22,7 +22,7 @@ from .auto_comment import AutoCommenter
 from .login_capture import LoginSession
 from .browser import launch_stealth, close_context_safely
 from .selectors import COMMENT_URL, POST_CREATE_URL
-from .memtrim import MemoryTrimmer
+from .memtrim import MemoryTrimmer, trim_now
 
 
 def _in_night_hours(night_hours):
@@ -286,7 +286,7 @@ class AccountWorker:
             # 判定:有 live_stats(近期)即直播;stream_url(.flv 流)也视为直播(视频流必出)。
             # 【rev13 修复 flapping】live_object_id 单独【不再】作为直播信号:
             # 它可能来自上一场直播残留的 check_live_status 响应(账号已下播但接口仍返回旧
-            # liveObjectId),若据此判直播会反复"开播→下播"开关浏览器(见 uspoloassn6 抖动)。
+            # liveObjectId),若据此判直播会反复"开播→下播"开关浏览器(见某账号抖动案例)。
             # live_object_id 仅用于 dashboard 抓取,不参与 is_live 判定。
             last_ts = lf.updated_at_ts or 0
             fresh = (time.time() - last_ts) < 30
@@ -676,7 +676,10 @@ class AccountWorker:
                     # dashboardV4 指标,按 config.dashboard_interval_sec 抓(需 live_object_id,账号在直播)
                     if lf.live_object_id and now - (lf._dashboard_ts or 0) >= dash_interval:
                         try:
-                            dd = await lf.fetch_dashboard_data()
+                            # rev21: 超时闸 —— dashboard 抓取内部已逐级加超时,这里再加一道
+                            # 总闸。缺了它,任何一次挂起都会让整个 _live_loop 停摆(不再
+                            # 推 live_screen_update),前端表现为"大屏彻底不动了"。
+                            dd = await asyncio.wait_for(lf.fetch_dashboard_data(), 45)
                             if dd:
                                 info["metrics"] = dd
                         except Exception as e:
@@ -838,7 +841,7 @@ class AccountManager:
         return await s.finalize_with_id(account_id, name)
 
     # ---------- 引擎 ----------
-    async def start(self, headless=True):
+    async def start(self, headless=True, auto_relogin=True):
         await self._ensure_playwright()
         self._running = True
         # rev15 P0: 启动定时内存归还(独立于账号,引擎运行期间常驻)
@@ -872,9 +875,12 @@ class AccountManager:
                 w.start_loop()
                 w.start_live_loop()
         await self._emit("engine_status", self.status_snapshot())
-        # 失效账号:后端自动依次弹 headed 扫码窗口,无需用户手动点启动
-        for acc_id in expired:
-            await self.enqueue_auto_relogin(acc_id)
+        # 失效账号:后端自动依次弹 headed 扫码窗口,无需用户手动点启动。
+        # rev17: 软重启时传 auto_relogin=False —— 自动重启不应擅自弹扫码窗口打扰用户,
+        # 未登录账号保持原状,仍可由用户在界面上手动启动。
+        if auto_relogin:
+            for acc_id in expired:
+                await self.enqueue_auto_relogin(acc_id)
 
     async def stop(self):
         self._running = False

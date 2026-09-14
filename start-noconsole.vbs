@@ -1,81 +1,136 @@
-' è§†é¢‘å·å·¥å…· - æ— æ§åˆ¶å°å¯åŠ¨(wscript è¿è¡Œ,å…¨ç¨‹ä¸å‡ºç° CMD é»‘çª—å£)
+' ÊÓÆµºÅ¹¤¾ß - ÎŞ¿ØÖÆÌ¨Æô¶¯(wscript ÔËĞĞ,È«³Ì²»³öÏÖ CMD ºÚ´°¿Ú)
 '
-' åŒå‡»æœ¬æ–‡ä»¶å³å¯å¯åŠ¨è½¯ä»¶ã€‚æ—¥å¿—è¯·åœ¨è½¯ä»¶ç•Œé¢åº•éƒ¨ã€Œè¿è¡Œæ—¥å¿—ã€æ¿å—æŸ¥çœ‹;
-' å´©æºƒçº¿ç´¢å†™åœ¨åŒç›®å½• run.logã€‚
-'
-' è‹¥ä½ çš„ Python ä¸åœ¨ PATH æˆ–å­˜åœ¨å¤šä¸ªç‰ˆæœ¬,å¯è®¾ç½®ç¯å¢ƒå˜é‡ SPHGJ_PYTHONW
-' æŒ‡å‘è¦ä½¿ç”¨çš„ pythonw.exe å®Œæ•´è·¯å¾„,æœ¬è„šæœ¬ä¼šä¼˜å…ˆé‡‡ç”¨ã€‚
+' Ë«»÷±¾ÎÄ¼ş¼´¿ÉÆô¶¯Èí¼ş¡£ÅÅÕÏÈÕÖ¾Ğ´ÔÚÍ¬Ä¿Â¼ start.log¡£
 
 Option Explicit
 
-Dim sh, fso, here, pyw, Q, rc, cmd
+Dim sh, fso, here, pyw, Q, cmd, pwBrowsers
+Dim wmi, procs, pr, envObj
+
 Set sh = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
 here = fso.GetParentFolderName(WScript.ScriptFullName)
 Q = Chr(34)
 
+Call LogLine("==== Æô¶¯³¢ÊÔ " & Now & " ====")
+
+' 0) ÒÑÔÚÔËĞĞÔòÖ±½ÓÌáÊ¾,²»ÔÙ¿ªµÚ¶ş¸öÊµÀı(¶àÊµÀı»áÇÀ¶Ë¿Ú)
+If AlreadyRunning() Then
+  Call LogLine("¼ì²âµ½ÒÑÔÚÔËĞĞ,·ÅÆúÆô¶¯")
+  MsgBox "SPHGJ ÒÑ¾­ÔÚÔËĞĞÁË,ÎŞĞèÖØ¸´Æô¶¯¡£", 64, "ÊÓÆµºÅ¹¤¾ß"
+  WScript.Quit 0
+End If
+
+' 1) ¶¨Î»½âÊÍÆ÷
 pyw = FindPythonw()
+Call LogLine("Ñ¡¶¨½âÊÍÆ÷: " & pyw)
 
 If pyw = "" Then
-  MsgBox "æœªæ‰¾åˆ°å¯ç”¨çš„ pythonw.exeã€‚" & vbCrLf & vbCrLf & _
-         "è¯·å…ˆåŒå‡» setup.bat å®Œæˆå®‰è£…;è‹¥ Python ä¸åœ¨ PATH," & vbCrLf & _
-         "è¯·è®¾ç½®ç¯å¢ƒå˜é‡ SPHGJ_PYTHONW æŒ‡å‘ pythonw.exe çš„å®Œæ•´è·¯å¾„ã€‚", _
-         16, "è§†é¢‘å·å·¥å…· - å¯åŠ¨å¤±è´¥"
+  Call LogLine("´íÎó: Î´ÕÒµ½¿ÉÓÃµÄ pythonw.exe")
+  MsgBox "Î´ÕÒµ½¿ÉÓÃµÄ pythonw.exe¡£" & vbCrLf & vbCrLf & _
+         "ÇëÏÈË«»÷ ÅäÖÃ»·¾³°²×°\Ò»¼ü°²×°.bat Íê³É»·¾³°²×°¡£" & vbCrLf & _
+         "ÅÅ²éÏ¸½Ú¼ûÍ¬Ä¿Â¼ start.log¡£", 16, "ÊÓÆµºÅ¹¤¾ß - Æô¶¯Ê§°Ü"
   WScript.Quit 1
 End If
 
+' 2) Ö¸ÏòËæÏîÄ¿×Ô´øµÄÀëÏßä¯ÀÀÆ÷(Óë Æô¶¯-SPHGJ.bat ±£³ÖÒ»ÖÂ)
+pwBrowsers = here & "\ÅäÖÃ»·¾³°²×°\ms-playwright"
+If fso.FolderExists(pwBrowsers) Then
+  Set envObj = sh.Environment("PROCESS")
+  envObj.Item("PLAYWRIGHT_BROWSERS_PATH") = pwBrowsers
+  Call LogLine("ÒÑÉèÖÃ PLAYWRIGHT_BROWSERS_PATH=" & pwBrowsers)
+End If
+
+' 3) Æô¶¯¡£
+'    ×¢Òâ!´°¿ÚÑùÊ½±ØĞë´« 1(Õı³£ÏÔÊ¾),²»ÄÜ´« 0(SW_HIDE):
+'    ÕâÀïÆô¶¯µÄÊÇ pythonw.exe,ÊôÓÚ GUI ×ÓÏµÍ³,±¾Éí¾Í²»»á´´½¨¿ØÖÆÌ¨´°¿Ú,
+'    ´« 0 »á°Ñ pywebview ´´½¨µÄ×ÀÃæ´°¿ÚÒ»ÆğÒş²Ø ¡ª¡ª ±íÏÖÎª¡¸ºó¶ËÔÚÅÜ¡¢
+'    ä¯ÀÀÆ÷ÄÜ´ò¿ªÒ³Ãæ¡¢µ«¾ÍÊÇ¿´²»µ½Èí¼ş´°¿Ú¡¹¡£
+'    False = ²»µÈ´ı,½Å±¾Æô¶¯ºóÁ¢¼´ÍË³ö¡£
 sh.CurrentDirectory = here
-' å‚æ•°:å‘½ä»¤, 0=éšè—çª—å£, False=ä¸ç­‰å¾…(å¯åŠ¨åç«‹å³ç»“æŸæœ¬è„šæœ¬)
 cmd = Q & pyw & Q & " " & Q & here & "\main.py" & Q
-sh.Run cmd, 0, False
+Call LogLine("Ö´ĞĞÃüÁî: " & cmd)
+sh.Run cmd, 1, False
+
+WScript.Quit 0
 
 
-' ---------------------------------------------------------------------------
-' æŒ‰ä¼˜å…ˆçº§æ‰¾ pythonw.exe,å¹¶å¯¹æ¯ä¸ªå€™é€‰åšä¾èµ–æ ¡éªŒ(é¿å…é€‰ä¸­æ²¡è£…ä¾èµ–çš„è§£é‡Šå™¨
-' å¯¼è‡´æ— æ§åˆ¶å°ä¸‹é™é»˜å¤±è´¥ â€”â€” ç”¨æˆ·ä»€ä¹ˆéƒ½çœ‹ä¸åˆ°)ã€‚
-' ---------------------------------------------------------------------------
+' ÅĞ¶ÏÊÇ·ñÒÑÓĞÊµÀıÔÚÅÜ:²é pythonw ½ø³ÌÀïÃüÁîĞĞº¬ main.py µÄ
+Function AlreadyRunning()
+  AlreadyRunning = False
+  On Error Resume Next
+  Set wmi = GetObject("winmgmts:\\.\root\cimv2")
+  If Err.Number <> 0 Then
+    On Error GoTo 0
+    Exit Function
+  End If
+  Set procs = wmi.ExecQuery("SELECT ProcessId FROM Win32_Process WHERE Name='pythonw.exe' AND CommandLine LIKE '%main.py%'")
+  For Each pr In procs
+    AlreadyRunning = True
+    Exit For
+  Next
+  On Error GoTo 0
+End Function
+
+
+' °´ÓÅÏÈ¼¶ÕÒ¿ÉÓÃµÄ pythonw.exe:
+' ±ãĞ¯°æ(ËæÏîÄ¿,ÒÀÀµÆëÈ«) > »·¾³±äÁ¿ > ½Å±¾Í¬Ä¿Â¼ > PATH > ³£¼û°²×°Î»ÖÃ
 Function FindPythonw()
-  Dim cand, i, arr, d, base, subF, f
+  Dim cand, arr, i, d, base, subF, f
 
   FindPythonw = ""
 
-  ' 1) ç¯å¢ƒå˜é‡æ˜¾å¼æŒ‡å®š
+  ' 1) ËæÏîÄ¿×Ô´øµÄ±ãĞ¯°æ ¡ª¡ª Ê×Ñ¡,ÃâÌ½²â¡¢ÃâÒÀÀµ
+  cand = here & "\ÅäÖÃ»·¾³°²×°\Python314\pythonw.exe"
+  If Usable(cand) Then
+    FindPythonw = cand
+    Exit Function
+  End If
+
+  ' 2) »·¾³±äÁ¿ÏÔÊ½Ö¸¶¨
   cand = sh.ExpandEnvironmentStrings("%SPHGJ_PYTHONW%")
   If cand <> "%SPHGJ_PYTHONW%" And cand <> "" Then
-    If Usable(cand) Then FindPythonw = cand : Exit Function
+    If Usable(cand) Then
+      FindPythonw = cand
+      Exit Function
+    End If
   End If
 
-  ' 2) æœ¬è„šæœ¬åŒç›®å½•(è§£å‹å³ç”¨åœºæ™¯)
+  ' 3) ½Å±¾Í¬Ä¿Â¼
   cand = here & "\pythonw.exe"
-  If fso.FileExists(cand) And Usable(cand) Then
-    FindPythonw = cand : Exit Function
+  If Usable(cand) Then
+    FindPythonw = cand
+    Exit Function
   End If
 
-  ' 3) PATH ä¸­é€ä¸ªç›®å½•æ‰¾
+  ' 4) PATH ÖĞÖğ¸öÄ¿Â¼ÕÒ
   arr = Split(sh.ExpandEnvironmentStrings("%PATH%"), ";")
   For i = 0 To UBound(arr)
     d = Trim(arr(i))
     If d <> "" Then
       If Right(d, 1) = "\" Then d = Left(d, Len(d) - 1)
       cand = d & "\pythonw.exe"
-      If fso.FileExists(cand) And Usable(cand) Then
-        FindPythonw = cand : Exit Function
+      If Usable(cand) Then
+        FindPythonw = cand
+        Exit Function
       End If
     End If
   Next
 
-  ' 4) %LOCALAPPDATA%\Python\<å‘è¡Œç‰ˆ> ä¸‹çš„å¸¸è§ä½ç½®(PyManager / å®˜æ–¹å®‰è£…å™¨)
+  ' 5) ³£¼û°²×°Î»ÖÃ
   base = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%") & "\Python"
   If fso.FolderExists(base) Then
     For Each subF In fso.GetFolder(base).SubFolders
       cand = subF.Path & "\pythonw.exe"
-      If fso.FileExists(cand) And Usable(cand) Then
-        FindPythonw = cand : Exit Function
+      If Usable(cand) Then
+        FindPythonw = cand
+        Exit Function
       End If
       For Each f In subF.SubFolders
         cand = f.Path & "\pythonw.exe"
-        If fso.FileExists(cand) And Usable(cand) Then
-          FindPythonw = cand : Exit Function
+        If Usable(cand) Then
+          FindPythonw = cand
+          Exit Function
         End If
       Next
     Next
@@ -83,13 +138,26 @@ Function FindPythonw()
 End Function
 
 
-' ä¾èµ–æ ¡éªŒ:pythonw æ— æ§åˆ¶å°,é è¿›ç¨‹é€€å‡ºç åˆ¤æ–­(0=ä¾èµ–é½å…¨)
+' ÒÀÀµĞ£Ñé:pythonw ÎŞ¿ØÖÆÌ¨,Ö»ÄÜ¿¿ÍË³öÂëÅĞ¶Ï(0 = ÒÀÀµÆëÈ«)
+' ×¢Òâ:rc ±ØĞë¾Ö²¿±äÁ¿²¢ÔÚ Run Ç°ÖØÖÃ,·ñÔòÉÏ´ÎµÄ²ĞÁôÖµ»áÎóÅĞ
 Function Usable(exe)
+  Dim rc
   Usable = False
   If Not fso.FileExists(exe) Then Exit Function
+  rc = -1
   On Error Resume Next
-  ' 0=éšè—çª—å£, True=ç­‰å¾…ç»“æŸä»¥å–é€€å‡ºç 
   rc = sh.Run(Q & exe & Q & " -c ""import fastapi, webview, playwright""", 0, True)
   On Error GoTo 0
   If rc = 0 Then Usable = True
 End Function
+
+
+' ×·¼ÓÒ»ĞĞµ½ start.log
+Sub LogLine(msg)
+  On Error Resume Next
+  Dim f
+  Set f = fso.OpenTextFile(here & "\start.log", 8, True)
+  f.WriteLine msg
+  f.Close
+  On Error GoTo 0
+End Sub
