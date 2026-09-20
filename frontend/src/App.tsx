@@ -5,6 +5,7 @@ import { Toaster } from "@/components/ui/sonner"
 import { ThemeProvider } from "@/lib/theme"
 import { UiScaleProvider } from "@/lib/uiScale"
 import { AppShell } from "@/components/layout/AppShell"
+import { LockConflictDialog } from "@/components/accounts/LockConflictDialog"
 import { useWebSocket } from "@/lib/ws"
 import { toast } from "sonner"
 import { DashboardPage } from "@/pages/DashboardPage"
@@ -41,6 +42,8 @@ export default function App() {
           <BrowserRouter>
             <AppShell>
               <AutoReloginNotifier />
+              {/* 扫错微信全局警告:清除登录态后提示用锁定的微信重扫(任意页面都能弹) */}
+              <LockConflictDialog />
               <Routes>
                 <Route path="/" element={<DashboardPage />} />
                 <Route path="/accounts" element={<AccountsPage />} />

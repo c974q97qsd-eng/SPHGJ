@@ -233,6 +233,9 @@ export const api = {
     req<{ ok: boolean }>(`/accounts/login/${sid}/select-account`, { method: "POST", body: JSON.stringify({ index }) }),
   loginOpenWindow: (sid: string) => req<{ sid: string; status: string }>(`/accounts/login/${sid}/open-window`, { method: "POST" }),
   loginCancel: (sid: string) => req<{ ok: boolean }>(`/accounts/login/${sid}/cancel`, { method: "POST" }),
+  /** 扫错微信(非锁定微信)确认后:重新进入全新登录环境等待扫码(登录态已由后端清除) */
+  loginRetryClean: (sid: string) =>
+    req<{ sid: string; status: string; headed?: boolean }>(`/accounts/login/${sid}/retry-clean`, { method: "POST" }),
   loginFinalize: (sid: string, account_id?: string, name?: string) =>
     req<{ ok: boolean; account: Record<string, unknown>; accounts: AccountStatus[] }>(`/accounts/login/${sid}/finalize`, {
       method: "POST",

@@ -33,7 +33,7 @@ QR_PAGE = """<html><body>
 <div>登录视频号助手</div><div>使用微信扫码登录</div>
 </body></html>"""
 
-NAMES = ["U.S.POLO 3号", "U.S.POLO 5号", "风尚鞋类旗舰店", "测试小店"]
+NAMES = ["示范店·甲仓", "示范店·乙仓", "示范店·丙仓", "示范店·丁仓"]
 ROLES = ["超级管理员", "管理员", "运营者", "管理员"]
 
 
@@ -136,9 +136,9 @@ async def main():
         await load(page, select_page(4))
         await page.evaluate("window.__clicked = null")
         s = await new_session(page)
-        ok = await s._click_select_account(2, "风尚鞋类旗舰店")
+        ok = await s._click_select_account(2, "示范店·丙仓")
         clicked = await page.evaluate("window.__clicked")
-        check(ok and clicked == "acc2", f"点 name=风尚鞋类旗舰店 -> acc2(实际 {clicked})")
+        check(ok and clicked == "acc2", f"点 name=示范店·丙仓 -> acc2(实际 {clicked})")
 
         # ---- 4. 点击:仅按 index(不传 name) ----
         print("\n[4] 点击:仅按 index")
@@ -159,8 +159,8 @@ async def main():
         # ---- 6. 无勾选框的布局(退回策略B/C) ----
         print("\n[6] 无勾选框布局:应退回 class / 文本行策略")
         await load(page, """<html><body><h2>选择视频号登录</h2>
-        <div class="account-card" style="width:520px;height:60px">U.S.POLO 3号 管理员</div>
-        <div class="account-card" style="width:520px;height:60px">风尚鞋类旗舰店 运营者</div>
+        <div class="account-card" style="width:520px;height:60px">示范店·甲仓 管理员</div>
+        <div class="account-card" style="width:520px;height:60px">示范店·丙仓 运营者</div>
         </body></html>""")
         s = await new_session(page)
         accs = await s._enumerate_select_accounts()

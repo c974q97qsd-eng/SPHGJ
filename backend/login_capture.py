@@ -12,6 +12,7 @@ import os
 import re
 import json
 import uuid
+import shutil
 import base64
 import asyncio
 from urllib.parse import urlparse, parse_qs
@@ -47,6 +48,41 @@ def check_account_lock(acc: dict, captured: dict) -> str:
             f"本次登录的是「{nm or '未知'}」,已拒绝保存")
 
 
+def clear_login_state(profile_dir: str):
+    """清空账号 profile 目录内的登录态文件并重建空目录(全新登录环境)。
+
+    用于「扫码用了非锁定微信」场景:错误微信的 Cookie/LocalStorage 已经写进该 profile,
+    不清掉的话账号会一直带着错的登录态(这正是"必须手动删目录才能重新登录"的根因)。
+
+    安全:只允许操作 ./profiles 下的目录(防误删),目录被浏览器占用时如实返回失败。
+    返回 (ok, 说明)。
+    """
+    if not profile_dir:
+        return False, "profile 目录为空"
+    root = os.path.abspath("./profiles")
+    target = os.path.abspath(profile_dir)
+    if target != root and not target.startswith(root + os.sep):
+        return False, f"拒绝清理非 profiles 目录: {profile_dir}"
+    try:
+        if os.path.isdir(target):
+            for name in os.listdir(target):
+                p = os.path.join(target, name)
+                try:
+                    if os.path.isdir(p) and not os.path.islink(p):
+                        shutil.rmtree(p, ignore_errors=True)
+                    else:
+                        os.remove(p)
+                except Exception as e:
+                    logger.debug(f"[lock-clean] 删除 {p} 失败: {e}")
+        os.makedirs(target, exist_ok=True)
+    except Exception as e:
+        return False, f"清理登录态失败: {e}"
+    leftover = os.listdir(target) if os.path.isdir(target) else ["<目录不存在>"]
+    if leftover:
+        return False, f"登录态未清干净(残留 {len(leftover)} 项,浏览器可能未完全退出)"
+    return True, "已清除本账号登录态,登录环境已重置"
+
+
 class LoginSession:
     def __init__(self, playwright, config, emit, account=None, auto_finalize=False, on_finished=None):
         self.sid = uuid.uuid4().hex[:12]
@@ -68,6 +104,10 @@ class LoginSession:
         self.auto_finalize = auto_finalize  # auto 模式:captured 后后端自动落盘,不等前端调 finalize
         self.on_finished = on_finished      # 终态回调(sid, status, account_id),供 auto 队列调度
         self._finished_called = False
+        # —— 锁定微信校验(扫错微信时清登录态 + 警告 + 全新环境重扫) ——
+        self._headed = False          # start() 记录本次扫码模式,冲突后原地重扫沿用
+        self._conflict_task = None    # 冲突等待确认的超时兜底任务
+        self.lock_conflict = None     # 冲突详情(前端据此弹警告框)
         # 网络拦截缓存:二维码原图(优先于截图)
         self._qr_raw = None  # bytes | None
 
@@ -85,6 +125,7 @@ class LoginSession:
 
     # ---------- 生命周期 ----------
     async def start(self, headed=False):
+        self._headed = headed
         if self.account:
             # relogin:复用原账号 profile_dir(失效 cookie 会被扫码覆盖)
             self.profile_dir = self.account["profile_dir"]
@@ -129,6 +170,8 @@ class LoginSession:
 
     async def open_window(self):
         """兜底:关闭 headless,以同 profile_dir 重启 headed,让用户在弹出窗口扫码。"""
+        if self.status == "locked_conflict":
+            return  # 冲突态已关掉登录环境,等用户在警告框确认后重新扫码
         headed_profile = self.profile_dir
         await self._close(keep_profile=True)
         self.context = await launch_stealth(self.pw, headed_profile, headless=False)
@@ -143,6 +186,9 @@ class LoginSession:
         self._tasks.append(asyncio.create_task(self._wait_login_loop()))
 
     async def cancel(self):
+        if self._conflict_task is not None and not self._conflict_task.done():
+            self._conflict_task.cancel()
+        self._conflict_task = None
         self.status = "cancelled"
         await self._close(keep_profile=False)
         await self.emit("login_status", {"sid": self.sid, "status": "cancelled"})
@@ -166,6 +212,130 @@ class LoginSession:
                     shutil.rmtree(self.profile_dir, ignore_errors=True)
             except Exception:
                 pass
+
+    # ---------- 锁定微信校验(扫错微信 -> 清登录态 + 警告 + 全新环境重扫) ----------
+    def _lock_mismatch(self):
+        """本次已抓到的登录身份是否与该账号锁定的微信冲突。
+
+        仅在【拿到可比对的身份】时才判冲突,身份未知一律不判(交给后续检测点),
+        避免刚进页面就误清登录态。返回 (冲突?, 本次登录名, 原因)。
+
+        finder_id 是账号唯一标识,是最可靠依据;只有锁定信息里没有 finder_id 的老数据
+        才退回名字比对(注意 relogin 时 captured["name"] 预填了账号名,单独用它比对不可靠,
+        故只在 finder_id 缺失时才用)。
+        """
+        acc = self.account or {}
+        locked_fid = (acc.get("locked_finder_id") or "").strip()
+        locked_name = (acc.get("locked_name") or "").strip()
+        if not locked_fid and not locked_name:
+            return False, "", ""
+        fid = (self.captured.get("finder_id") or "").strip()
+        nm = (self.captured.get("name") or "").strip()
+        if locked_fid:
+            if not fid:
+                return False, "", ""
+            if fid == locked_fid:
+                return False, "", ""
+            show = nm if nm and nm != (acc.get("name") or "").strip() else f"未知账号({fid[:10]}…)"
+            return True, show, (f"本账号已锁定微信「{locked_name or locked_fid}」,"
+                                f"但本次扫码登录的不是它")
+        if not nm:
+            return False, "", ""
+        if nm == locked_name:
+            return False, "", ""
+        return True, nm, f"本账号已锁定微信「{locked_name}」,但本次扫码登录的是「{nm}」"
+
+    async def _select_page_missing_locked(self, accounts):
+        """「选择视频号登录」页上确实找不到该账号锁定的微信 -> 判定扫码用错了微信。
+
+        这是最早的拦截点(不用等用户点选)。三重确认避免枚举不全误判:
+          A. 枚举结果里有锁定名 / finder_id -> 不算缺失;
+          B. 页面正文里出现锁定名 / finder_id(懒加载未纳入枚举但实际在页面上)-> 不算缺失;
+          C. 都没出现,且账号确实处于锁定态 -> 判定缺失。
+        """
+        acc = self.account or {}
+        locked_fid = (acc.get("locked_finder_id") or "").strip()
+        locked_name = (acc.get("locked_name") or "").strip()
+        if not locked_fid and not locked_name:
+            return False
+        for a in accounts or []:
+            if locked_name and (a.get("name") or "").strip() == locked_name:
+                return False
+            if locked_fid and locked_fid in (a.get("_raw") or ""):
+                return False
+        txt = await self._body_text() or ""
+        if locked_name and locked_name in txt:
+            return False
+        if locked_fid and locked_fid in txt:
+            return False
+        return True
+
+    async def _mark_lock_conflict(self, reason, scanned="", can_retry=True):
+        """锁定冲突:关浏览器 -> 清空该账号登录态(全新登录环境) -> 推警告框等用户确认。
+
+        不调用 _finished()(冲突不是终态):用户确认后原地重扫,或由 _conflict_timeout 收尾。
+        清理只针对本次登录的 profile 目录,不动 config 里的账号配置。
+        """
+        logger.warning(f"[login:{self.sid}] 检测到非锁定微信扫码: {reason}")
+        target = self.profile_dir
+        await self._close(keep_profile=True)
+        ok, msg = clear_login_state(target)
+        logger.info(f"[login:{self.sid}] 登录态清理: {'OK' if ok else 'NG'} {msg}")
+        acc = self.account or {}
+        self.lock_conflict = {
+            "sid": self.sid,
+            "account_id": acc.get("id", ""),
+            "account_name": acc.get("name", ""),
+            "locked_name": (acc.get("locked_name") or "").strip(),
+            "scanned_name": scanned or "",
+            "reason": reason,
+            "cleared": bool(ok),
+            "cleared_msg": msg,
+            "can_retry": bool(can_retry),
+        }
+        self.status = "locked_conflict"
+        await self.emit("login_status", {"sid": self.sid, "status": "locked_conflict",
+                                         "error": reason,
+                                         "lock_conflict": dict(self.lock_conflict)})
+        await self.emit("login_lock_conflict", dict(self.lock_conflict))
+        wait = int((self.config or {}).get("lock_conflict_wait_sec", 600))
+        self._conflict_task = asyncio.create_task(self._conflict_timeout(wait))
+        self._tasks.append(self._conflict_task)
+
+    async def _conflict_timeout(self, wait):
+        """冲突后无人确认的兜底:超时按失败收尾,避免自动重登队列被永久卡住。"""
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + wait
+        while self.status == "locked_conflict" and loop.time() < deadline:
+            await asyncio.sleep(2)
+        if self.status != "locked_conflict":
+            return
+        logger.warning(f"[login:{self.sid}] 扫错微信后等待确认超时({wait}s),放弃本次登录")
+        self.status = "failed"
+        await self.emit("login_status", {"sid": self.sid, "status": "failed",
+                                         "error": "扫码的不是锁定的微信,等待确认超时"})
+        await self._close(keep_profile=False)
+        self._finished("failed")
+
+    async def relaunch_clean(self):
+        """冲突确认后:在同一会话上重新进入全新登录环境等待扫码(sid 不变)。"""
+        if self.status != "locked_conflict":
+            return False
+        if self._conflict_task is not None and not self._conflict_task.done():
+            self._conflict_task.cancel()
+        self._conflict_task = None
+        # 二次清理:首次清理可能因浏览器窗口尚未完全退出而残留(Windows 文件占用)
+        if self.profile_dir:
+            ok, msg = clear_login_state(self.profile_dir)
+            logger.info(f"[login:{self.sid}] 重新扫码前清理登录态: {'OK' if ok else 'NG'} {msg}")
+        self.lock_conflict = None
+        self.qr_image = None
+        self._qr_raw = None
+        self.captured = {"aid": "", "finder_id": "",
+                         "name": (self.account or {}).get("name", ""),
+                         "wx_name": (self.account or {}).get("_wx_name", "")}
+        await self.start(headed=self._headed)
+        return True
 
     # ---------- 请求拦截:抓 _aid / _log_finder_id ----------
     def _on_request(self, req):
@@ -481,7 +651,7 @@ class LoginSession:
 
         # relogin 且能**精确**匹配到目标账号 -> 自动点击,不再打扰用户
         # 精准匹配规则: name 必须完全相等(==),禁止子串包含(in)——
-        #   "免税仓"与"免税2号"前缀相近,泛匹配必然误选错号。
+        #   "甲仓"与"甲仓2号"前缀相近,泛匹配必然误选错号。
         # wx_name 同理精确匹配;finder_id 是全局唯一标识符,允许子串匹配。
         auto_idx = -1
         target_name = ""
@@ -500,6 +670,14 @@ class LoginSession:
                         auto_idx = i
                         break
                 if auto_idx < 0:
+                    if accounts and await self._select_page_missing_locked(accounts):
+                        # 选择页里没有该账号锁定的微信 => 扫码用的不是它。
+                        # 关键:不能再降级让用户手选 —— 那样必然选到别的号
+                        # (污染账号登录态 / 凭空多一个随机账号)。
+                        await self._mark_lock_conflict(
+                            f"本账号已锁定微信「{locked_name or locked_fid}」,"
+                            f"但本次扫码的微信名下没有它(选择页 {len(accounts)} 项均不匹配)")
+                        return
                     logger.warning(f"[login:{self.sid}] 账号已锁定「{locked_name or locked_fid}」,"
                                    f"选择页 {len(accounts)} 项中无匹配,不自动点击")
             else:
@@ -578,6 +756,11 @@ class LoginSession:
             logger.warning(f"[login:{self.sid}] 字段抓取异常: {e}")
         # 字段齐全 -> 通知前端自动保存(前端调 finalize 关弹窗 + 落盘);否则失败
         if self.captured["aid"] and self.captured["finder_id"]:
+            # 锁定校验:必须在 emit captured 之前(前端收到 captured 会立刻 finalize 落盘)
+            conflict, scanned, reason = self._lock_mismatch()
+            if conflict:
+                await self._mark_lock_conflict(reason, scanned)
+                return
             self.status = "captured"
             logger.info(f"[login:{self.sid}] 抓取完成 aid/finder_id 齐全 name={self.captured['name']}")
             await self.emit("login_status", {"sid": self.sid, "status": "captured",
@@ -698,7 +881,21 @@ class LoginSession:
             reason = check_account_lock(acc, self.captured)
             if reason:
                 logger.warning(f"[login:{self.sid}] 账号 {acc['id']} 锁定校验未通过: {reason}")
-                await self.emit("login_error", {"sid": self.sid, "message": reason})
+                # 兜底:错的 Cookie 已经写进 profile,必须清掉,否则下次启动仍是错的登录态
+                # (这正是"必须手动删目录才能重新登录"的根因)。会话已被 manager 摘除,
+                # 这里只推警告 + 清环境,重扫由用户点该账号卡片上的「重新登录」发起。
+                ok, msg = clear_login_state(self.profile_dir)
+                info = {
+                    "sid": self.sid, "account_id": acc["id"],
+                    "account_name": acc.get("name", ""),
+                    "locked_name": (acc.get("locked_name") or "").strip(),
+                    "scanned_name": (self.captured.get("name") or "").strip(),
+                    "reason": reason, "cleared": bool(ok), "cleared_msg": msg,
+                    "can_retry": False,
+                }
+                await self.emit("login_lock_conflict", info)
+                await self.emit("login_error", {"sid": self.sid, "message":
+                                                f"{reason};已清除本账号登录态,请用锁定的微信重新扫码"})
                 raise LoginLockError(reason)
             acc["_aid"] = self.captured["aid"] or acc.get("_aid", "")
             acc["_log_finder_id"] = self.captured["finder_id"] or acc.get("_log_finder_id", "")

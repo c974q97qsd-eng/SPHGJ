@@ -1,12 +1,12 @@
 import { useEffect, useRef, useState } from "react"
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "@/components/ui/dialog"
 import { Button } from "@/components/ui/button"
-import { Loader2, ExternalLink, AlertCircle, Smartphone, Monitor, QrCode, Users } from "lucide-react"
+import { Loader2, ExternalLink, AlertCircle, AlertTriangle, RefreshCw, Smartphone, Monitor, QrCode, Users } from "lucide-react"
 import { api } from "@/lib/api"
 import { useWebSocket, type WsEvent } from "@/lib/ws"
 import { toast } from "sonner"
 
-type Status = "starting" | "waiting_scan" | "scanned" | "capturing" | "captured" | "failed" | "cancelled" | "selecting_account"
+type Status = "starting" | "waiting_scan" | "scanned" | "capturing" | "captured" | "failed" | "cancelled" | "selecting_account" | "locked_conflict"
 
 const STATUS_TEXT: Record<Status, string> = {
   starting: "正在准备登录环境…",
@@ -17,6 +17,7 @@ const STATUS_TEXT: Record<Status, string> = {
   failed: "登录失败",
   cancelled: "已取消",
   selecting_account: "请选择要登录的视频号",
+  locked_conflict: "扫码的微信不对,已清除本账号登录态",
 }
 
 /** auto=后端按客户端是否本机自动决定(未拿到结果前不高亮任何按钮) */
@@ -110,7 +111,9 @@ export function AddAccountDialog({ open, onOpenChange, onDone, reloginAccountId,
     if (!s) return
     try {
       await api.selectLoginAccount(s, index)
-      setStatus("scanned") // 后端会推进到 scanned → captured → autoFinalize
+      // 后端会推进到 scanned → captured → autoFinalize;
+      // 若同一瞬间被判为「扫错微信」(locked_conflict),保留该状态不被覆盖
+      setStatus((st) => (st === "locked_conflict" ? st : "scanned"))
     } catch (e) {
       setError("选择失败:" + (e as Error).message)
       setStatus("failed")
@@ -132,7 +135,7 @@ export function AddAccountDialog({ open, onOpenChange, onDone, reloginAccountId,
         finalizingRef.current = true
         void autoFinalize(p.captured?.name)
       }
-      if (p.status === "failed") setError(p.error || "登录失败")
+      if (p.status === "failed" || p.status === "locked_conflict") setError(p.error || "登录失败")
     }
     if (e.event === "qr_update" && e.payload.sid === mySid) {
       setQrImage(e.payload.image || null)
@@ -151,6 +154,20 @@ export function AddAccountDialog({ open, onOpenChange, onDone, reloginAccountId,
     if (!s) return
     try { await api.loginOpenWindow(s) } catch (e) { toast.error((e as Error).message) }
   }
+  // 扫错微信后:登录态已由后端清除,这里原地重开全新登录环境
+  const retryClean = async () => {
+    const s = sidRef.current
+    if (!s) return
+    try {
+      await api.loginRetryClean(s)
+      setError(null)
+      setQrImage(null)
+      setStatus("waiting_scan")
+    } catch (e) {
+      toast.error("重置失败:" + (e as Error).message)
+    }
+  }
+
   const cancel = async () => {
     const s = sidRef.current
     if (s) { try { await api.loginCancel(s) } catch {} }
@@ -194,10 +211,11 @@ export function AddAccountDialog({ open, onOpenChange, onDone, reloginAccountId,
 
         <div className="flex flex-col items-center gap-3 py-6">
           {status === "failed" ? <AlertCircle className="h-10 w-10 text-destructive" />
+            : status === "locked_conflict" ? <AlertTriangle className="h-10 w-10 text-destructive" />
             : processing ? <Loader2 className="h-10 w-10 animate-spin text-primary" />
             : status === "selecting_account" ? <Users className="h-10 w-10 text-primary" />
             : <Smartphone className="h-10 w-10 text-primary" />}
-          <p className={`text-sm font-medium text-center ${status === "failed" ? "text-destructive" : "text-foreground"}`}>
+          <p className={`text-sm font-medium text-center ${status === "failed" || status === "locked_conflict" ? "text-destructive" : "text-foreground"}`}>
             {error ? error : STATUS_TEXT[status]}
           </p>
           {autoSelectedName && (
@@ -267,6 +285,12 @@ export function AddAccountDialog({ open, onOpenChange, onDone, reloginAccountId,
           )}
           {status === "failed" && (
             <Button onClick={() => startLogin()} className="gap-1.5">重试</Button>
+          )}
+          {/* 扫错微信:登录态已清,原地重开全新环境重扫 */}
+          {status === "locked_conflict" && (
+            <Button onClick={retryClean} className="gap-1.5">
+              <RefreshCw className="h-3.5 w-3.5" />重新扫码
+            </Button>
           )}
           {/* 网页二维码模式下识别不到账号列表 -> 切本机窗口重试 */}
           {status === "selecting_account" && selectAccounts.length === 0 && mode === "web" && (

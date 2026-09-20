@@ -870,6 +870,18 @@ async def login_cancel(sid: str):
     return {"ok": True}
 
 
+@app.post("/api/accounts/login/{sid}/retry-clean")
+async def login_retry_clean(sid: str):
+    """扫错微信(非锁定微信)确认后:重新进入全新登录环境等待扫码。
+
+    登录态在检测到冲突时已清除,这里原地重启扫码流程(同一 sid)。
+    """
+    s = await manager.retry_login_clean(sid)
+    if not s:
+        raise HTTPException(404, "登录会话不存在或不在等待确认状态")
+    return {"sid": s.sid, "status": s.status, "headed": s._headed}
+
+
 @app.post("/api/accounts/login/{sid}/select-account")
 async def login_select_account(sid: str, body: dict):
     """前端选择账号(选择页出现时推送列表给用户,用户选后回调此接口)。"""

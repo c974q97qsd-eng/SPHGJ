@@ -34,7 +34,7 @@ from backend.browser import launch_stealth
 
 OUT = ".workbuddy/account_select3"
 # 干净 profile:确保出现「选择账号」页(已登录 profile 会被直接送进平台)
-PROFILE = "./profiles/_probe_as_fresh"
+PROFILE = "./profiles/<探测profile>"
 LOGIN = "https://channels.weixin.qq.com/platform/login"
 CMD = f"{OUT}/cmd.txt"
 

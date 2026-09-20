@@ -71,7 +71,7 @@ function AccountCard({ acc, onRefresh }: { acc: AccountStatus; onRefresh: () => 
         toast.success("已解锁,可接受任意微信登录")
       } else {
         await setLock(acc.id, true)
-        toast.success(`已锁定微信「${acc.name}」,其他微信登录不会被保存`)
+        toast.success(`已锁定「${acc.name}」,其他微信扫码会被拦截并清除登录态`)
       }
     } catch (e) {
       toast.error("操作失败:" + (e as Error).message)

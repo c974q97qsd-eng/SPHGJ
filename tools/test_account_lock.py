@@ -21,16 +21,16 @@ from backend.login_capture import check_account_lock, LoginLockError  # noqa: E4
 # ---------------------------------------------------------------- A. 纯函数
 def test_check_lock():
     print("=== A. check_account_lock 校验逻辑 ===")
-    locked = {"locked_finder_id": "FID_X", "locked_name": "U.S.POLOASSN.免税仓"}
+    locked = {"locked_finder_id": "FID_X", "locked_name": "示范店·甲仓"}
 
     # (captured, 期望通过?, 说明)
     cases = [
         ({"finder_id": "FID_X", "name": "任意显示名"}, True, "finder_id 相同 -> 放行"),
-        ({"finder_id": "", "name": "U.S.POLOASSN.免税仓"}, True, "选择页名精确相等 -> 放行"),
-        ({"finder_id": "FID_Y", "name": "U.S.POLOASSN.免税仓2号"}, False, "别的微信 -> 拒绝"),
+        ({"finder_id": "", "name": "示范店·甲仓"}, True, "选择页名精确相等 -> 放行"),
+        ({"finder_id": "FID_Y", "name": "示范店·甲仓2号"}, False, "别的微信 -> 拒绝"),
         ({"finder_id": "", "name": ""}, False, "身份取不到 -> 拒绝(宁可不存)"),
-        ({"finder_id": "FID_Y", "name": "U.S.POLOASSN.免税仓2号"}, False, "名字相近但不等 -> 拒绝(防子串误判)"),
-        ({"finder_id": "", "name": "U.S.POLOASSN.免税"}, False, "前缀相同不等 -> 拒绝"),
+        ({"finder_id": "FID_Y", "name": "示范店·甲仓2号"}, False, "名字相近但不等 -> 拒绝(防子串误判)"),
+        ({"finder_id": "", "name": "示范店·甲"}, False, "前缀相同不等 -> 拒绝"),
     ]
     for captured, expect_pass, label in cases:
         reason = check_account_lock(locked, captured)
@@ -42,12 +42,12 @@ def test_check_lock():
 
     # 只锁 finder_id(未锁 name):名字相同但 fid 不同 -> 拒绝(fid 是唯一标识)
     only_fid = {"locked_finder_id": "FID_X", "locked_name": ""}
-    check(bool(check_account_lock(only_fid, {"finder_id": "FID_Y", "name": "U.S.POLOASSN.免税仓"})),
+    check(bool(check_account_lock(only_fid, {"finder_id": "FID_Y", "name": "示范店·甲仓"})),
           "只锁 fid 时,fid 不同即使名字相同 -> 拒绝")
 
     # 只锁 name:名字精确相等 -> 放行
-    only_name = {"locked_finder_id": "", "locked_name": "U.S.POLOASSN.免税仓"}
-    check(not check_account_lock(only_name, {"finder_id": "FID_Y", "name": "U.S.POLOASSN.免税仓"}),
+    only_name = {"locked_finder_id": "", "locked_name": "示范店·甲仓"}
+    check(not check_account_lock(only_name, {"finder_id": "FID_Y", "name": "示范店·甲仓"}),
           "只锁 name 时,名字相等 -> 放行")
 
 
@@ -70,16 +70,16 @@ class StubManager:
 
 def test_set_lock():
     print("\n=== B. set_account_lock 真实实现(_save_config 打桩) ===")
-    acc = {"id": "a1", "name": "U.S.POLOASSN.尚品仓", "_log_finder_id": "FID_A"}
+    acc = {"id": "a1", "name": "示范店·乙仓", "_log_finder_id": "FID_A"}
     m = StubManager([acc])
 
     check(m.set_account_lock("a1", True) is True, "锁定成功 -> True")
-    check(acc.get("locked_finder_id") == "FID_A" and acc.get("locked_name") == "U.S.POLOASSN.尚品仓",
+    check(acc.get("locked_finder_id") == "FID_A" and acc.get("locked_name") == "示范店·乙仓",
           f"locked_* 已写入 (fid={acc.get('locked_finder_id')!r} name={acc.get('locked_name')!r})")
     check(m.saved == 1, f"落盘被调用 1 次 (saved={m.saved})")
 
     st = m._account_status(acc, {})
-    check(st["locked"] is True and st["locked_name"] == "U.S.POLOASSN.尚品仓",
+    check(st["locked"] is True and st["locked_name"] == "示范店·乙仓",
           f"status 输出 locked/locked_name ({st['locked']}, {st['locked_name']!r})")
 
     check(m.set_account_lock("a1", False) is True, "解锁成功 -> True")
@@ -165,7 +165,7 @@ async def test_routes():
     check(st == 404, f"解锁不存在的账号 -> 404 (st={st})")
 
     # finalize 被锁定拒绝 -> 403 且带中文原因
-    msg = "该账号已锁定微信「U.S.POLOASSN.免税仓」,本次登录的是「U.S.POLOASSN.免税仓2号」,已拒绝保存"
+    msg = "该账号已锁定微信「示范店·甲仓」,本次登录的是「示范店·甲仓2号」,已拒绝保存"
 
     class FinalizeMgr:
         async def finalize_login(self, sid, account_id, name):

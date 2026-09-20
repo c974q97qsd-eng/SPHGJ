@@ -149,6 +149,7 @@ class AccountWorker:
         else:
             logger.warning(f"[{self.account['id']}] 未登录(当前:{self.page.url}),请重新扫码")
         # _aid 每次登录会变,实时从 profile localStorage 读当前会话 _aid/_log_finder_id
+        ls = {}
         try:
             ls = await self.page.evaluate("""() => {
                 const aid = localStorage.getItem('__ml::aid') || localStorage.getItem('__rx::aid') || '';
@@ -163,6 +164,15 @@ class AccountWorker:
                 self.account["_log_finder_id"] = ls["finder_id"]
         except Exception as e:
             logger.debug(f"[{self.account['id']}] 读 localStorage _aid 失败,用 config 旧值: {e}")
+        # 锁定校验:profile 里现存的登录身份若与账号锁定的微信不符(历史脏登录态,比如
+        # 之前用错微信扫过),直接按未登录处理 —— 引擎会走自动重登,用户用锁定微信重扫。
+        # 否则会拿错的登录态抓数据,把别的账号的数据记到本账号名下。
+        locked_fid = (self.account.get("locked_finder_id") or "").strip()
+        cur_fid = (ls.get("finder_id") or "").strip()
+        if self.logged_in and locked_fid and cur_fid and cur_fid != locked_fid:
+            logger.warning(f"[{self.account['id']}] 当前登录身份与锁定微信不一致"
+                           f"(登录={cur_fid[:12]}… 应={locked_fid[:12]}…),按未登录处理,需重新扫码")
+            self.logged_in = False
         self.api = WxApiClient(self.page, self.account, self.config, self.storage)
         # 重绑:自动回复/评论/删除/抓取器都持有 api 引用,重开浏览器后统一指向新客户端
         if self.auto_reply is not None: self.auto_reply.api = self.api
@@ -825,6 +835,19 @@ class AccountManager:
         if not s:
             return False
         return await s.select_account(index)
+
+    async def retry_login_clean(self, sid):
+        """锁定冲突(扫了非锁定微信)确认后:重新进入全新登录环境等待扫码。
+
+        登录态在检测到冲突时已经清空,这里只原地重启扫码流程(sid 不变,
+        自动重登队列的 active 状态不受影响)。
+        """
+        s = self.login_sessions.get(sid)
+        if not s:
+            return None
+        if not await s.relaunch_clean():
+            return None
+        return s
 
     async def finalize_login(self, sid, account_id=None, name=None):
         s = self.login_sessions.pop(sid, None)

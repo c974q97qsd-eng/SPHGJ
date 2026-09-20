@@ -1,9 +1,24 @@
 import { useEffect, useRef, useState, useCallback } from "react"
 
+/** 「扫错微信」冲突详情:后端识别到本次扫码的不是该账号锁定的微信,已清除登录态。 */
+export interface LockConflictInfo {
+  sid: string
+  account_id: string
+  account_name: string
+  locked_name: string
+  scanned_name: string
+  reason: string
+  cleared: boolean
+  cleared_msg: string
+  /** 会话是否仍可原地重开扫码(false=需用户点该账号卡片的「重新登录」) */
+  can_retry: boolean
+}
+
 /** 后端推送事件类型。 */
 export type WsEvent =
   | { event: "qr_update"; payload: { sid: string; image: string } }
-  | { event: "login_status"; payload: { sid: string; status: string; captured?: { aid: string; finder_id: string; name: string }; error?: string; headed?: boolean; auto_selected?: string } }
+  | { event: "login_status"; payload: { sid: string; status: string; captured?: { aid: string; finder_id: string; name: string }; error?: string; headed?: boolean; auto_selected?: string; lock_conflict?: LockConflictInfo } }
+  | { event: "login_lock_conflict"; payload: LockConflictInfo }
   | { event: "account_select"; payload: { sid: string; accounts: { name: string; role: string }[] } }
   | { event: "engine_status"; payload: { running: boolean; accounts: unknown[] } }
   | { event: "comments_update"; payload: { account_id: string; comments: unknown[] } }
