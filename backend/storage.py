@@ -16,6 +16,8 @@ class Storage:
         self.db_path = db_path
         self._stats_cache = None
         self._stats_cache_ts = 0.0
+        self._own_ident_cache = {}
+        self._own_ident_ts = 0.0
         self._init()
 
     def _conn(self):
@@ -30,6 +32,7 @@ class Storage:
         c.execute("""CREATE TABLE IF NOT EXISTS comments(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             account_id TEXT, export_id TEXT, comment_id TEXT UNIQUE,
+            author_id TEXT,
             nickname TEXT, content TEXT, head_url TEXT, create_time INTEGER,
             like_count INTEGER, read_flag INTEGER, replied INTEGER DEFAULT 0,
             deleted INTEGER DEFAULT 0,
@@ -84,27 +87,40 @@ class Storage:
             c.execute("ALTER TABLE post_fetch_meta ADD COLUMN full_synced INTEGER DEFAULT 0")
         except Exception:
             pass
+        # 迁移:补 author_id(评论作者的视频号 id,接口 raw.username。用于精准识别「自己发出的评论」)
+        try:
+            c.execute("ALTER TABLE comments ADD COLUMN author_id TEXT")
+        except Exception:
+            pass
         c.execute("PRAGMA wal_checkpoint(TRUNCATE)")  # 启动时收敛 WAL,避免长期运行 WAL 膨胀
         c.commit()
         c.close()
+        # 历史评论 raw 里本就带作者 id,补一次(只处理缺列的行)
+        try:
+            self._backfill_author_ids()
+        except Exception:
+            pass
 
     def upsert_comment(self, account_id, export_id, comment):
         c = self._conn()
         cid = comment.get("commentId")
+        # 作者身份:接口每条评论都带 username(作者的视频号 id),同一次响应里与评论同源,不会错位
+        author_id = comment.get("username") or comment.get("commentUsername") or ""
         # INSERT OR IGNORE:新评论插入(replied=0);已存在的不动 replied
         c.execute("""INSERT OR IGNORE INTO comments
-            (account_id,export_id,comment_id,nickname,content,head_url,create_time,like_count,read_flag,replied,raw,fetched_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (account_id, export_id, cid, comment.get("commentNickname"),
+            (account_id,export_id,comment_id,author_id,nickname,content,head_url,create_time,like_count,read_flag,replied,raw,fetched_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (account_id, export_id, cid, author_id, comment.get("commentNickname"),
              comment.get("commentContent"), comment.get("commentHeadurl"),
              int(comment.get("commentCreatetime", 0) or 0),
              int(comment.get("commentLikeCount", 0) or 0),
              1 if comment.get("readFlag") else 0, 0,
              json.dumps(comment, ensure_ascii=False), datetime.now().isoformat()))
         # UPDATE 其他字段(不覆盖 replied)
-        c.execute("""UPDATE comments SET nickname=?,content=?,head_url=?,create_time=?,like_count=?,read_flag=?,raw=?,fetched_at=?
+        c.execute("""UPDATE comments SET author_id=CASE WHEN COALESCE(?,'')<>'' THEN ? ELSE author_id END,
+                nickname=?,content=?,head_url=?,create_time=?,like_count=?,read_flag=?,raw=?,fetched_at=?
             WHERE comment_id=?""",
-            (comment.get("commentNickname"), comment.get("commentContent"), comment.get("commentHeadurl"),
+            (author_id, author_id, comment.get("commentNickname"), comment.get("commentContent"), comment.get("commentHeadurl"),
              int(comment.get("commentCreatetime", 0) or 0), int(comment.get("commentLikeCount", 0) or 0),
              1 if comment.get("readFlag") else 0, json.dumps(comment, ensure_ascii=False),
              datetime.now().isoformat(), cid))
@@ -205,8 +221,14 @@ class Storage:
 
     # ---------- 新增:分页查询 + 账号统计(供 API 层) ----------
     def query_comments(self, account_id=None, replied=None, q=None, limit=200, offset=0,
-                       hide_own=False):
-        """分页查询评论,返回 (list[dict], total)。"""
+                       hide_own=False, own_map=None):
+        """分页查询评论,返回 (list[dict], total)。
+
+        hide_own=True 隐藏「自己发出的评论」,判据(并集,见 _own_exclusion):
+          1) comment_id 在本工具登记表(自动评论+置顶 / 自动回复 / 手动回复)
+          2) 作者就是本账号自己 —— 接口给的作者视频号 id 命中 own_map[acc]['ids'],
+             或昵称命中 ['names'](账号改名/旧数据 raw 缺 id 时兜底)
+        """
         c = self._conn()
         where, args = ["deleted=0"], []
         if account_id:
@@ -216,9 +238,9 @@ class Storage:
         elif replied is False:
             where.append("replied=0")
         if hide_own:
-            # 隐藏本工具发出的评论(自动评论+置顶 / 自动回复 / 手动回复)
-            where.append("comment_id NOT IN (SELECT comment_id FROM own_comments "
-                         "UNION SELECT comment_id FROM auto_commented WHERE comment_id<>'')")
+            # 隐藏自己发出的评论:本工具登记过的 id + 作者身份命中本账号
+            _sql, _a = self._own_exclusion(own_map)
+            where.append(_sql); args.extend(_a)
         if q:
             where.append("(content LIKE ? OR nickname LIKE ?)"); args.extend([f"%{q}%", f"%{q}%"])
         clause = (" WHERE " + " AND ".join(where)) if where else ""
@@ -514,6 +536,107 @@ class Storage:
                 c.execute("UPDATE post_fetch_meta SET full_synced=? WHERE account_id=?",
                           (1 if full_synced else 0, account_id))
             c.commit()
+        finally:
+            c.close()
+
+    @staticmethod
+    def _own_exclusion(own_map=None):
+        """生成「排除自己发出的评论」的 WHERE 片段,返回 (sql, args)。
+
+        判据一:comment_id 在本工具登记表里(自动评论+置顶 / 自动回复 / 手动回复)。
+        判据二:作者身份与本账号自己一致 —— 优先视频号 id(权威,作者改名也不受影响),
+               昵称兜底(旧数据 raw 里可能没有作者 id)。
+        author_id 为空、昵称也对不上时无法判定 -> 保持显示,绝不误伤客户评论。
+        """
+        parts = ["comment_id IN (SELECT comment_id FROM own_comments WHERE COALESCE(comment_id,'')<>''"
+                 " UNION SELECT comment_id FROM auto_commented WHERE COALESCE(comment_id,'')<>'')"]
+        args = []
+        for acc, ident in sorted((own_map or {}).items()):
+            ids = sorted({x for x in (ident.get("ids") or []) if x})
+            names = sorted({x for x in (ident.get("names") or []) if x})
+            cond, sub = [], []
+            if ids:
+                cond.append("COALESCE(author_id,'') IN (%s)" % ",".join(["?"] * len(ids)))
+                sub.extend(ids)
+            if names:
+                cond.append("nickname IN (%s)" % ",".join(["?"] * len(names)))
+                sub.extend(names)
+            if cond:
+                # 注意参数顺序必须与 SQL 里占位符出现的顺序一致:account_id 在最前
+                parts.append("(account_id=? AND (%s))" % " OR ".join(cond))
+                args.append(acc)
+                args.extend(sub)
+        return "(NOT (%s))" % " OR ".join(parts), args
+
+    def own_identities_from_library(self, min_count=10, min_ratio=0.2,
+                                    allow_ids=None, allow_names=None, ttl=60):
+        """从库内统计每个账号「自己」的作者 id / 昵称(缓存 ttl 秒)。
+
+        用途:账号被删掉重建(account_id 变了)后,旧 id 上还留着以前自己发的评论,
+        配置里已经没有这个账号,靠统计也能认出来。
+
+        依据:一个账号收到的评论里,自己发出的评论数远多于任何单个客户;
+        取该账号出现次数最多、且 >= min_count 条、且占比 >= min_ratio 的作者 id 与昵称。
+
+        allow_ids / allow_names:已知身份白名单(调用方传 accounts 里所有账号的
+        finder_id / 名称)。给了就只认命中白名单的项 —— 否则一个刷屏客户
+        (80% 的评论都是他)会被误判成「自己」,把他的真实评论也藏起来。
+        """
+        import time
+        now = time.time()
+        ckey = (min_count, min_ratio,
+                None if allow_ids is None else tuple(sorted(allow_ids)),
+                None if allow_names is None else tuple(sorted(allow_names)))
+        cached = self._own_ident_cache.get(ckey)
+        if cached is not None and now - cached[0] < ttl:
+            return cached[1]
+        out = {}
+        c = self._conn()
+        try:
+            for col, key, allow in (("author_id", "ids", allow_ids),
+                                    ("nickname", "names", allow_names)):
+                rows = c.execute(
+                    f"""SELECT account_id, {col}, COUNT(*) FROM comments
+                        WHERE deleted=0 AND COALESCE({col},'')<>''
+                        GROUP BY account_id, {col}""").fetchall()
+                total = {}
+                for acc, _v, n in rows:
+                    total[acc] = total.get(acc, 0) + n
+                best = {}
+                for acc, v, n in rows:
+                    if allow is not None and v not in allow:
+                        continue
+                    if n < min_count or n < total[acc] * min_ratio:
+                        continue
+                    if acc not in best or n > best[acc][1]:
+                        best[acc] = (v, n)
+                for acc, (v, _n) in best.items():
+                    out.setdefault(acc, {"ids": set(), "names": set()})[key].add(v)
+        finally:
+            c.close()
+        self._own_ident_cache[ckey] = (now, out)
+        self._own_ident_ts = now
+        return out
+
+    def _backfill_author_ids(self):
+        """把历史评论 raw 里的作者视频号 id 回填到 author_id 列(只处理缺失行)。"""
+        c = self._conn()
+        try:
+            rows = c.execute(
+                "SELECT comment_id, raw FROM comments "
+                "WHERE (author_id IS NULL OR author_id='') AND raw LIKE '%username%'").fetchall()
+            n = 0
+            for cid, raw in rows:
+                try:
+                    aid = (json.loads(raw) or {}).get("username") or ""
+                except Exception:
+                    aid = ""
+                if aid:
+                    c.execute("UPDATE comments SET author_id=? WHERE comment_id=?", (aid, cid))
+                    n += 1
+            if n:
+                c.commit()
+            return n
         finally:
             c.close()
 

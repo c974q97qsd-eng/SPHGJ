@@ -1051,6 +1051,41 @@ async def live_screen_status():
 
 
 # ===================== 评论 =====================
+def _own_identity_map():
+    """每个账号「自己的身份」(视频号 id + 昵称),供「隐藏发出的评论」判定。两来源取并集:
+
+    1) accounts 配置:登录抓到的 _log_finder_id / locked_finder_id 与账号名;
+    2) 库内统计:该账号评论里出现最多且占比够高的作者 id / 昵称
+       (账号删掉重建、account_id 变了时,旧 id 上的自己评论也能认出来)。
+       只认「命中已知账号身份白名单」的统计结果,避免把刷屏客户误判成自己。
+    """
+    m = {}
+
+    def add(acc_id, ids=(), names=()):
+        if not acc_id:
+            return
+        e = m.setdefault(acc_id, {"ids": set(), "names": set()})
+        e["ids"].update(x for x in ids if x)
+        e["names"].update(x for x in names if x)
+
+    allow_ids, allow_names = set(), set()
+    for a in config.get("accounts", []):
+        acc = a.get("id")
+        ids = (a.get("_log_finder_id"), a.get("locked_finder_id"))
+        names = (a.get("name"), a.get("locked_name"))
+        allow_ids.update(x for x in ids if x)
+        allow_names.update(x for x in names if x)
+        add(acc, ids=ids, names=names)
+    try:
+        learned = storage.own_identities_from_library(allow_ids=allow_ids,
+                                                      allow_names=allow_names)
+        for acc, ident in learned.items():
+            add(acc, ids=ident.get("ids") or (), names=ident.get("names") or ())
+    except Exception:
+        logger.exception("统计自己评论身份失败")
+    return m
+
+
 @app.get("/api/comments")
 async def get_comments(
     account_id: Optional[str] = None,
@@ -1062,6 +1097,7 @@ async def get_comments(
 ):
     items, total = storage.query_comments(account_id=account_id, replied=replied, q=q,
                                           hide_own=bool(hide_own),
+                                          own_map=_own_identity_map() if hide_own else None,
                                           limit=limit, offset=offset)
     return {"items": items, "total": total, "limit": limit, "offset": offset}
 
