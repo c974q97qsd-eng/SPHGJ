@@ -19,7 +19,7 @@ from urllib.parse import urlparse, parse_qs
 import logging
 logger = logging.getLogger("sphgj")
 from .browser import launch_stealth, close_context_safely
-from .selectors import (QR_CANDIDATES, ACCOUNT_NAME_CANDIDATES, COMMENT_URL, LOGIN_URL,
+from .selectors import (QR_CANDIDATES, COMMENT_URL, LOGIN_URL,
                         ACCOUNT_SELECT_MARKERS, ACCOUNT_SELECT_ROLE_WORDS)
 
 
@@ -96,9 +96,9 @@ class LoginSession:
         # pending|waiting_scan|scanned|capturing|success|failed|cancelled|open_window
         self.status = "pending"
         self.qr_image = None
-        self.captured = {"aid": "", "finder_id": "",
-                         "name": (account or {}).get("name", ""),
-                         "wx_name": (account or {}).get("_wx_name", "")}
+        # name/wx_name 一律从空开始:只由 auth/auth_data 的 finderUser 对象写入,
+        # 不预填 relogin 的旧值(旧值可能就是被抓坏的「切换视频号 取消切换」)。
+        self.captured = {"aid": "", "finder_id": "", "name": "", "wx_name": ""}
         self._tasks = []
         self._finalized = False
         self.auto_finalize = auto_finalize  # auto 模式:captured 后后端自动落盘,不等前端调 finalize
@@ -221,8 +221,8 @@ class LoginSession:
         避免刚进页面就误清登录态。返回 (冲突?, 本次登录名, 原因)。
 
         finder_id 是账号唯一标识,是最可靠依据;只有锁定信息里没有 finder_id 的老数据
-        才退回名字比对(注意 relogin 时 captured["name"] 预填了账号名,单独用它比对不可靠,
-        故只在 finder_id 缺失时才用)。
+        才退回名字比对。captured["name"] 现在只来自 auth_data 的 finderUser.nickname,
+        与 finder_id 同属一个对象(同源可信),不再有"预填旧名"的干扰。
         """
         acc = self.account or {}
         locked_fid = (acc.get("locked_finder_id") or "").strip()
@@ -261,13 +261,16 @@ class LoginSession:
         for a in accounts or []:
             if locked_name and (a.get("name") or "").strip() == locked_name:
                 return False
-            if locked_fid and locked_fid in (a.get("_raw") or ""):
+            if locked_fid and (a.get("finder_id") or "").strip() == locked_fid:
                 return False
-        txt = await self._body_text() or ""
-        if locked_name and locked_name in txt:
-            return False
-        if locked_fid and locked_fid in txt:
-            return False
+        # 接口数据源(auth_finder_list)每项都带完整 finder_id -> 列表即权威,无需再看正文;
+        # 仅当退回 DOM 枚举(无任何 finder_id)时才用正文兜底,避免懒加载漏项误判。
+        if not any((a.get("finder_id") or "").strip() for a in (accounts or [])):
+            txt = await self._body_text() or ""
+            if locked_name and locked_name in txt:
+                return False
+            if locked_fid and locked_fid in txt:
+                return False
         return True
 
     async def _mark_lock_conflict(self, reason, scanned="", can_retry=True):
@@ -331,9 +334,7 @@ class LoginSession:
         self.lock_conflict = None
         self.qr_image = None
         self._qr_raw = None
-        self.captured = {"aid": "", "finder_id": "",
-                         "name": (self.account or {}).get("name", ""),
-                         "wx_name": (self.account or {}).get("_wx_name", "")}
+        self.captured = {"aid": "", "finder_id": "", "name": "", "wx_name": ""}
         await self.start(headed=self._headed)
         return True
 
@@ -456,13 +457,73 @@ class LoginSession:
             return True
         return sum(txt.count(w) for w in ACCOUNT_SELECT_ROLE_WORDS) >= 2
 
+    async def _read_aid(self):
+        """取 _aid:优先用已抓到的,否则现场读 localStorage。
+
+        选择页阶段(扫码后、还没进平台页)self.captured["aid"] 仍为空,但页面同源,
+        localStorage 里通常已有 __ml::aid;不补这一步,auth_finder_list 会带空 _aid 请求。
+        """
+        aid = (self.captured.get("aid") or "").strip()
+        if aid:
+            return aid
+        try:
+            aid = await self.page.evaluate("""() => {
+                const a = localStorage.getItem('__ml::aid') || localStorage.getItem('__rx::aid') || '';
+                try { return JSON.parse(a) || ''; } catch(e) { return a.replace(/^"|"$/g, ''); }
+            }""")
+        except Exception:
+            aid = ""
+        return str(aid or "").strip()
+
+    async def _fetch_finder_list(self):
+        """调 auth/auth_finder_list 取「选择视频号登录」页的账号列表(选择页的真实数据源)。
+
+        返回 [{"name": nickname, "role": roleName, "finder_id": finderUsername, "_raw": ...}],
+        取不到返回 []。每项的 nickname 与 finderUsername 来自同一个对象,成对且精准,
+        页面卡片就是渲染它;从此不再靠切页面文本来认账号名。
+        """
+        aid = await self._read_aid()
+        try:
+            txt = await self.page.evaluate("""async (aid) => {
+                const url = `https://channels.weixin.qq.com/cgi-bin/mmfinderassistant-bin/auth/auth_finder_list?_aid=${aid}&_pageUrl=${encodeURIComponent('https://channels.weixin.qq.com/platform')}`;
+                const r = await fetch(url, { method:'POST',
+                    headers:{'Content-Type':'application/json'}, body:'{}', credentials:'include' });
+                return await r.text();
+            }""", aid)
+            data = json.loads(txt)
+            if data.get("errCode") not in (0, None):
+                logger.debug(f"[login:{self.sid}] auth_finder_list errCode={data.get('errCode')} "
+                             f"{data.get('errMsg')}")
+                return []
+            rows = ((data.get("data") or {}).get("finderList")) or []
+        except Exception as e:
+            logger.debug(f"[login:{self.sid}] auth_finder_list 取列表失败: {e}")
+            return []
+        items = []
+        for r in rows:
+            nm = (r.get("nickname") or "").strip()
+            fid = (r.get("finderUsername") or "").strip()
+            if not nm and not fid:
+                continue
+            role = (r.get("roleName") or "").strip()
+            items.append({"name": nm, "role": role, "finder_id": fid,
+                          "_raw": nm, "_blocked": r.get("spamFlag") == 1})
+        if items:
+            logger.info(f"[login:{self.sid}] auth_finder_list 返回 {len(items)} 个账号: "
+                        f"{[(i['name'], i['role']) for i in items]}")
+        return items
+
     async def _enumerate_select_accounts(self, retries=5):
         """枚举选择页上的账号卡片,返回 [{name, role, _raw}, ...]。
 
-        以「勾选控件」为锚点向上找账号行(最稳:选择页每行都有勾选框),
-        失败再退回按 class 关键字猜容器,最后退回按正文行切分。
-        同时向下滚动触发懒加载(列表不止 3 个)。
+        首选官方接口 auth/auth_finder_list(选择页卡片的真实数据源):名字与 finder_id
+        成对返回,精准且可直接精确匹配。接口不可用时才退回 DOM 文本枚举 —— 此时名字
+        仅用于展示与点击定位,绝不会写进 captured["name"](那只由 auth_data 写入)。
         """
+        api_items = await self._fetch_finder_list()
+        if api_items:
+            self._select_names = [i["name"] for i in api_items]
+            return api_items
         js = """() => {
             const out = [];
             const seen = new Set();
@@ -536,7 +597,7 @@ class LoginSession:
                         name = t.replace(kw, "").strip().strip("\u00b7|\uff0c\u2014\u2013, ")
                         break
                 if name:
-                    items.append({"name": name, "role": role, "_raw": t})
+                    items.append({"name": name, "role": role, "finder_id": "", "_raw": t})
             if items:
                 logger.info(f"[login:{self.sid}] 选择页枚举到 {len(items)} 个账号: "
                             f"{[(i['name'], i['role']) for i in items]}")
@@ -665,7 +726,8 @@ class LoginSession:
             if locked_fid or locked_name:
                 # 锁定态:只认锁定的那个微信,其余一律不自动点(宁可交给用户,也不误选)
                 for i, acc in enumerate(accounts):
-                    if (locked_fid and locked_fid in acc.get("_raw", "")) \
+                    afid = (acc.get("finder_id") or "").strip()
+                    if (locked_fid and afid and afid == locked_fid) \
                             or (locked_name and acc["name"] == locked_name):
                         auto_idx = i
                         break
@@ -683,10 +745,11 @@ class LoginSession:
             else:
                 for i, acc in enumerate(accounts):
                     nm = acc["name"]
-                    # 仅 name 精确相等 或 wx_name 精确相等 或 fid 子串命中(raw 含 finder id)
+                    afid = (acc.get("finder_id") or "").strip()
+                    # 一律精确相等:name / wx_name / finder_id(接口列表自带完整 id)
                     if (target_name and nm == target_name) \
                             or (wx_name and nm == wx_name) \
-                            or (fid and fid in acc.get("_raw", "")):
+                            or (fid and afid and afid == fid):
                         auto_idx = i
                         break
         if auto_idx >= 0:
@@ -784,7 +847,13 @@ class LoginSession:
         """抓 _aid/_log_finder_id + 账号名。实测两者均在 localStorage(同源页可直接读),
         无需跳评论页拦截 post_list:_aid=localStorage.__ml::aid(去 JSON 引号),
         _log_finder_id=localStorage.finder_username(与 post_list body 完全一致)。
-        账号名用顶栏 .account-info .name(首页/评论页同一组件)。扫码后停在当前页即可,0 跳转。"""
+
+        账号名**只取官方接口字段**:auth/auth_data 的 data.finderUser.nickname
+        (与同对象里的 finderUsername 成对返回,不可能错位);接口没给则用
+        auth_finder_list 按 finder_id 精确反查;仍没有才用 finder_id 前缀占位。
+        全程不读页面文本 —— 顶栏 .account-info 下本就没有 .name,回退到容器会把
+        「切换视频号/取消切换」等控件文案当名字抓走(线上已踩过两次)。
+        """
         # 1. localStorage 直接取 _aid / _log_finder_id(扫码后当前页即有)
         vals = {}
         for _ in range(6):
@@ -803,11 +872,20 @@ class LoginSession:
         if vals.get("finder_id"):
             self.captured["finder_id"] = vals["finder_id"]
         logger.info(f"[login:{self.sid}] localStorage 取 _aid={self.captured['aid'][:20]} _log_finder_id={self.captured['finder_id'][:20]}")
-        # 2. 顶栏抓账号名(.account-info .name)
+        # 2. 账号名 + 身份:唯一权威来源 = auth/auth_data 的 data.finderUser
+        #    finderUser.nickname(视频号名) 与 finderUser.finderUsername(finder_id)
+        #    是同一个对象的两个字段,成对返回,不存在"名字与 id 错位"的可能。
+        #    不再用 CSS 选择器抓页面文本:顶栏 .account-info 下根本没有 .name,
+        #    回退到容器会把「切换视频号/取消切换」等控件文案一起抓进来(text_content
+        #    连隐藏节点都算),这正是账号名被抓错的根因。
         await self.page.wait_for_timeout(2500)
-        dom_name = await self._capture_name()
-        if dom_name:
-            self.captured["name"] = dom_name
+        ident = await self._fetch_finder_identity()
+        if ident["finder_id"]:
+            self.captured["finder_id"] = ident["finder_id"]
+        if ident["nickname"]:
+            self.captured["name"] = ident["nickname"]
+        if ident["wx_name"]:
+            self.captured["wx_name"] = ident["wx_name"]
         # 3. fallback:localStorage 没拿全 _aid/finder_id -> 跳评论页拦截 post_list
         if not (self.captured["aid"] and self.captured["finder_id"]):
             logger.info(f"[login:{self.sid}] localStorage 未取全,回退评论页拦截 post_list")
@@ -817,55 +895,74 @@ class LoginSession:
                     if self.captured["aid"] and self.captured["finder_id"]:
                         break
                     await asyncio.sleep(0.5)
+                # 落到评论页后再取一次身份(此前可能还没有 _aid)
+                ident = await self._fetch_finder_identity()
+                if ident["finder_id"]:
+                    self.captured["finder_id"] = ident["finder_id"]
+                if ident["nickname"]:
+                    self.captured["name"] = ident["nickname"]
+                if ident["wx_name"]:
+                    self.captured["wx_name"] = ident["wx_name"]
             except Exception as e:
                 logger.warning(f"[login:{self.sid}] 回退跳转评论页失败: {e}")
-        # 4. 登录微信:调 auth/auth_data API 取 userAttr.nickname(API 比 DOM 稳)
-        wx_name = await self._fetch_wx_name()
-        if wx_name:
-            self.captured["wx_name"] = wx_name
-        # 5. fallback:没抓到名字 -> 跳 /platform 首页
-        if not dom_name:
-            try:
-                await self.page.goto("https://channels.weixin.qq.com/platform",
-                                     wait_until="domcontentloaded", timeout=8000)
-                await self.page.wait_for_timeout(3000)
-                dom_name = await self._capture_name()
-                if dom_name:
-                    self.captured["name"] = dom_name
-            except Exception as e:
-                logger.warning(f"[login:{self.sid}] 跳 /platform 抓账号名失败: {e}")
-        cur = self.captured.get("name", "")
-        if not cur or cur == "未命名" or re.match(r"^(v2_|\d+$)", cur):
-            self.captured["name"] = cur or self.captured["finder_id"][:12] or "未命名"
+        # 4. 兜底一:auth_data 没给名字 -> 用 auth_finder_list 按 finder_id 精确反查。
+        #    仍是官方接口、仍是"名字与 id 同一条记录",只是换个口子取,不是猜。
+        if not (self.captured.get("name") or "").strip():
+            fid = (self.captured.get("finder_id") or "").strip()
+            if fid:
+                for it in await self._fetch_finder_list():
+                    if (it.get("finder_id") or "").strip() == fid and it.get("name"):
+                        self.captured["name"] = it["name"]
+                        logger.info(f"[login:{self.sid}] auth_data 未给名字,"
+                                    f"已由 auth_finder_list 按 finder_id 反查到 {it['name']!r}")
+                        break
+        # 5. 兜底二:两个接口都没给 -> 用 finder_id 前缀占位(明确是占位符,不是猜出来的名字)。
+        #    绝不回退到页面文本 —— 「切换视频号 取消切换」正是那样被写进 config 的。
+        if not (self.captured.get("name") or "").strip():
+            fid = (self.captured.get("finder_id") or "").strip()
+            self.captured["name"] = fid[:12] if fid else "未命名"
+            logger.warning(f"[login:{self.sid}] 两个接口均未返回视频号名称,"
+                           f"name 暂用 finder_id 前缀占位={self.captured['name']!r}(界面可手动改名)")
 
-    async def _capture_name(self):
-        for sel in ACCOUNT_NAME_CANDIDATES:
-            try:
-                loc = self.page.locator(sel).first
-                if await loc.count():
-                    txt = (await loc.text_content(timeout=2000) or "").strip()
-                    if txt:
-                        return txt
-            except Exception:
-                continue
-        return None
+    async def _fetch_finder_identity(self):
+        """调 auth/auth_data,一次取回【视频号名 + finder_id + 扫码微信名】。
 
-    async def _fetch_wx_name(self):
-        """调 auth/auth_data(POST 空 body)取登录微信昵称(data.userAttr.nickname)。"""
-        aid = self.captured.get("aid") or ""
+        账号名的唯一权威来源(官方接口字段,前端顶栏显示的就是它):
+          data.finderUser.nickname       -> 视频号名称
+          data.finderUser.finderUsername -> 视频号 finder_id(与 localStorage 的
+                                            finder_username 同值,互为交叉校验)
+          data.userAttr.nickname         -> 本次扫码微信的昵称(扫错微信保护用)
+
+        三者同在一次响应里取回:昵称与 id 天然配对,不存在把别的元素文字当名字的可能。
+        取不到一律返回空串(不猜、不回退到 DOM 文本)。
+        """
+        out = {"nickname": "", "finder_id": "", "wx_name": ""}
+        aid = await self._read_aid()
         if not aid:
-            return ""
-        try:
-            txt = await self.page.evaluate("""async (aid) => {
-                const url = `https://channels.weixin.qq.com/cgi-bin/mmfinderassistant-bin/auth/auth_data?_aid=${aid}&_pageUrl=${encodeURIComponent('https://channels.weixin.qq.com/micro/interaction/comment')}`;
-                const r = await fetch(url, { method:'POST', headers:{'Content-Type':'application/json'}, body:'{}', credentials:'include' });
-                return await r.text();
-            }""", aid)
-            data = json.loads(txt)
-            return ((data.get("data") or {}).get("userAttr") or {}).get("nickname") or ""
-        except Exception as e:
-            logger.debug(f"[login:{self.sid}] auth_data 取微信名失败: {e}")
-            return ""
+            return out
+        for attempt in range(3):
+            try:
+                txt = await self.page.evaluate("""async (aid) => {
+                    const url = `https://channels.weixin.qq.com/cgi-bin/mmfinderassistant-bin/auth/auth_data?_aid=${aid}&_pageUrl=${encodeURIComponent('https://channels.weixin.qq.com/micro/interaction/comment')}`;
+                    const r = await fetch(url, { method:'POST', headers:{'Content-Type':'application/json'}, body:'{}', credentials:'include' });
+                    return await r.text();
+                }""", aid)
+                data = json.loads(txt)
+                d = data.get("data") or {}
+                fu = d.get("finderUser") or {}
+                out["nickname"] = (fu.get("nickname") or "").strip()
+                out["finder_id"] = (fu.get("finderUsername") or "").strip()
+                out["wx_name"] = ((d.get("userAttr") or {}).get("nickname") or "").strip()
+                if out["finder_id"]:
+                    logger.info(f"[login:{self.sid}] auth_data: 视频号名={out['nickname']!r} "
+                                f"finder_id={out['finder_id'][:20]!r} 微信={out['wx_name']!r}")
+                    return out
+                logger.debug(f"[login:{self.sid}] auth_data 第{attempt + 1}次未返回 finderUser: "
+                             f"{(txt or '')[:150]}")
+            except Exception as e:
+                logger.warning(f"[login:{self.sid}] auth_data 取视频号身份失败(第{attempt + 1}次): {e}")
+            await asyncio.sleep(1.0)
+        return out
 
     # ---------- 前端确认后落盘 ----------
     async def finalize_with_id(self, account_id=None, name=None):

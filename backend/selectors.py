@@ -15,16 +15,11 @@ QR_CANDIDATES = [
     ".login_qrcode img",
 ]
 
-# 登录后平台顶栏账号名(用于自动抓取「名称」)
-ACCOUNT_NAME_CANDIDATES = [
-    ".account-info .name",
-    ".account-info",
-    ".weui-desktop-account__name",
-    ".account-name",
-    "[class*='account'] [class*='name']",
-    ".weui-desktop-nav__account-name",
-    ".header-account-name",
-]
+# 说明:平台顶栏「账号名」不再用 CSS 选择器抓取。
+# 实测 .account-info .name 并不存在(该容器内是 account-info-top/avatar-and-nickname/
+# nickname,且属作品预览组件),回退到容器会把「切换视频号/取消切换」等控件文案一起
+# text_content 抓出来,导致账号名被写坏。现改为从 auth/auth_data 的 data.finderUser
+# 取 nickname(与 finderUsername 同对象成对返回),见 login_capture._fetch_finder_identity。
 
 # 扫码后「选择视频号登录」页标记词。
 # 该页 URL 仍含 /login(实测),因此只能按 DOM 文本判定;标记词不得与二维码登录页
