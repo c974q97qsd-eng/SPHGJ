@@ -8,7 +8,7 @@ import { Switch } from "@/components/ui/switch"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { EmptyState, LoadingState, ErrorState } from "@/components/common/states"
 import { useAccounts } from "@/hooks/useAccounts"
-import { api, type PostItem, type PostsJobState } from "@/lib/api"
+import { api, type PostItem, type PostMeta, type PostsJobState } from "@/lib/api"
 import { fmtTime, cn } from "@/lib/utils"
 import { toast } from "sonner"
 import {
@@ -52,7 +52,7 @@ export function PostsPage() {
   const [job, setJob] = useState<PostsJobState | null>(null)
   const [refreshing, setRefreshing] = useState(false)
   const [batching, setBatching] = useState(false)
-  const [meta, setMeta] = useState<Record<string, { last_refresh: string | null; last_pages: number; today_requests: number }>>({})
+  const [meta, setMeta] = useState<Record<string, PostMeta>>({})
 
   // 自动刷新配置
   const [autoRefresh, setAutoRefresh] = useState(true)
@@ -174,6 +174,7 @@ export function PostsPage() {
   const toggleSortDir = () => { setAsc((v) => !v); setOffset(0) }
 
   const accName = (id: string) => accounts.find((a) => a.id === id)?.name || id
+  const pendingFull = accounts.filter((a) => { const m = meta[a.id]; return m && !m.full_synced })
   const totalToday = Object.values(meta).reduce((s, m) => s + (m.today_requests || 0), 0)
   const lastRefresh = Object.values(meta)
     .map((m) => m.last_refresh).filter(Boolean).sort().reverse()[0]
@@ -232,6 +233,11 @@ export function PostsPage() {
           <span>共 {total} 个作品{checked.size > 0 && ` · 已选 ${checked.size} 个`}</span>
           {lastRefresh && <span>上次更新:{new Date(lastRefresh).toLocaleString()}</span>}
           <span>今日已请求 {totalToday} 次</span>
+          {pendingFull.length > 0 && (
+            <span className="text-amber-600 dark:text-amber-500">
+              {pendingFull.length} 个账号作品未完整同步,点「刷新作品」补全
+            </span>
+          )}
           <div className="flex items-center gap-2 ml-auto">
             <span>每日自动刷新({autoHour}:00 在线账号)</span>
             <Switch checked={autoRefresh} onCheckedChange={(v) => { setAutoRefresh(v); saveAuto(v, autoHour) }} aria-label="每日自动刷新" />

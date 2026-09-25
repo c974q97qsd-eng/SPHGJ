@@ -1321,7 +1321,8 @@ async def _do_posts_refresh(aids):
                 storage.set_post_fetch_meta(
                     aid, last_refresh=datetime.now().isoformat(),
                     last_pages=int(r.get("pages") or 0),
-                    add_requests=int(r.get("pages") or 0) + int(r.get("covers") or 0))
+                    add_requests=int(r.get("pages") or 0) + int(r.get("covers") or 0),
+                    full_synced=1 if r.get("full") else None)
             logger.info(f"[posts] {aid} 刷新完成: {st}")
         except Exception as e:
             st["status"] = "error"; st["error"] = str(e)[:200]

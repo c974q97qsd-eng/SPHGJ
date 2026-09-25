@@ -27,8 +27,8 @@ const NAV = [
   { to: "/comments", label: "评论", icon: MessageSquare },
   { to: "/auto-reply", label: "自动回复", icon: Reply },
   { to: "/auto-delete", label: "自动删除", icon: Trash2 },
-  { to: "/live-screen", label: "直播大屏", icon: Monitor },
   { to: "/posts", label: "作品管理", icon: Clapperboard },
+  { to: "/live-screen", label: "直播大屏", icon: Monitor },
 ]
 
 const TITLES: Record<string, string> = { "/": "仪表盘", "/accounts": "账号管理", "/comments": "评论", "/auto-reply": "自动回复设置", "/auto-delete": "自动删除", "/live-screen": "直播大屏", "/posts": "作品管理" }

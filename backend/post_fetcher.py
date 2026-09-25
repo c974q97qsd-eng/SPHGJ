@@ -8,9 +8,12 @@
 
 增量闸门(压总请求量,任一命中即停翻页):
   1. pageSize=200 大页(2534 作品全量仅 13 页)
-  2. 早停:整页作品均已入库且 stat_sig(播放/赞/评签名)未变 -> 立即停
-  3. 页数上限 max_pages(默认 20)
-  4. 刷新冷却 cooldown_sec(默认 60s,距上次刷新不足则直接跳过)
+  2. 全量优先:本地未完整抓取过(full_synced=0)时禁止早停,一路翻到底把作品补全
+  3. 早停:已全量过 + 本页作品 id 全部已在库 -> 其后都是更老的作品,立即停
+     判据必须是「id 已知」且必须在入库前判定:曾在入库后判 stat_sig,
+     刚写入的行必然命中 -> 每个账号永远只抓第 1 页 200 条。
+  4. 页数上限 max_pages(默认 20)
+  5. 刷新冷却 cooldown_sec(默认 60s,距上次刷新不足则直接跳过)
 封面判重: md5(cover_url),文件在且 hash 未变 -> 一次请求都不发。
 
 所有状态写 storage;请求量记 post_fetch_meta 账本(今日请求次数可见)。
@@ -155,6 +158,9 @@ class PostFetcher:
             except Exception:
                 pass
 
+        # 本地是否完整抓取过一次:没全量过就不许早停,否则历史作品永远补不齐
+        allow_early_stop = bool(meta.get("full_synced"))
+
         context = worker.context
         if context is None:
             return {"error": "浏览器未打开"}
@@ -168,6 +174,7 @@ class PostFetcher:
         fetched_total = 0
         covers = 0
         early_stop = False
+        reached_end = False   # 是否已翻到最后一页(用于标记本地已全量)
         try:
             try:
                 await page.goto(PAGE_URL, wait_until="domcontentloaded", timeout=60000)
@@ -196,25 +203,30 @@ class PostFetcher:
                 data = j.get("data") or {}
                 lst = data.get("list") or []
                 if not lst:
+                    reached_end = True   # 空页 -> 到底了
                     break
                 rows = [_extract_post(p) for p in lst]
+                # 早停判据必须在入库前算:入库后再算的话,刚写入的行必然"已知"
+                page_all_known = await asyncio.to_thread(
+                    self.storage.posts_all_known, aid, [r["object_id"] for r in rows])
                 # 封面判重 + 下载(先算 cover_path 再入库)
                 covers += await self._ensure_covers(context, rows)
                 await asyncio.to_thread(self.storage.upsert_posts, aid, rows)
                 pages += 1
                 fetched_total += len(rows)
-                # 早停:整页已入库且统计签名未变 -> 后面都是老数据
-                if await asyncio.to_thread(
-                        self.storage.posts_known_and_unchanged, aid,
-                        [(r["object_id"], f"{r['read_count']}:{r['like_count']}:{r['comment_count']}")
-                         for r in rows]):
-                    early_stop = True
+                if allow_early_stop and page_all_known:
+                    early_stop = True    # 本页全已知 -> 后面都是更老的作品
                     break
                 if len(lst) < self.page_size:
+                    reached_end = True   # 不足一页 -> 到底了
                     break
                 await asyncio.sleep(1.2)  # 翻页间隔,防风控
+            full = bool(reached_end)
+            if full:
+                # 标记本地已全量:下次刷新才允许早停
+                await asyncio.to_thread(self.storage.set_post_fetch_meta, aid, full_synced=1)
             return {"pages": pages, "fetched": fetched_total, "covers": covers,
-                    "early_stop": early_stop}
+                    "early_stop": early_stop, "full": full}
         finally:
             try:
                 await page.close()

@@ -68,7 +68,8 @@ class Storage:
         c.execute("""CREATE TABLE IF NOT EXISTS post_fetch_meta(
             account_id TEXT PRIMARY KEY,
             last_refresh TEXT, last_pages INTEGER,
-            today_date TEXT, today_requests INTEGER)""")
+            today_date TEXT, today_requests INTEGER,
+            full_synced INTEGER DEFAULT 0)""")
         c.execute("""CREATE TABLE IF NOT EXISTS own_comments(
             account_id TEXT, comment_id TEXT UNIQUE, via TEXT, created_at TEXT)""")
         c.execute("CREATE INDEX IF NOT EXISTS idx_posts_time ON posts(create_time DESC)")
@@ -76,6 +77,11 @@ class Storage:
         # 迁移:为旧库补 deleted 列(已存在则忽略)
         try:
             c.execute("ALTER TABLE comments ADD COLUMN deleted INTEGER DEFAULT 0")
+        except Exception:
+            pass
+        # 迁移:补 full_synced(作品是否已完整抓取过一次;0=未全量,下次刷新一路翻到底补全)
+        try:
+            c.execute("ALTER TABLE post_fetch_meta ADD COLUMN full_synced INTEGER DEFAULT 0")
         except Exception:
             pass
         c.execute("PRAGMA wal_checkpoint(TRUNCATE)")  # 启动时收敛 WAL,避免长期运行 WAL 膨胀
@@ -367,19 +373,23 @@ class Storage:
         finally:
             c.close()
 
-    def posts_known_and_unchanged(self, account_id, id_sig_pairs):
-        """早停判定:这批作品全部已入库且 stat_sig 都没变。"""
-        if not id_sig_pairs:
+    def posts_all_known(self, account_id, object_ids):
+        """早停判定:这一页的作品是否已全部在本地库。
+
+        列表按时间倒序(置顶在前),新作品必然出现在更靠前的页,所以
+        「本页 id 全部已知」即说明其后都是更老的已入库作品,可以停。
+        刻意不用 stat_sig(播放/赞/评签名)当判据:统计数天天在变,用它会导致永远停不下来。
+        """
+        ids = [i for i in object_ids if i]
+        if not ids:
             return False
         c = self._conn()
         try:
-            want = dict(id_sig_pairs)
-            ph = ",".join("?" * len(want))
-            rows = c.execute(
-                f"SELECT object_id, stat_sig FROM posts WHERE account_id=? AND object_id IN ({ph})",
-                [account_id] + list(want.keys())).fetchall()
-            have = dict(rows)
-            return all(have.get(oid) == sig for oid, sig in want.items())
+            ph = ",".join("?" * len(ids))
+            n = c.execute(
+                f"SELECT COUNT(*) FROM posts WHERE account_id=? AND object_id IN ({ph})",
+                [account_id] + ids).fetchone()[0]
+            return int(n) >= len(ids)
         finally:
             c.close()
 
@@ -476,17 +486,19 @@ class Storage:
     def get_post_fetch_meta(self, account_id):
         c = self._conn()
         try:
-            r = c.execute("SELECT last_refresh,last_pages,today_date,today_requests "
+            r = c.execute("SELECT last_refresh,last_pages,today_date,today_requests,full_synced "
                           "FROM post_fetch_meta WHERE account_id=?", (account_id,)).fetchone()
             today = datetime.now().strftime("%Y-%m-%d")
             if not r:
-                return dict(last_refresh=None, last_pages=0, today_requests=0)
+                return dict(last_refresh=None, last_pages=0, today_requests=0, full_synced=0)
             return dict(last_refresh=r[0], last_pages=r[1] or 0,
-                        today_requests=(r[3] or 0) if r[2] == today else 0)
+                        today_requests=(r[3] or 0) if r[2] == today else 0,
+                        full_synced=int(r[4] or 0))
         finally:
             c.close()
 
-    def set_post_fetch_meta(self, account_id, last_refresh=None, last_pages=None, add_requests=0):
+    def set_post_fetch_meta(self, account_id, last_refresh=None, last_pages=None, add_requests=0,
+                            full_synced=None):
         today = datetime.now().strftime("%Y-%m-%d")
         c = self._conn()
         try:
@@ -498,6 +510,9 @@ class Storage:
             if last_refresh is not None:
                 c.execute("UPDATE post_fetch_meta SET last_refresh=?, last_pages=? WHERE account_id=?",
                           (last_refresh, last_pages or 0, account_id))
+            if full_synced is not None:
+                c.execute("UPDATE post_fetch_meta SET full_synced=? WHERE account_id=?",
+                          (1 if full_synced else 0, account_id))
             c.commit()
         finally:
             c.close()

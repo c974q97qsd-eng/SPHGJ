@@ -154,6 +154,7 @@ export interface PostMeta {
   last_refresh: string | null
   last_pages: number
   today_requests: number
+  full_synced: number
 }
 
 export interface PostsJobState {
