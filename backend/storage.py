@@ -4,11 +4,16 @@
   comments        评论(account_id/export_id/comment_id UNIQUE/nickname/content/create_time/replied ...)
   video_stats     视频评论数(account_id+export_id 主键)--增量对比:count 没变则跳过抓取
   auto_commented  已自动评论的视频(避免重发)
+  own_comments    本工具发出的评论登记(自动评论/自动回复/手动回复,隐藏与溯源用)
+  own_comment_pending  发出但接口没回 comment_id 的评论,抓取时按 export_id+内容补登
 """
+import logging
 import os
 import json
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
+
+logger = logging.getLogger("sphgj")
 
 
 class Storage:
@@ -75,6 +80,12 @@ class Storage:
             full_synced INTEGER DEFAULT 0)""")
         c.execute("""CREATE TABLE IF NOT EXISTS own_comments(
             account_id TEXT, comment_id TEXT UNIQUE, via TEXT, created_at TEXT)""")
+        # 待确认登记:发评论/回复成功但接口没回 comment_id 时先记下,
+        # 下一轮抓到该评论(comment_list 会带回自己发的评论)再补登真实 id
+        c.execute("""CREATE TABLE IF NOT EXISTS own_comment_pending(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id TEXT, export_id TEXT, content TEXT, via TEXT, created_at TEXT)""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_own_pending_acc ON own_comment_pending(account_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_posts_time ON posts(create_time DESC)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_posts_acc ON posts(account_id)")
         # 迁移:为旧库补 deleted 列(已存在则忽略)
@@ -641,13 +652,101 @@ class Storage:
             c.close()
 
     # ---------- 本工具发出的评论 ----------
-    def mark_own_comment(self, account_id, comment_id, via):
+    # 链路:发出去 -> 拿到 comment_id 就登记 own_comments;
+    #       拿不到 -> 记 own_comment_pending;抓到评论后用 export_id+内容补登。
+    # 隐藏判据另外还有「作者身份」一路(见 _own_exclusion),登记表是溯源用的权威记录。
+    def mark_own_comment(self, account_id, comment_id, via, content=None, export_id=None):
+        """登记一条本工具发出的评论。
+
+        content 可选:发出的文本。给了就顺手清掉对应的待确认登记
+        (说明这条已经拿到真实 id,不需要再回填)。
+        """
         if not comment_id:
             return
         c = self._conn()
         try:
             c.execute("INSERT OR IGNORE INTO own_comments(account_id,comment_id,via,created_at) VALUES(?,?,?,?)",
                       (account_id, comment_id, via, datetime.now().isoformat()))
+            if content:
+                c.execute("DELETE FROM own_comment_pending WHERE account_id=? AND content=?",
+                          (account_id, content))
             c.commit()
+        finally:
+            c.close()
+
+    def mark_own_comment_pending(self, account_id, export_id, content, via):
+        """发出去了但没拿到 comment_id:先记待确认,等抓到评论再补登。
+
+        同一 (账号,作品,内容,来源) 只留一条,避免重试堆积。
+        """
+        if not content:
+            return
+        c = self._conn()
+        try:
+            dup = c.execute("""SELECT 1 FROM own_comment_pending
+                               WHERE account_id=? AND COALESCE(export_id,'')=? AND content=? AND via=?""",
+                            (account_id, export_id or "", content, via)).fetchone()
+            if not dup:
+                c.execute("INSERT INTO own_comment_pending(account_id,export_id,content,via,created_at) VALUES(?,?,?,?,?)",
+                          (account_id, export_id or "", content, via, datetime.now().isoformat()))
+                c.commit()
+        finally:
+            c.close()
+
+    def pending_own_comment_count(self, account_id=None):
+        c = self._conn()
+        try:
+            if account_id:
+                r = c.execute("SELECT COUNT(*) FROM own_comment_pending WHERE account_id=?",
+                              (account_id,)).fetchone()
+            else:
+                r = c.execute("SELECT COUNT(*) FROM own_comment_pending").fetchone()
+            return r[0] if r else 0
+        finally:
+            c.close()
+
+    def reconcile_own_comments(self, account_id=None, max_age_days=30):
+        """把「当时没拿到 comment_id」的自己评论补登进 own_comments。返回补登条数。
+
+        匹配依据:同账号 + export_id(若记录里没有则不限)+ 内容完全相同 +
+                  尚未在 own_comments 里的评论。内容逐字相同且是同一作品,
+        基本只可能是自己刚发的那条 —— 客户不会复述我方话术。
+        补不上的保留待确认;超过 max_age_days 仍未匹配的丢弃,避免无限堆积。
+        """
+        c = self._conn()
+        try:
+            rows = c.execute(
+                "SELECT id, account_id, export_id, content, via FROM own_comment_pending"
+                + (" WHERE account_id=?" if account_id else ""),
+                (account_id,) if account_id else ()).fetchall()
+            if not rows:
+                return 0
+            matched = 0
+            for pid, acc, exp, content, via in rows:
+                if not content:
+                    c.execute("DELETE FROM own_comment_pending WHERE id=?", (pid,))
+                    continue
+                row = c.execute(
+                    """SELECT comment_id FROM comments
+                        WHERE account_id=? AND content=?
+                          AND (?='' OR export_id=?)
+                          AND deleted=0 AND COALESCE(comment_id,'')<>''
+                          AND comment_id NOT IN
+                              (SELECT comment_id FROM own_comments WHERE COALESCE(comment_id,'')<>'')
+                        ORDER BY create_time ASC, id ASC LIMIT 1""",
+                    (acc, content, exp or "", exp or "")).fetchone()
+                if not row:
+                    continue
+                c.execute("INSERT OR IGNORE INTO own_comments(account_id,comment_id,via,created_at) VALUES(?,?,?,?)",
+                          (acc, row[0], via, datetime.now().isoformat()))
+                c.execute("DELETE FROM own_comment_pending WHERE id=?", (pid,))
+                matched += 1
+                logger.info("[%s] 补登自己发出的评论 %s(via=%s): %s",
+                            acc, row[0], via, (content or "")[:20])
+            # 超龄未匹配:丢弃(评论可能早被删/抓不到),不让待确认表无限增长
+            c.execute("DELETE FROM own_comment_pending WHERE created_at < ?",
+                      ((datetime.now() - timedelta(days=max_age_days)).isoformat(),))
+            c.commit()
+            return matched
         finally:
             c.close()

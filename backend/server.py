@@ -1166,8 +1166,14 @@ async def reply_comment(comment_id: str, body: schemas.ManualReply):
         if isinstance(_cmt, dict):
             _ncid = _cmt.get("commentId") or _cmt.get("comment_id")
         _ncid = _ncid or _data.get("commentId") or _data.get("comment_id")
+    _exp = (storage.get_comment(comment_id) or {}).get("export_id")
     if _ncid:
-        storage.mark_own_comment(body.account_id, _ncid, "manual_reply")
+        storage.mark_own_comment(body.account_id, _ncid, "manual_reply",
+                                 content=body.content, export_id=_exp)
+    else:
+        # 回复成功但接口没回 comment_id:记待确认,抓取时按 export_id+内容补登
+        logger.warning(f"手动回复成功但未返回 commentId,已记待确认(抓到该评论后自动补登): {str(resp)[:200]}")
+        storage.mark_own_comment_pending(body.account_id, _exp, body.content, "manual_reply")
     await hub.emit("comment_replied", {"comment_id": comment_id, "account_id": body.account_id})
     return {"ok": True}
 

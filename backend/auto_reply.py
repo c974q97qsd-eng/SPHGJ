@@ -43,8 +43,11 @@ class AutoReply:
                 return cid
         return data.get("commentId") or data.get("comment_id")
 
-    async def reply_comment(self, cmt):
-        """单条评论:命中关键字则回复。返回是否回复成功。"""
+    async def reply_comment(self, cmt, export_id=None):
+        """单条评论:命中关键字则回复。返回是否回复成功。
+
+        export_id:该评论所属作品,登记/待确认登记需要它(不传则补登时不限作品)。
+        """
         if not self.is_enabled():
             return False
         cid = cmt.get("commentId")
@@ -63,11 +66,17 @@ class AutoReply:
             resp = await self.api.reply_comment(cid, reply_text)
             if resp and not resp.get("__err"):
                 await asyncio.to_thread(self.storage.mark_replied, cid)
-                # 记录本工具发出的评论(评论列表「隐藏发出的评论」开关用)
+                # 记录本工具发出的评论(隐藏与溯源用):拿到 id 直接登记,
+                # 拿不到就记待确认,由 comment_fetcher 抓完一轮后补登
                 new_cid = self._parse_new_comment_id(resp)
                 if new_cid:
                     await asyncio.to_thread(self.storage.mark_own_comment,
-                                            self.account_id, new_cid, "auto_reply")
+                                            self.account_id, new_cid, "auto_reply",
+                                            content=reply_text, export_id=export_id)
+                else:
+                    logger.warning(f"[{self.account_id}] 回复成功但未返回 commentId,已记待确认(抓到该评论后自动补登): {str(resp)[:200]}")
+                    await asyncio.to_thread(self.storage.mark_own_comment_pending,
+                                            self.account_id, export_id, reply_text, "auto_reply")
                 logger.info(f"[{self.account_id}] 自动回复 {cid}({content[:15]})-> {reply_text}")
                 return True
             logger.warning(f"[{self.account_id}] 回复失败 {cid}: {resp}")

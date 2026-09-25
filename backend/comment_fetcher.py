@@ -70,7 +70,21 @@ class CommentFetcher:
                   缓冲累积到 FLUSH_THRESHOLD 条即推送并清空,避免高评论量账号在内存堆积
                   全量新评论。不传则保持原有行为(全部抓完一次性返回)。
                   注意:返回的"新评论列表"仅含【未推送完的剩余部分】,新增数则是完整总数。
+
+        抓完一轮后统一补登「自己发出的评论」:自动评论/回复发出但当时没拿到 comment_id 的,
+        此时评论已被抓进库,按 export_id+内容精确匹配补上真实 id(见 storage.reconcile_own_comments)。
         """
+        try:
+            return await self._fetch_all_inner(max_videos=max_videos, on_batch=on_batch)
+        finally:
+            try:
+                n = await self._s(self.storage.reconcile_own_comments, self.account_id)
+                if n:
+                    logger.info(f"[{self.account_id}] 补登自己发出的评论 {n} 条")
+            except Exception as e:
+                logger.error(f"[{self.account_id}] 补登自己发出的评论失败: {e}")
+
+    async def _fetch_all_inner(self, max_videos=None, on_batch=None):
         scanned = 0
         new_comments = []   # 待推送缓冲(流式模式下会周期性清空)
         deleted_ids = []
@@ -164,7 +178,7 @@ class CommentFetcher:
                         # 未删的新评论触发自动回复
                         if self.auto_reply:
                             try:
-                                await self.auto_reply.reply_comment(cmt)
+                                await self.auto_reply.reply_comment(cmt, export_id)
                             except Exception as e:
                                 logger.error(f"[{self.account_id}] 自动回复异常 {cid}: {e}")
                 # 二级评论(回复)

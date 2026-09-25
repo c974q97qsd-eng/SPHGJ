@@ -38,8 +38,13 @@ class AutoCommenter:
                     comment_id = cmt.get("commentId") or cmt.get("comment_id")
                 comment_id = comment_id or data.get("commentId") or data.get("comment_id")
             if not comment_id:
-                logger.warning(f"[{self.account['id']}] 自动评论未返回 commentId(标记已发避免重试): {str(resp)[:200]}")
+                logger.warning(f"[{self.account['id']}] 自动评论未返回 commentId(已标记已发避免重试,并记待确认,抓到该评论后自动补登): {str(resp)[:200]}")
                 self.storage.set_auto_commented(self.account["id"], export_id, "")
+                # 记待确认:下一轮抓到这条评论时按 export_id+内容补登真实 comment_id
+                try:
+                    self.storage.mark_own_comment_pending(self.account["id"], export_id, content, "auto_comment")
+                except Exception as e:
+                    logger.error(f"[{self.account['id']}] 记待确认登记失败 {export_id}: {e}")
                 return False
             # 置顶
             pin_resp = await self.api.pin_comment(export_id, comment_id)
@@ -48,6 +53,13 @@ class AutoCommenter:
             else:
                 logger.warning(f"[{self.account['id']}] 置顶失败 {export_id}: {pin_resp}")
             self.storage.set_auto_commented(self.account["id"], export_id, comment_id)
+            # 同时登记到 own_comments:auto_commented 按作品去重,多次评论会覆盖旧 id,
+            # 而 own_comments 一条不落(隐藏与溯源都以它为准)
+            try:
+                self.storage.mark_own_comment(self.account["id"], comment_id, "auto_comment",
+                                              content=content, export_id=export_id)
+            except Exception as e:
+                logger.error(f"[{self.account['id']}] 登记自己评论失败 {comment_id}: {e}")
             return True
         except Exception as e:
             logger.error(f"[{self.account['id']}] 自动评论异常 {export_id}: {e}")
