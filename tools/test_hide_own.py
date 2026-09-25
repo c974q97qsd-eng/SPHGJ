@@ -14,7 +14,9 @@
 
 回归锁:参数顺序(account_id 必须排在 id/name 之前)、账号间不串号、阈值保护。
 """
+import atexit
 import os
+import shutil
 import sys
 import tempfile
 
@@ -59,6 +61,7 @@ def ids_of(st, **kw):
 
 def main():
     tmp = tempfile.mkdtemp(prefix="hideown_test_")
+    atexit.register(shutil.rmtree, tmp, ignore_errors=True)   # 跑完自动清临时库
     db = os.path.join(tmp, "comments.db")
     st = Storage(db)
 
