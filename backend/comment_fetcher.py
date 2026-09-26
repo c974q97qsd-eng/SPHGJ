@@ -5,6 +5,15 @@
   2. 本地存每视频上次 commentCount,没增加的跳过
   3. 评论按 commentId 去重(已存在的 upsert,不重复计数)
 
+⚠️ 早停(优化 1/2)的两条硬约束 —— 2026-09-26 线上「好几天新增0评论」事故的教训:
+
+  a) commentCount 字段缺失 ≠ 真的没有评论。用 `v.get("commentCount", 0) or 0`
+     会把「字段没返回」和「接口请求失败」一起吞成 0;把这个 0 写进本地快照后,
+     该视频从此走「没评论」分支永远跳过。所以字段缺失时【既不写快照也不跳过】。
+  b) `prev == cc` 才跳过的前提是【本地真的抓到过评论】。仅凭 video_stats 里的
+     count 不足以判定 —— 那个值可能正是被脏 0 污染的。故必须同时确认
+     comments 表已有该视频的行(见 storage.get_video_fetch_state)。
+
 storage 调用一律走 _s() 放线程池(asyncio.to_thread),避免同步 SQLite 阻塞
 uvicorn 事件循环(多 worker 并发写锁等待会卡死事件循环,导致 8712 不响应)。
 
@@ -101,25 +110,44 @@ class CommentFetcher:
                 break
             for v in videos:
                 oid = v.get("objectId")
-                cc = v.get("commentCount", 0) or 0
                 if not oid:
                     continue
                 scanned += 1
+                # 评论数:必须区分「字段缺失」与「真的是 0」。
+                # 用 `or 0` 兜底会把两者混同,而后续两个早停分支都吃这个值,
+                # 一旦把缺失误当 0 写进快照就会永久跳过该视频(2026-09-26 事故)。
+                raw_cc = v.get("commentCount")
+                cc_missing = raw_cc is None
+                try:
+                    cc = int(raw_cc or 0)
+                except (TypeError, ValueError):
+                    cc_missing, cc = True, 0
+                if cc_missing:
+                    # 字段没返回:本轮无法判断评论数,不写快照、不跳过,照样抓一次。
+                    # 代价 = 多一次 comment_list,但绝不会把视频锁死。
+                    logger.debug(f"[{self.account_id}] {oid} commentCount 缺失,强制抓取")
+                    st = None
+                else:
+                    st = await self._s(self.storage.get_video_fetch_state, self.account_id, oid)
                 # 新视频检测(本地无记录)-> 自动评论+置顶
-                is_new = (await self._s(self.storage.get_video_comment_count, self.account_id, oid)) is None
+                is_new = (st is None) or (not st["seen"])
                 if is_new and self.auto_commenter:
                     try:
                         await self.auto_commenter.try_comment(oid)
                     except Exception as e:
                         logger.error(f"[{self.account_id}] 自动评论异常 {oid}: {e}")
-                # 优化1:没评论的跳过(仍记录评论数=0)
-                if not cc:
-                    await self._s(self.storage.set_video_comment_count, self.account_id, oid, 0)
-                    continue
-                # 优化2:评论数没增加的跳过
-                prev = await self._s(self.storage.get_video_comment_count, self.account_id, oid)
-                if prev is not None and prev == cc:
-                    continue
+                if st is not None:
+                    # 优化1:接口明确说没评论 -> 跳过(记录快照)。set 内部有单调性保护,
+                    # 不会把已有的正数打回 0。
+                    if not cc:
+                        await self._s(self.storage.set_video_comment_count, self.account_id, oid, 0)
+                        continue
+                    # 优化2:评论数没增加 -> 跳过。前提是【本地真抓到过评论】:
+                    # has_comments=False 说明历史快照可能是脏 0(从未抓过),
+                    # 此时必须强制抓一次,否则永远补不回来。
+                    prev = st["cc"]
+                    if prev is not None and prev == cc and st["has_comments"]:
+                        continue
                 # 抓评论
                 n, new_subs, del_ids = await self._fetch_comments_for_video(oid, on_batch=on_batch)
                 total_new += n
@@ -128,7 +156,11 @@ class CommentFetcher:
                 # 流式:缓冲达阈值即推送并清空(单视频内部也会 flush,这里兜住跨视频累积)
                 if on_batch and len(new_comments) >= self.FLUSH_THRESHOLD:
                     await self._flush(new_comments, deleted_ids, on_batch)
-                await self._s(self.storage.set_video_comment_count, self.account_id, oid, cc)
+                if st is not None:
+                    # 抓到评论才更新为接口汇报值;没抓到(如接口临时失败)不落值,
+                    # 免得把「没抓到」写成「评论数=0」再次污染快照。
+                    if n or cc == 0:
+                        await self._s(self.storage.set_video_comment_count, self.account_id, oid, cc)
                 if max_videos and scanned >= max_videos:
                     return scanned, total_new, new_comments, deleted_ids
             last_buff = data.get("lastBuff") or ""

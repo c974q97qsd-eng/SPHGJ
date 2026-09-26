@@ -175,12 +175,127 @@ class Storage:
         c.close()
         return r[0] if r else None
 
-    def set_video_comment_count(self, account_id, export_id, count):
+    def get_video_fetch_state(self, account_id, export_id):
+        """一次取回该视频的抓取状态,用于早停判定。返回 dict:
+            seen         本地是否已有该视频记录(无 => 新视频)
+            cc           上次记录的评论数(None = 无记录)
+            has_comments 该视频在 comments 表是否已有行
+
+        为什么单独开这个方法:早停「评论数没增加就跳过」有致命前提 —— 本地必须
+        【真的抓到过评论】。历史上曾把接口返回的 commentCount=0(字段缺失/请求失败
+        被 or 0 吞掉)写进 video_stats,于是 cc=0 的视频连 comment_list 都不发,
+        永远停在 0 评论。所以判据里必须带上 has_comments。
+        """
         c = self._conn()
+        r = c.execute("SELECT comment_count FROM video_stats WHERE account_id=? AND export_id=?",
+                      (account_id, export_id)).fetchone()
+        cc = r[0] if r else None
+        has = c.execute("SELECT 1 FROM comments WHERE account_id=? AND export_id=? LIMIT 1",
+                        (account_id, export_id)).fetchone() is not None
+        c.close()
+        return dict(seen=r is not None, cc=cc, has_comments=has)
+
+    def set_video_comment_count(self, account_id, export_id, count):
+        """记录该视频本次看到的评论数。
+
+        单调性保护:接口偶发把 commentCount 返回成 0(字段缺失 / 请求失败),
+        直接写回会把快照打回 0 —— 而 0 会让下一轮走「没评论」分支直接跳过,
+        等于永久锁死(2026-09-26 线上事故根因)。评论数不会无故减少,
+        故新值更小时保留旧值;但允许 0 -> 正数 的正常增长。
+        """
+        c = self._conn()
+        try:
+            new = int(count or 0)
+        except (TypeError, ValueError):
+            new = 0
+        r = c.execute("SELECT comment_count FROM video_stats WHERE account_id=? AND export_id=?",
+                      (account_id, export_id)).fetchone()
+        old = r[0] if r else None
+        if old is not None and new < old:
+            new = old            # 脏值:保留旧值,不回退
         c.execute("""INSERT OR REPLACE INTO video_stats(account_id,export_id,comment_count,updated_at)
-            VALUES(?,?,?,?)""", (account_id, export_id, count, datetime.now().isoformat()))
+            VALUES(?,?,?,?)""", (account_id, export_id, new, datetime.now().isoformat()))
         c.commit()
         c.close()
+        return new
+
+    def reset_video_comment_count(self, account_id=None, export_id=None):
+        """清掉视频的评论数快照,强制下一轮重新抓取。返回清除条数。
+
+        用于修历史脏数据:video_stats 里记了 count 但 comments 表一条都没有,
+        说明该视频从未真正抓到过评论(被 0 值快照锁死),必须复位重抓。
+        account_id / export_id 为 None 表示不限定。
+        """
+        c = self._conn()
+        where, args = [], []
+        if account_id:
+            where.append("account_id=?"); args.append(account_id)
+        if export_id:
+            where.append("export_id=?"); args.append(export_id)
+        clause = (" WHERE " + " AND ".join(where)) if where else ""
+        cur = c.execute(f"DELETE FROM video_stats{clause}", args)
+        n = cur.rowcount or 0
+        c.commit()
+        c.close()
+        return n
+
+    def reset_stale_video_counts(self):
+        """复位「评论数快照 > 0 但从未抓到过评论」的脏视频。返回 (受影响账号数, 清除条数)。
+
+        判据只有两条,刻意【不依赖 posts 表】:
+          a) comments 表里没有该 (account_id, export_id) 的行 —— 从未抓到过评论
+          b) video_stats.comment_count > 0 —— 接口明确报过「这条视频有评论」
+        两条同时成立 => 接口说有评论、我们却一条都没抓到,必然是脏快照锁死。
+
+        为什么不用 posts.comment_count 交叉验证(2026-09-26 踩过):
+        posts 表是按账号增量抓的,未抓过作品的账号在 posts 里
+        一条记录都没有,拿它当过滤器会把整个账号漏掉。
+        cc=0 的视频不复位:那是「接口说的确没评论」的正常状态,复位了会白跑一圈。
+        """
+        c = self._conn()
+        rows = c.execute("""SELECT vs.account_id, vs.export_id FROM video_stats vs
+            WHERE vs.comment_count > 0
+              AND NOT EXISTS (
+                SELECT 1 FROM comments cm
+                WHERE cm.account_id = vs.account_id AND cm.export_id = vs.export_id)""").fetchall()
+        c.close()
+        if not rows:
+            return 0, 0
+        by_acc = {}
+        for acc, eid in rows:
+            by_acc.setdefault(acc, []).append(eid)
+        total = 0
+        for acc, eids in by_acc.items():
+            for i in range(0, len(eids), 500):
+                chunk = eids[i:i + 500]
+                cc = self._conn()
+                qs = ",".join("?" * len(chunk))
+                total += cc.execute(
+                    f"DELETE FROM video_stats WHERE account_id=? AND export_id IN ({qs})",
+                    [acc] + chunk).rowcount or 0
+                cc.commit()
+                cc.close()
+        return len(by_acc), total
+
+    def video_fetch_health(self):
+        """诊断:返回每个账号的「评论抓取健康度」。供排查「新增0评论」用。
+
+        关键指标 never_fetched = 快照说有评论、但 comments 表一条都没有的视频数。
+        该值长期 > 0 且持续增长 => 早停判定又把视频锁死了。
+        """
+        c = self._conn()
+        rows = c.execute("""SELECT vs.account_id,
+                COUNT(*) AS videos,
+                SUM(CASE WHEN vs.comment_count > 0 THEN 1 ELSE 0 END) AS with_cc,
+                SUM(CASE WHEN vs.comment_count > 0 AND NOT EXISTS (
+                        SELECT 1 FROM comments cm
+                        WHERE cm.account_id = vs.account_id AND cm.export_id = vs.export_id)
+                    THEN 1 ELSE 0 END) AS never_fetched,
+                MAX(vs.updated_at) AS last_scan
+            FROM video_stats vs GROUP BY vs.account_id""").fetchall()
+        c.close()
+        return [dict(account_id=r[0], videos=r[1] or 0, with_cc=r[2] or 0,
+                     never_fetched=r[3] or 0, last_scan=r[4]) for r in rows]
 
     def get_comment(self, comment_id):
         """取单条评论(删除前用于补充删除记录)。返回 dict 或 None。"""
@@ -274,13 +389,20 @@ class Storage:
         now = time.time()
         if self._stats_cache is not None and now - self._stats_cache_ts < 60:
             return self._stats_cache
-        c = self._conn()
-        rows = c.execute("""SELECT account_id,
-                COUNT(*) AS total,
-                SUM(CASE WHEN replied=1 THEN 1 ELSE 0 END) AS replied,
-                MAX(fetched_at) AS last_fetched
-            FROM comments GROUP BY account_id""").fetchall()
-        c.close()
+        try:
+            c = self._conn()
+            rows = c.execute("""SELECT account_id,
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN replied=1 THEN 1 ELSE 0 END) AS replied,
+                    MAX(fetched_at) AS last_fetched
+                FROM comments GROUP BY account_id""").fetchall()
+            c.close()
+        except Exception as e:
+            # 读路径兜底:库被外部工具只读打开 / UNC 访问抖动会抛
+            # sqlite3.DatabaseError(file is not a database),不能让整页 /api/stats 500。
+            # 返回上一次缓存(可能为空),并保留 _stats_cache_ts 让 60s 后自然重试。
+            logger.warning(f"account_stats 读取失败,返回缓存: {e}")
+            return self._stats_cache or []
         self._stats_cache = [dict(account_id=r[0], total=r[1] or 0, replied=r[2] or 0,
                                   last_fetched=r[3]) for r in rows]
         self._stats_cache_ts = now

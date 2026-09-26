@@ -611,6 +611,45 @@ async def _deep_autopsy_loop(runs=8, gap_sec=1500):
             logger.debug(f"[memdeep] 深采样失败: {type(e).__name__}: {e}")
 
 
+@app.get("/api/system/comment-health")
+async def comment_health():
+    """评论抓取健康度自检 —— 回答「为什么好几天没抓到新评论」。
+
+    2026-09-26 事故:早停判据(评论数没增加就跳过)会把视频永久锁死,
+    表面看日志一直「扫描N视频 新增0评论」,但每个账号的指标都正常,
+    肉眼查不出来。这里把关键指标直接暴露出来。
+
+    判读:
+      never_fetched > 0  且持续增长
+          -> 有视频「接口说有评论、但我们一条都没抓到」,即早停被脏快照锁死。
+             线上曾有个账号一次积了 231 个。
+      last_scan 很久没更新
+          -> 该账号根本没在跑(登录失效 / 被停用),不是抓取逻辑问题。
+
+    修复:提交一个空的 POST 到 /api/system/comment-health/reset 复位脏快照,
+    下一轮会自动补抓(也可用 ?reset=1 直接在这个接口里复位)。
+    """
+    def _impl():
+        rows = storage.video_fetch_health()
+        rows = sorted(rows, key=lambda r: -r["never_fetched"])
+        return {"accounts": rows,
+                "total_never_fetched": sum(r["never_fetched"] for r in rows)}
+    return await asyncio.to_thread(_impl)
+
+
+@app.post("/api/system/comment-health/reset")
+async def comment_health_reset():
+    """复位「有评论数快照但从未抓到评论」的脏视频,强制下一轮重抓。
+
+    只动 video_stats 的计数,不碰 comments 表 —— 已抓到的评论一条不会丢。
+    """
+    def _impl():
+        accs, n = storage.reset_stale_video_counts()
+        logger.info(f"[comment-health] 复位脏快照: 影响 {accs} 个账号,清除 {n} 条")
+        return {"accounts_affected": accs, "rows_reset": n}
+    return await asyncio.to_thread(_impl)
+
+
 @app.get("/api/system/memdiag")
 async def mem_diagnose(holders: bool = False, deep: bool = False, chain: bool = False,
                        tasks: bool = False):
