@@ -110,6 +110,12 @@ class LoginSession:
         self.lock_conflict = None     # 冲突详情(前端据此弹警告框)
         # 网络拦截缓存:二维码原图(优先于截图)
         self._qr_raw = None  # bytes | None
+        # —— 账号名兜底(2026-10-01 修:page 被关闭导致名字退化成 finder_id 前缀) ——
+        # 点击「选择视频号」时,选择页接口返回且已【精确匹配】到目标账号的名字。
+        # 它是官方接口字段(不是页面文本),即便随后 page 被关掉也能拿它兜底。
+        self._picked_name = ""
+        # auth_finder_list 最近一次成功的结果(含 finder_id),page 死亡时反查仍可用
+        self._finder_list_cache = []
 
     def _finished(self, status):
         """终态通知(防重复):auto 模式下触发 manager 推进下一个 relogin。"""
@@ -212,6 +218,69 @@ class LoginSession:
                     shutil.rmtree(self.profile_dir, ignore_errors=True)
             except Exception:
                 pass
+
+    async def _ensure_page_alive(self):
+        """确保 self.page 指向一个还活着的 page;必要时从 context 重新附着。
+
+        为什么必须做:点击「选择视频号」后微信会从 login.html 跳到 /platform,
+        旧 page 随之被关闭,而 self.page 仍指着它 —— 之后所有 page.evaluate 都会抛
+        「Target page, context or browser has been closed」。于是 auth_data 拿不到
+        视频号名,auth_finder_list 兜底反查也因为同一个死 page 一起失败,最终名字
+        退化成 finder_id 前缀占位(线上曾因此出过一次事故)。
+        """
+        # 1. 现 page 还活着 -> 直接用
+        if self.page is not None:
+            try:
+                if not self.page.is_closed():
+                    return True
+            except AttributeError:
+                # 取不到 is_closed(非标准 page 对象):无法证明它已关闭,
+                # 按「可用」处理 —— 绝不能因为探测不了就把整条抓取链放弃。
+                return True
+            except Exception:
+                pass
+        if not self.context:
+            return False
+        # 2. 从 context 里挑一个活着的 page(优先平台域;取最后一个=最近打开的)
+        alive = []
+        for pg in list(getattr(self.context, "pages", []) or []):
+            try:
+                if not pg.is_closed():
+                    alive.append(pg)
+            except Exception:
+                pass
+        target = None
+        for pg in alive:
+            try:
+                if "channels.weixin.qq.com" in (pg.url or ""):
+                    target = pg
+            except Exception:
+                pass
+        if target is None and alive:
+            target = alive[-1]
+        if target is None:
+            # 一个活的都没有 -> 新开并导航到同源页(登录态在 cookie 里,不丢)。
+            # 必须 goto:about:blank 与 channels.weixin.qq.com 不同源,
+            # 页面内 fetch(auth_data / auth_finder_list)会被 CORS 拦掉。
+            try:
+                target = await self.context.new_page()
+            except Exception as e:
+                logger.warning(f"[login:{self.sid}] 无可用的 page 且新开失败: {e}")
+                return False
+            try:
+                await target.goto("https://channels.weixin.qq.com/platform",
+                                  wait_until="domcontentloaded", timeout=8000)
+            except Exception as e:
+                logger.debug(f"[login:{self.sid}] 新 page 导航平台页失败(继续尝试): {e}")
+        self.page = target
+        # 重新挂 request 监听(新 page 不带旧 page 的 handler;
+        # 此时已过扫码阶段,二维码 response 监听不再需要)
+        try:
+            self.page.on("request", self._on_request)
+        except Exception:
+            pass
+        logger.warning(f"[login:{self.sid}] 原 page 已关闭,已重新附着到 URL={target.url}")
+        return True
 
     # ---------- 锁定微信校验(扫错微信 -> 清登录态 + 警告 + 全新环境重扫) ----------
     def _lock_mismatch(self):
@@ -482,6 +551,13 @@ class LoginSession:
         取不到返回 []。每项的 nickname 与 finderUsername 来自同一个对象,成对且精准,
         页面卡片就是渲染它;从此不再靠切页面文本来认账号名。
         """
+        if not await self._ensure_page_alive():
+            # page 不可用:优先复用上一次成功枚举的结果(登录流程里通常刚枚举过)
+            if self._finder_list_cache:
+                logger.info(f"[login:{self.sid}] page 不可用,复用缓存的账号列表"
+                            f"({len(self._finder_list_cache)} 项)")
+                return list(self._finder_list_cache)
+            return []
         aid = await self._read_aid()
         try:
             txt = await self.page.evaluate("""async (aid) => {
@@ -509,6 +585,7 @@ class LoginSession:
             items.append({"name": nm, "role": role, "finder_id": fid,
                           "_raw": nm, "_blocked": r.get("spamFlag") == 1})
         if items:
+            self._finder_list_cache = list(items)   # 缓存:page 死亡时兜底反查还能用
             logger.info(f"[login:{self.sid}] auth_finder_list 返回 {len(items)} 个账号: "
                         f"{[(i['name'], i['role']) for i in items]}")
         return items
@@ -761,6 +838,9 @@ class LoginSession:
             logger.info(f"[login:{self.sid}] 精确匹配账号 #{auto_idx + 1} {nm!r}"
                         f"(方式={how}, 目标 name={target_name!r})")
             if await self._click_select_account(auto_idx, nm):
+                # 记下这个 nm:官方接口返回、且已精确匹配到目标账号。
+                # 后面若 auth_data 因 page 关闭而失败,它就是最可靠的名字兜底。
+                self._picked_name = nm
                 self.status = "scanned"
                 await self.emit("login_status", {"sid": self.sid, "status": "scanned",
                                                  "auto_selected": nm})
@@ -802,6 +882,7 @@ class LoginSession:
         name = names[index] if 0 <= index < len(names) else ""
         if not await self._click_select_account(index, name):
             return False
+        self._picked_name = name   # 官方接口返回的名字,作后续兜底(同 auto 路径)
         self.status = "scanned"
         await self.emit("login_status", {"sid": self.sid, "status": "scanned"})
         await self._capture_fields_and_finalize()
@@ -855,15 +936,24 @@ class LoginSession:
         「切换视频号/取消切换」等控件文案当名字抓走(线上已踩过两次)。
         """
         # 1. localStorage 直接取 _aid / _log_finder_id(扫码后当前页即有)
+        await self._ensure_page_alive()
         vals = {}
         for _ in range(6):
-            vals = await self.page.evaluate("""() => {
-                const aid = localStorage.getItem('__ml::aid') || localStorage.getItem('__rx::aid') || '';
-                const fid = localStorage.getItem('finder_username') || '';
-                let a = aid;
-                try { a = JSON.parse(aid); } catch(e) { a = aid.replace(/^"|"$/g, ''); }
-                return { aid: a, finder_id: fid };
-            }""")
+            try:
+                vals = await self.page.evaluate("""() => {
+                    const aid = localStorage.getItem('__ml::aid') || localStorage.getItem('__rx::aid') || '';
+                    const fid = localStorage.getItem('finder_username') || '';
+                    let a = aid;
+                    try { a = JSON.parse(aid); } catch(e) { a = aid.replace(/^"|"$/g, ''); }
+                    return { aid: a, finder_id: fid };
+                }""")
+            except Exception as e:
+                # page 可能刚被关闭 -> 重新附着再试,别让整个抓取链断在这里
+                logger.debug(f"[login:{self.sid}] localStorage 读取异常,尝试重新附着 page: {e}")
+                if not await self._ensure_page_alive():
+                    vals = {}
+                    break
+                vals = {}
             if vals.get("aid") and vals.get("finder_id"):
                 break
             await asyncio.sleep(0.5)
@@ -878,7 +968,11 @@ class LoginSession:
         #    不再用 CSS 选择器抓页面文本:顶栏 .account-info 下根本没有 .name,
         #    回退到容器会把「切换视频号/取消切换」等控件文案一起抓进来(text_content
         #    连隐藏节点都算),这正是账号名被抓错的根因。
-        await self.page.wait_for_timeout(2500)
+        try:
+            await self.page.wait_for_timeout(2500)
+        except Exception as e:
+            logger.debug(f"[login:{self.sid}] 等待页面稳定异常(忽略): {e}")
+        await self._ensure_page_alive()
         ident = await self._fetch_finder_identity()
         if ident["finder_id"]:
             self.captured["finder_id"] = ident["finder_id"]
@@ -886,8 +980,10 @@ class LoginSession:
             self.captured["name"] = ident["nickname"]
         if ident["wx_name"]:
             self.captured["wx_name"] = ident["wx_name"]
-        # 3. fallback:localStorage 没拿全 _aid/finder_id -> 跳评论页拦截 post_list
-        if not (self.captured["aid"] and self.captured["finder_id"]):
+        # 3. fallback:localStorage 没拿全 _aid/finder_id,或 page 已不可用 -> 跳评论页。
+        #    page 已死时也必须走这一步:goto 会重新拿到一个活 page,后面才能取名字。
+        if (not (self.captured["aid"] and self.captured["finder_id"])) \
+                or not await self._ensure_page_alive():
             logger.info(f"[login:{self.sid}] localStorage 未取全,回退评论页拦截 post_list")
             try:
                 await self.page.goto(COMMENT_URL, wait_until="domcontentloaded", timeout=8000)
@@ -907,16 +1003,26 @@ class LoginSession:
                 logger.warning(f"[login:{self.sid}] 回退跳转评论页失败: {e}")
         # 4. 兜底一:auth_data 没给名字 -> 用 auth_finder_list 按 finder_id 精确反查。
         #    仍是官方接口、仍是"名字与 id 同一条记录",只是换个口子取,不是猜。
+        #    先修 page(page 死了重新请求必然失败),再查缓存+现场结果的并集。
         if not (self.captured.get("name") or "").strip():
             fid = (self.captured.get("finder_id") or "").strip()
             if fid:
-                for it in await self._fetch_finder_list():
+                await self._ensure_page_alive()
+                cand = list(self._finder_list_cache) + list(await self._fetch_finder_list())
+                for it in cand:
                     if (it.get("finder_id") or "").strip() == fid and it.get("name"):
                         self.captured["name"] = it["name"]
                         logger.info(f"[login:{self.sid}] auth_data 未给名字,"
                                     f"已由 auth_finder_list 按 finder_id 反查到 {it['name']!r}")
                         break
-        # 5. 兜底二:两个接口都没给 -> 用 finder_id 前缀占位(明确是占位符,不是猜出来的名字)。
+        # 4.5 兜底一之补:用点击「选择视频号」时那个已精确匹配的名字。
+        #     它是官方接口字段(auth_finder_list 的 nickname),不是页面文本;
+        #     能走到这里说明目标账号已被精确匹配并点击过,名字与账号必然对应。
+        if not (self.captured.get("name") or "").strip() and self._picked_name:
+            self.captured["name"] = self._picked_name
+            logger.info(f"[login:{self.sid}] auth_data/auth_finder_list 均未给名字,"
+                        f"已用选择页接口命中的 {self._picked_name!r} 兜底")
+        # 5. 兜底二:以上都没给 -> 用 finder_id 前缀占位(明确是占位符,不是猜出来的名字)。
         #    绝不回退到页面文本 —— 「切换视频号 取消切换」正是那样被写进 config 的。
         if not (self.captured.get("name") or "").strip():
             fid = (self.captured.get("finder_id") or "").strip()
@@ -941,6 +1047,12 @@ class LoginSession:
         if not aid:
             return out
         for attempt in range(3):
+            # page 可能刚被关闭(点击选择账号后跳转):重试前先重新附着,
+            # 否则 3 次重试都是同一句 "Target page...has been closed",纯浪费时间。
+            if not await self._ensure_page_alive():
+                logger.debug(f"[login:{self.sid}] auth_data 第{attempt + 1}次前无可用 page")
+                await asyncio.sleep(0.5)
+                continue
             try:
                 txt = await self.page.evaluate("""async (aid) => {
                     const url = `https://channels.weixin.qq.com/cgi-bin/mmfinderassistant-bin/auth/auth_data?_aid=${aid}&_pageUrl=${encodeURIComponent('https://channels.weixin.qq.com/micro/interaction/comment')}`;

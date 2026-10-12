@@ -166,6 +166,7 @@ def main():
 
     import uvicorn
     from backend import server
+    from backend import restart as restart_mod
 
     print(f"[启动] 视频号工具 v{VERSION}" + (" (headless)" if headless else ""))
 
@@ -187,6 +188,39 @@ def main():
     if not _wait_ready(port):
         _fatal("后端服务启动失败,请查看日志后重试。")
         return
+
+    # ---------------- 远程重启通道 ----------------
+    # 记录「怎么启动我」(解释器/参数/工作目录),并注册退出钩子。
+    # POST /api/system/restart 会:① 拉起一个脱离进程树的 helper;
+    # ② 调这里安排的退出 —— 优雅关浏览器 -> 关窗口 -> 兜底强退。
+    # helper 随后按原样把新实例拉起来,见 backend/restart.py。
+    restart_mod.set_runtime_info(version=VERSION, headless=headless, port=port)
+    restart_mod.write_launch_info()
+    _win = {"obj": None}
+
+    def _shutdown_hook(delay: float):
+        def _worker():
+            time.sleep(float(delay))
+            print("[重启] 收到重启指令,正在优雅退出…")
+            try:
+                server.graceful_shutdown()
+            except Exception as e:
+                print(f"[重启] graceful_shutdown 异常: {e}")
+            try:
+                srv.should_exit = True
+            except Exception:
+                pass
+            try:
+                if _win["obj"] is not None:
+                    _win["obj"].destroy()      # 让 webview.start() 返回
+            except Exception:
+                pass
+            time.sleep(4.0)                 # 给 uvicorn / 浏览器清理留时间
+            os._exit(0)                     # 兜底:确保进程真的退出
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    restart_mod.register_exit_hook(_shutdown_hook)
 
     url = f"http://127.0.0.1:{port}/"
     if headless:
@@ -233,8 +267,8 @@ def main():
 
     try:
         gui = "edgechromium" if _is_windows() else None
-        webview.create_window("视频号工具", url, width=1280, height=820,
-                              min_size=(900, 600))
+        _win["obj"] = webview.create_window("视频号工具", url, width=1280,
+                                            height=820, min_size=(900, 600))
         _ensure_window_shown("视频号工具")
         webview.start(gui=gui)
         # 窗口关闭 -> 优雅停止

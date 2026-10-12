@@ -33,6 +33,7 @@ from . import schemas
 from .metrics import metric_dictionary, validate_card_fields, DEFAULT_CARD_FIELDS
 from .memtrim import trim_now
 from .post_fetcher import PostFetcher
+from . import restart as restart_mod
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 CONFIG_PATH = os.path.join(ROOT, "config.json")
@@ -648,6 +649,40 @@ async def comment_health_reset():
         logger.info(f"[comment-health] 复位脏快照: 影响 {accs} 个账号,清除 {n} 条")
         return {"accounts_affected": accs, "rows_reset": n}
     return await asyncio.to_thread(_impl)
+
+
+@app.get("/api/system/info")
+async def system_info():
+    """运行信息 —— 远程重启后靠 pid 变化判断是否重启成功。
+
+    返回 pid / 启动时间 / 端口 / 版本 / 是否 headless,以及上一次重启的结果
+    (restart.phase == "done" 且 ok == true 即重启完成)。
+    该接口刻意保持极轻量:重启助手在等待新实例就绪时会高频轮询它。
+    """
+    return {"ok": True, **restart_mod.runtime_info(),
+            "restart": restart_mod.read_restart_status()}
+
+
+@app.post("/api/system/restart")
+async def system_restart(delay: float = Query(3.0, ge=1, le=60)):
+    """远程重启:优雅退出 + 按原方式重新拉起(见 backend/restart.py)。
+
+    用法(内网任意机器,无需登录):
+        curl -X POST "http://<运行机>:8712/api/system/restart?delay=3"
+
+    调用后【立刻返回】,真正退出发生在 delay 秒之后。客户端应轮询
+    /api/system/info:pid 变了且服务可访问 = 重启成功;
+    若长时间 pid 不变,看返回的 restart 字段里的 error。
+    """
+    try:
+        info = restart_mod.restart(delay)
+    except Exception as e:
+        logger.exception("[restart] 启动重启失败")
+        raise HTTPException(500, f"重启失败: {e}")
+    logger.info(f"[restart] 收到远程重启请求,{delay}s 后退出 "
+                f"(helper_pid={info['helper_pid']})")
+    return {"ok": True, **info,
+            "hint": "本进程将在 delay 秒后退出,请轮询 /api/system/info 确认新 pid"}
 
 
 @app.get("/api/system/memdiag")

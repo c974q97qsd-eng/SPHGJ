@@ -2,9 +2,14 @@ import { useCallback, useEffect, useRef, useState } from "react"
 import { api, type Comment, type CommentPage } from "@/lib/api"
 import { useWebSocket, type WsEvent } from "@/lib/ws"
 
-/** 评论列表:分页查询 + WS 实时新增。 */
+/** 评论列表:分页查询 + WS 实时新增。
+ *
+ * 分页:limit / offset 由调用方给(以前 fixed 200~300 条一次渲染,滚动和勾选都卡)。
+ * WS 新评论的插入策略:只有停在【第一页】时才前置插入 —— 否则会打乱当前页的
+ * 分页窗口(第 N 页看到的是别人的内容),此时只更新 total,翻回第一页即可看到。
+ */
 export function useComments(params: { account_id?: string; replied?: boolean; q?: string; hide_own?: number; limit?: number; offset?: number }) {
-  const [page, setPage] = useState<CommentPage>({ items: [], total: 0, limit: params.limit ?? 200, offset: 0 })
+  const [page, setPage] = useState<CommentPage>({ items: [], total: 0, limit: params.limit ?? 50, offset: params.offset ?? 0 })
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const paramsRef = useRef(params)
@@ -29,9 +34,13 @@ export function useComments(params: { account_id?: string; replied?: boolean; q?
   useWebSocket(useCallback((e: WsEvent) => {
     if (e.event === "comments_update") {
       const incoming = (e.payload as { comments: Comment[] }).comments
+      if (!incoming?.length) return
+      const onFirstPage = (paramsRef.current.offset ?? 0) === 0
       setPage((prev) => ({
         ...prev,
-        items: [...incoming, ...prev.items].slice(0, prev.limit),
+        items: onFirstPage
+          ? [...incoming, ...prev.items].slice(0, prev.limit)
+          : prev.items,
         total: prev.total + incoming.length,
       }))
     } else if (e.event === "comment_replied") {
@@ -43,5 +52,6 @@ export function useComments(params: { account_id?: string; replied?: boolean; q?
     }
   }, []))
 
-  return { page, items: page.items, total: page.total, loading, error, refresh }
+  return { page, items: page.items, total: page.total, limit: page.limit,
+           offset: page.offset, loading, error, refresh }
 }

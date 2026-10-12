@@ -26,7 +26,7 @@ def check(cond, msg):
     print(("  PASS  " if cond else "  FAIL  ") + msg, flush=True)
 
 
-LS_FID = "v2_060000231003b20faec8c7e18f1fc6d3cb0cee34b0773daa92bb86ba5749d1746c790f240ebc@finder"
+LS_FID = "v2_0000000000000000000000000000000000000000000000000000000000000000000000000000@finder"
 GHOST_NAME = "切换视频号   取消切换"
 
 

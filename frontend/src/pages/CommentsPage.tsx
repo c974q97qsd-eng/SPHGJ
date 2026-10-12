@@ -16,9 +16,16 @@ import { useAccounts } from "@/hooks/useAccounts"
 import { api, type Comment } from "@/lib/api"
 import { fmtTime } from "@/lib/utils"
 import { toast } from "sonner"
-import { Search, Download, Send, Trash2, Pin, MessageSquare, Reply as ReplyIcon, AlertTriangle, Loader2 } from "lucide-react"
+import {
+  Search, Download, Send, Trash2, Pin, MessageSquare, Reply as ReplyIcon,
+  AlertTriangle, Loader2, ChevronLeft, ChevronRight,
+} from "lucide-react"
 
 type RepliedFilter = "all" | "unreplied" | "replied"
+
+/** 每页条数候选。默认 50:以前一次渲染 300 行(每行 8 个单元格 ≈ 2400 个 DOM 节点),
+ *  在 WebView2 里滚动与勾选都会明显卡顿。 */
+const PAGE_SIZES = [50, 100, 200]
 
 export function CommentsPage() {
   const { accounts } = useAccounts()
@@ -30,13 +37,21 @@ export function CommentsPage() {
   const [hideOwn, setHideOwn] = useState<boolean>(() => localStorage.getItem("sphgj.hide_own_comments") !== "0")
   useEffect(() => { localStorage.setItem("sphgj.hide_own_comments", hideOwn ? "1" : "0") }, [hideOwn])
 
+  // 分页:条数偏好持久化,方便不同屏幕各取所需
+  const [limit, setLimit] = useState<number>(() => {
+    const v = parseInt(localStorage.getItem("sphgj.comments_page_size") || "", 10)
+    return PAGE_SIZES.includes(v) ? v : 50
+  })
+  useEffect(() => { localStorage.setItem("sphgj.comments_page_size", String(limit)) }, [limit])
+  const [offset, setOffset] = useState(0)
+
   const params = useMemo(() => ({
     account_id: accountId === "all" ? undefined : accountId,
     replied: replied === "all" ? undefined : replied === "replied",
     q: q.trim() || undefined,
     hide_own: hideOwn ? 1 : undefined,
-    limit: 300,
-  }), [accountId, q, replied, hideOwn])
+    limit, offset,
+  }), [accountId, q, replied, hideOwn, limit, offset])
 
   const { items, total, loading, error, refresh } = useComments(params)
 
@@ -53,8 +68,15 @@ export function CommentsPage() {
     if (next.has(id)) next.delete(id); else next.add(id)
     return next
   })
-  // 筛选变化清空勾选
-  useEffect(() => { setCheckedIds(new Set()) }, [accountId, q, replied])
+  // 筛选变化:清空勾选并回到第一页(否则会停在一个越界的 offset 上)
+  useEffect(() => { setCheckedIds(new Set()); setOffset(0) }, [accountId, q, replied, hideOwn, limit])
+
+  // 末页被删空 -> 自动回退到最后一个有内容的页,避免停在空白页
+  useEffect(() => {
+    if (!loading && offset > 0 && items.length === 0 && total > 0) {
+      setOffset(Math.max(0, Math.floor((total - 1) / limit) * limit))
+    }
+  }, [loading, offset, items.length, total, limit])
 
   const batchDelete = async () => {
     const targets = items.filter((c) => checkedIds.has(c.comment_id))
@@ -190,6 +212,32 @@ export function CommentsPage() {
               </TableBody>
             </Table>
           )}
+        {total > 0 && (
+          <div className="flex flex-wrap items-center justify-between gap-2 border-t px-3 py-2">
+            <span className="text-xs text-muted-foreground">
+              第 {offset + 1}-{Math.min(offset + limit, total)} 条 / 共 {total} 条
+            </span>
+            <div className="flex items-center gap-2">
+              <Select value={String(limit)} onValueChange={(v) => { setLimit(Number(v)); setOffset(0) }}>
+                <SelectTrigger className="h-8 w-[96px] text-xs"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  {PAGE_SIZES.map((n) => <SelectItem key={n} value={String(n)}>{n} 条/页</SelectItem>)}
+                </SelectContent>
+              </Select>
+              <Button variant="outline" size="sm" disabled={offset === 0}
+                onClick={() => setOffset(Math.max(0, offset - limit))} className="gap-1">
+                <ChevronLeft className="h-3.5 w-3.5" />上一页
+              </Button>
+              <span className="whitespace-nowrap text-xs text-muted-foreground">
+                第 {Math.floor(offset / limit) + 1} / {Math.max(1, Math.ceil(total / limit))} 页
+              </span>
+              <Button variant="outline" size="sm" disabled={offset + limit >= total}
+                onClick={() => setOffset(offset + limit)} className="gap-1">
+                下一页<ChevronRight className="h-3.5 w-3.5" />
+              </Button>
+            </div>
+          </div>
+        )}
       </Card>
 
       {/* 上下文手动回复抽屉(诉求3:仅选中时触发) */}
