@@ -15,6 +15,7 @@ export interface AccountStatus {
   auto_comment_content: string
   has_aid: boolean
   wx_name: string
+  login_at: string | null
   locked: boolean
   locked_name: string
 }

@@ -15,6 +15,7 @@ import uuid
 import shutil
 import base64
 import asyncio
+import datetime
 from urllib.parse import urlparse, parse_qs
 import logging
 logger = logging.getLogger("sphgj")
@@ -226,7 +227,7 @@ class LoginSession:
         旧 page 随之被关闭,而 self.page 仍指着它 —— 之后所有 page.evaluate 都会抛
         「Target page, context or browser has been closed」。于是 auth_data 拿不到
         视频号名,auth_finder_list 兜底反查也因为同一个死 page 一起失败,最终名字
-        退化成 finder_id 前缀占位(线上曾因此出过一次事故)。
+        退化成 finder_id 前缀占位(线上 2026-09-26 09:06 uspoloassn6 事故)。
         """
         # 1. 现 page 还活着 -> 直接用
         if self.page is not None:
@@ -1110,6 +1111,7 @@ class LoginSession:
             acc["_log_finder_id"] = self.captured["finder_id"] or acc.get("_log_finder_id", "")
             acc["name"] = (name or self.captured["name"] or acc.get("name") or acc["id"]).strip()
             acc["_wx_name"] = self.captured.get("wx_name") or acc.get("_wx_name", "")
+            acc["login_at"] = datetime.datetime.now().isoformat(timespec="seconds")
             self._save_config()
             await self.emit("accounts_updated", {"reason": "login_finalize", "sid": self.sid})
             self._finalized = True
@@ -1130,6 +1132,7 @@ class LoginSession:
             dup["_log_finder_id"] = fid
             dup["name"] = (name or self.captured["name"] or dup.get("name") or dup["id"]).strip()
             dup["_wx_name"] = self.captured.get("wx_name") or dup.get("_wx_name", "")
+            dup["login_at"] = datetime.datetime.now().isoformat(timespec="seconds")
             dup["profile_dir"] = final_dir
             self._save_config()
             await self.emit("accounts_updated", {"reason": "login_finalize_dedup", "sid": self.sid})
@@ -1159,6 +1162,7 @@ class LoginSession:
             "_log_finder_id": self.captured["finder_id"],
             "_wx_name": self.captured.get("wx_name", ""),
             "profile_dir": final_dir,
+            "login_at": datetime.datetime.now().isoformat(timespec="seconds"),
             "auto_comment_enabled": False,
             "auto_comment_content": "",
         }

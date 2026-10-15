@@ -1235,6 +1235,7 @@ class AccountManager:
             "auto_comment_content": acc.get("auto_comment_content", ""),
             "has_aid": bool(acc.get("_aid")),
             "wx_name": acc.get("_wx_name", ""),
+            "login_at": acc.get("login_at"),
             "locked": bool(acc.get("locked_finder_id") or acc.get("locked_name")),
             "locked_name": acc.get("locked_name", ""),
         }

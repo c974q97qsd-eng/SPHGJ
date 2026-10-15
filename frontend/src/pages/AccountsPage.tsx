@@ -1,4 +1,4 @@
-import { useState } from "react"
+import { useState, useEffect } from "react"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -13,7 +13,7 @@ import { useAccounts, useAccountActions, type AccountStatus } from "@/hooks/useA
 import { api } from "@/lib/api"
 import { fmtTime } from "@/lib/utils"
 import { toast } from "sonner"
-import { Plus, Play, Square, Trash2, Save, Loader2, MessageSquarePlus, Users, ExternalLink, ChevronRight, Lock, Unlock } from "lucide-react"
+import { Plus, Play, Square, Trash2, Save, Loader2, MessageSquarePlus, Users, ExternalLink, ChevronRight, Lock, Unlock, Clock } from "lucide-react"
 
 export function AccountsPage() {
   const { accounts, loading, error, refresh } = useAccounts()
@@ -102,6 +102,7 @@ function AccountCard({ acc, onRefresh }: { acc: AccountStatus; onRefresh: () => 
                   <Lock className="h-3 w-3" />已锁定
                 </Badge>
               )}
+              <LoginCountdown loginAt={acc.login_at} />
             </CardTitle>
             <div className="flex items-center gap-3 text-xs text-muted-foreground">
               {acc.wx_name && <span>微信: {acc.wx_name}</span>}
@@ -208,6 +209,54 @@ function AutoCommentConfig({ acc }: { acc: AccountStatus }) {
         </div>
       )}
     </div>
+  )
+}
+
+const LOGIN_TTL_MS = 24 * 60 * 60 * 1000
+
+function fmtRemain(ms: number): string {
+  const s = Math.max(0, Math.floor(ms / 1000))
+  const h = Math.floor(s / 3600)
+  const m = Math.floor((s % 3600) / 60)
+  const ss = s % 60
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(ss).padStart(2, "0")}`
+}
+
+/** 登录态 24h 超时倒计时。锚点 = 登录成功时间 login_at(backend/login_capture.py 落盘),
+ *  覆盖手动登录 / 重新登录 / 自动 relogin 三条路径。 */
+function LoginCountdown({ loginAt }: { loginAt: string | null }) {
+  const [, forceTick] = useState(0)
+  useEffect(() => {
+    const timer = setInterval(() => forceTick((v) => v + 1), 1000)
+    return () => clearInterval(timer)
+  }, [])
+
+  const unknown = (
+    <Badge variant="outline" className="gap-1 text-muted-foreground" title="登录时间未知(旧账号数据),重新扫码后开始计时">
+      <Clock className="h-3 w-3" />计时未知
+    </Badge>
+  )
+  if (!loginAt) return unknown
+  const loginTs = new Date(loginAt).getTime()
+  if (Number.isNaN(loginTs)) return unknown
+
+  const remain = loginTs + LOGIN_TTL_MS - Date.now()
+  if (remain <= 0) {
+    return (
+      <Badge variant="outline" className="gap-1 border-destructive/50 text-destructive" title="登录态已超时(24 小时),请重新扫码">
+        <Clock className="h-3 w-3" />登录态已过期
+      </Badge>
+    )
+  }
+  const cls = remain < 60 * 60 * 1000
+    ? "border-destructive/50 text-destructive"
+    : remain < 6 * 60 * 60 * 1000
+      ? "border-amber-500/40 text-amber-600"
+      : "border-emerald-500/40 text-emerald-600"
+  return (
+    <Badge variant="outline" className={`gap-1 ${cls}`} title={`登录于 ${fmtTime(loginAt)} · 24 小时后超时,请提前重新扫码`}>
+      <Clock className="h-3 w-3" />登录态 {fmtRemain(remain)}
+    </Badge>
   )
 }
 
