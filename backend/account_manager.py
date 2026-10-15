@@ -794,6 +794,11 @@ class AccountManager:
         self._open_browsers = {}         # account_id -> headed BrowserContext(用户手动操作)
         # rev15 P0: 定时内存归还(gc.collect + 工作集压缩),解决 Python 分配器不归还 OS 的 RSS 膨胀
         self._memtrim = MemoryTrimmer(int(config.get("memtrim_interval_sec", 600)))
+        # rev21: 运行意图持久化 —— start/stop_account 时实时维护,
+        # 重启后 startup 按此恢复"关闭之前在跑"的账号(优雅关闭 stop_all 不清 intent)
+        self._run_intent_file = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "run_state.json")
+        self._run_intent = self._load_run_intent()
 
     async def _ensure_playwright(self):
         if self._playwright is None:
@@ -949,6 +954,9 @@ class AccountManager:
             w.start_loop()
             w.start_live_loop()
             self.workers[account_id] = w
+            # rev21: 记录运行意图(重启后自动恢复)
+            self._run_intent.add(account_id)
+            self._save_run_intent()
             # 手动启动:首检未播则进入短期开播探测(每 ~24s 查一次,最长 live_probe_window_sec 秒),
             # 尽快捕获"启动后开播"——解决非直播账号开播检测跟随 10 分钟抓取周期的延迟问题。
             if w.live_fetcher is None:
@@ -1034,10 +1042,68 @@ class AccountManager:
         return {"active": active, "active_name": active_name, "pending": list(self._relogin_queue)}
 
     async def stop_account(self, account_id):
+        # rev21: 用户主动停 -> 清运行意图(重启后不恢复该账号)
+        self._run_intent.discard(account_id)
+        self._save_run_intent()
         w = self.workers.pop(account_id, None)
         if w:
             await w.stop()
         await self._emit("engine_status", self.status_snapshot())
+
+    # ---------- rev21: 运行意图持久化(重启恢复) ----------
+    def _load_run_intent(self) -> set:
+        """读取上次退出前的运行中账号集合;文件不存在/损坏返回空集。"""
+        try:
+            with open(self._run_intent_file, encoding="utf-8") as f:
+                d = json.load(f)
+            return set(d.get("running", []) or [])
+        except Exception:
+            return set()
+
+    def _save_run_intent(self):
+        """运行意图原子落盘(临时文件 + os.replace);失败仅警告不阻断业务。"""
+        try:
+            os.makedirs(os.path.dirname(self._run_intent_file), exist_ok=True)
+            tmp = self._run_intent_file + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"running": sorted(self._run_intent),
+                           "saved_at": time.time()}, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, self._run_intent_file)
+        except Exception as e:
+            logger.warning(f"运行意图落盘失败(忽略): {e}")
+
+    async def restore_running_accounts(self, gap_sec: float = 4.0):
+        """重启后恢复关闭前在跑的账号。
+
+        - intent 由 start_account/stop_account 实时维护:用户关窗口/重启/强杀都不会丢,
+          只有用户主动点"停止"才清除 —— 语义即"关闭之前在运行中";
+        - 只恢复仍存在于 config 的账号(已删除的顺手清出 intent);
+        - 逐个错峰启动(默认间隔 4s),避免同时拉起多个 Chromium 争抢资源;
+        - 未登录/启动失败的账号移出 intent,避免每次重启空开浏览器。
+        """
+        known = {a["id"] for a in self.config.get("accounts", [])}
+        stale = self._run_intent - known
+        if stale:
+            self._run_intent -= stale
+            self._save_run_intent()
+        todo = [aid for aid in sorted(self._run_intent) if aid not in self.workers]
+        if not todo:
+            logger.info("[恢复] 无需要自动恢复的账号")
+            return
+        logger.info(f"[恢复] 重启后自动恢复 {len(todo)} 个关闭前在跑的账号: {todo}")
+        for i, aid in enumerate(todo):
+            if i:
+                await asyncio.sleep(gap_sec)
+            try:
+                await self.start_account(aid)
+                if aid not in self.workers:
+                    # 未登录/启动失败:移出 intent,避免下次重启再空试
+                    self._run_intent.discard(aid)
+                    self._save_run_intent()
+                    logger.warning(f"[恢复] {aid} 未登录或启动失败,已移出恢复列表")
+            except Exception as e:
+                logger.warning(f"[恢复] {aid} 启动异常(保留 intent,下次重启再试): {e}")
+        logger.info("[恢复] 自动恢复流程结束")
 
     async def open_account_browser(self, account_id):
         """打开带登录态的 headed 浏览器供用户手动操作。

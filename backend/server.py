@@ -104,6 +104,18 @@ async def _capture_loop():
     asyncio.create_task(_deep_autopsy_loop())
     # 作品每日定时刷新(手动刷新不受影响)
     asyncio.create_task(_posts_auto_refresh_loop())
+    # rev21: 重启后恢复"关闭之前在运行中的账号"
+    # 延迟 15s:等前端 WS 连上先拿到真实状态,恢复过程经 engine_status 事件实时可见
+    async def _auto_restore_loop():
+        await asyncio.sleep(15)
+        if not manager.config.get("auto_restore_running", True):
+            logger.info("[恢复] auto_restore_running=false,跳过自动恢复")
+            return
+        try:
+            await manager.restore_running_accounts()
+        except Exception as e:
+            logger.warning(f"[恢复] 自动恢复异常: {e}")
+    asyncio.create_task(_auto_restore_loop())
     # 打印运行版本(懒导入 main.VERSION,避免与 main 的循环依赖)
     try:
         from main import VERSION
