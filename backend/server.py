@@ -33,6 +33,7 @@ from . import schemas
 from .metrics import metric_dictionary, validate_card_fields, DEFAULT_CARD_FIELDS
 from .memtrim import trim_now
 from .post_fetcher import PostFetcher
+from .publish_queue import PublishQueue
 from . import restart as restart_mod
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
@@ -101,6 +102,15 @@ try:
 except Exception as _e:
     logger.warning(f"[启动] 评论归属迁移失败(不影响启动,下次再试): {_e}")
 manager = AccountManager(config, storage, emit=hub.emit)
+# rev25: 自动发作品调度器(inbox 扫描 + 队列 + UI 发布)
+publish_queue = PublishQueue(manager, storage, config, emit=hub.emit, save_config=save_config)
+# 上次进程中断时还在 running 的任务不能自动重发(可能实际已发出),转 need_review 等人工核对
+try:
+    _nr = storage.reset_running_tasks()
+    if _nr:
+        logger.warning(f"[publish] {_nr} 条任务上次运行中断,已转「待核对」(不会自动重发)")
+except Exception as _e:
+    logger.warning(f"[publish] 收尾 running 任务失败(不影响启动): {_e}")
 
 app = FastAPI(title="视频号评论区管理")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -132,6 +142,8 @@ async def _capture_loop():
         except Exception as e:
             logger.warning(f"[恢复] 自动恢复异常: {e}")
     asyncio.create_task(_auto_restore_loop())
+    # rev25: 自动发作品调度器(等自动恢复账号跑完再开始,见 PublishQueue._loop 的 20s 延迟)
+    publish_queue.start()
     # 打印运行版本(懒导入 main.VERSION,避免与 main 的循环依赖)
     try:
         from main import VERSION
@@ -689,6 +701,51 @@ async def system_info():
     """
     return {"ok": True, **restart_mod.runtime_info(),
             "restart": restart_mod.read_restart_status()}
+
+
+@app.post("/api/publish/probe")
+async def publish_probe(account_id: str = "", finder_id: str = "", upload_file: str = ""):
+    """【诊断】dump 视频号发布页 DOM 结构(只读,不填写不提交)。
+
+    发布页控件在 Shadow DOM 里、class 是编译产物,选择器必须按实测写。
+    用某个已登录且运行中的账号打开 platform/post/create,把可交互元素
+    (含 shadow root 层级 / iframe)落盘到 data/publish_dom_probe.json。
+    upload_file: 传一个本机视频路径时会注入上传(仍不点发表),用来探测
+    「上传后才渲染」的描述编辑器 —— 未上传时页面上根本没有描述框。
+    """
+    from . import publisher as pub
+    w = manager.workers.get(account_id) if account_id else None
+    if w is None and finder_id:
+        for cand in manager.workers.values():
+            if (cand.account.get("_log_finder_id") or "") == finder_id:
+                w = cand
+                break
+    if w is None:
+        raise HTTPException(400, "目标账号未运行,请先启动该账号再探测"
+                                 "(或传 finder_id 找当前运行且登录该视频号的卡片)")
+    if not w.logged_in:
+        raise HTTPException(400, "目标账号未登录,请先扫码登录")
+    ok = await w.ensure_browser()
+    if not ok or w.context is None:
+        raise HTTPException(500, "打开浏览器失败")
+    try:
+        out_dir = os.path.dirname(str(storage.db_path)) or "."
+        res = await pub.probe_post_create(w.context, out_dir, upload_file=upload_file)
+    finally:
+        try:
+            await w.release_idle_browser()
+        except Exception:
+            pass
+    return {"ok": res.get("ok"), "account_id": w.account.get("id"),
+            "file": res.get("file"), "final_url": res.get("final_url"),
+            "logged_in": res.get("logged_in"),
+            "has_file_input": res.get("has_file_input"),
+            "upload_injected": res.get("upload_injected"),
+            "upload_err": res.get("upload_err"),
+            "upload_poll": res.get("upload_poll"),
+            "publish_ready_at": res.get("publish_ready_at"),
+            "desc_probe": res.get("desc_probe"),
+            "key_nodes": res.get("key_nodes")}
 
 
 @app.post("/api/system/restart")
@@ -1742,6 +1799,213 @@ async def get_posts(
         it["account_name"] = name_map.get(it.get("account_id") or "",
                                           it.get("account_id") or "")
     return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+
+# ==================== 自动发作品(rev25) ====================
+
+@app.get("/api/publish/status")
+async def publish_status():
+    return publish_queue.status()
+
+
+@app.get("/api/publish/finders")
+async def publish_finders():
+    """可发布视频号列表:带承载卡片、今日已发、标题余量、绑定状态。"""
+    pool = storage.title_pool_stats()
+    today = datetime.now().strftime("%Y-%m-%d")
+    out = []
+    for acc in config.get("accounts") or []:
+        fid = (acc.get("locked_finder_id") or acc.get("_log_finder_id") or "").strip()
+        if not fid:
+            continue
+        w = manager.workers.get(acc.get("id"))
+        logged = bool(w and w.logged_in) or bool((acc.get("_log_finder_id") or "") == fid)
+        ps = pool.get(fid) or {}
+        out.append({
+            "finder_id": fid,
+            "name": acc.get("name") or fid[-8:],
+            "account_id": acc.get("id") or "",
+            "running": bool(w),
+            "logged_in": logged,
+            "human_stopped": (acc.get("id") in getattr(manager, "human_stopped", set())),
+            "today_success": storage.daily_success_count(fid, today),
+            "titles_total": ps.get("total", 0),
+            "titles_unused": ps.get("unused", 0),
+            "last_success_at": storage.last_success_at(fid),
+            "fail_streak": publish_queue._fail_streak.get(fid, 0),
+        })
+    generic = pool.get("") or {}
+    return {"items": out, "generic_titles": {"total": generic.get("total", 0),
+                                             "unused": generic.get("unused", 0)},
+            "mappings": (config.get("publish") or {}).get("mappings") or {}}
+
+
+@app.get("/api/publish/tasks")
+async def publish_tasks(status: str = "", finder_id: str = "", limit: int = 100, offset: int = 0):
+    rows, total = storage.query_tasks(status=status or None, finder_id=finder_id or None,
+                                      limit=min(limit, 500), offset=max(0, offset))
+    for r in rows:
+        r["finder_name"] = publish_queue.finder_label(r.get("finder_id") or "")
+    return {"items": rows, "total": total}
+
+
+@app.post("/api/publish/scan")
+async def publish_scan():
+    stat = publish_queue.scan_inbox()
+    filled = publish_queue.fill_missing_titles()
+    await publish_queue._push()
+    return {"ok": True, "scan": stat, "titles_filled": filled}
+
+
+@app.post("/api/publish/tasks/{task_id}/run")
+async def publish_run(task_id: int, dry_run: bool = False):
+    """立即发这一条。dry_run=1 只演练(上传+填描述,不点发表)。"""
+    if publish_queue._busy:
+        raise HTTPException(409, "正在发布另一条,请等它完成(发布是全局串行的)")
+    t = storage.get_task(task_id)
+    if not t:
+        raise HTTPException(404, "任务不存在")
+    if t.get("status") == "success":
+        raise HTTPException(400, "这条已经发布成功,不重复发(防重复)")
+    # 手动发:清掉该视频号的熔断,重试要给人机会
+    publish_queue._fail_streak[t.get("finder_id") or ""] = 0
+    if t.get("status") in ("failed", "need_review", "skipped"):
+        storage.reset_task(task_id)
+    res = await publish_queue.run_task(task_id, manual=True, dry_run=dry_run)
+    return {"ok": bool(res.get("ok")), "result": res}
+
+
+@app.post("/api/publish/tasks/{task_id}/skip")
+async def publish_skip(task_id: int):
+    t = storage.get_task(task_id)
+    if not t:
+        raise HTTPException(404, "任务不存在")
+    if t.get("status") == "running":
+        raise HTTPException(400, "正在发布中,不能跳过")
+    storage.set_task_status(task_id, status="skipped", step="skipped",
+                            error="人工跳过", finished=True)
+    if t.get("title_id"):
+        storage.release_title(t["title_id"])
+    await publish_queue._push()
+    return {"ok": True}
+
+
+@app.post("/api/publish/tasks/{task_id}/retry")
+async def publish_retry(task_id: int):
+    t = storage.get_task(task_id)
+    if not t:
+        raise HTTPException(404, "任务不存在")
+    if t.get("status") == "running":
+        raise HTTPException(400, "正在发布中")
+    publish_queue._fail_streak[t.get("finder_id") or ""] = 0
+    # 标题被还回池子后可能已被别的任务用掉 -> 重新取一条
+    if not (t.get("title") or "").strip():
+        tid, content = storage.take_title(t.get("finder_id") or "")
+        if tid:
+            storage.update_task_title(task_id, content)
+            storage.bind_title_task(tid, task_id)
+    storage.reset_task(task_id)
+    await publish_queue._push()
+    return {"ok": True}
+
+
+@app.post("/api/publish/tasks/{task_id}/title")
+async def publish_set_title(task_id: int, body: dict):
+    t = storage.get_task(task_id)
+    if not t:
+        raise HTTPException(404, "任务不存在")
+    title = (body.get("title") or "").strip()
+    if not title:
+        raise HTTPException(400, "标题不能为空")
+    storage.update_task_title(task_id, title)
+    return {"ok": True, "title": title}
+
+
+@app.delete("/api/publish/tasks/{task_id}")
+async def publish_delete(task_id: int):
+    t = storage.get_task(task_id)
+    if not t:
+        raise HTTPException(404, "任务不存在")
+    if t.get("status") == "running":
+        raise HTTPException(400, "正在发布中,不能删除")
+    storage.delete_task(task_id)
+    return {"ok": True}
+
+
+@app.get("/api/publish/titles")
+async def publish_titles(finder_id: Optional[str] = None, include_used: bool = True):
+    return {"items": storage.query_titles(finder_id=finder_id, include_used=include_used),
+            "stats": storage.title_pool_stats()}
+
+
+@app.post("/api/publish/titles")
+async def publish_add_titles(body: dict):
+    finder_id = (body.get("finder_id") or "").strip()
+    raw = body.get("contents")
+    if isinstance(raw, str):
+        contents = raw.splitlines()
+    elif isinstance(raw, list):
+        contents = [str(x) for x in raw]
+    else:
+        raise HTTPException(400, "contents 需要是数组或换行文本")
+    n = storage.add_titles(contents, finder_id=finder_id)
+    filled = publish_queue.fill_missing_titles()
+    await publish_queue._push()
+    return {"ok": True, "added": n, "titles_filled": filled}
+
+
+@app.delete("/api/publish/titles/{title_id}")
+async def publish_delete_title(title_id: int):
+    storage.delete_title(title_id)
+    return {"ok": True}
+
+
+@app.post("/api/publish/titles/clear")
+async def publish_clear_titles(body: dict):
+    finder_id = body.get("finder_id")
+    only_used = bool(body.get("only_used"))
+    n = storage.clear_titles(finder_id=finder_id, only_used=only_used)
+    return {"ok": True, "deleted": n}
+
+
+PUBLISH_SETTING_KEYS = ("enabled", "inbox_dir", "scan_interval_sec", "daily_limit",
+                        "min_gap_sec", "gap_jitter_sec", "window_start", "window_end",
+                        "auto_start_account", "min_login_remain_sec")
+
+
+@app.post("/api/publish/settings")
+async def publish_settings(body: dict):
+    cfg = config.setdefault("publish", {})
+    for k in PUBLISH_SETTING_KEYS:
+        if k in body and body[k] is not None:
+            cfg[k] = body[k]
+    if isinstance(body.get("per_finder"), dict):
+        cfg["per_finder"] = body["per_finder"]
+    save_config(config)
+    await publish_queue._push()
+    return {"ok": True, "cfg": cfg}
+
+
+@app.post("/api/publish/mappings")
+async def publish_mappings(body: dict):
+    """保存「inbox 目录名 -> 视频号」绑定。body: {"mappings": {"目录名": "finder_id"}}。"""
+    mp = body.get("mappings")
+    if not isinstance(mp, dict):
+        raise HTTPException(400, "mappings 需要是 {目录名: finder_id} 对象")
+    cfg = config.setdefault("publish", {})
+    cur = cfg.get("mappings") or {}
+    for k, v in mp.items():
+        if v:
+            cur[str(k)] = str(v)
+        else:
+            cur.pop(str(k), None)
+    cfg["mappings"] = cur
+    save_config(config)
+    # 绑定后立刻重新扫一遍,把之前落在「未认领」里的文件收进来
+    stat = publish_queue.scan_inbox()
+    publish_queue.fill_missing_titles()
+    await publish_queue._push()
+    return {"ok": True, "mappings": cur, "scan": stat}
 
 
 @app.get("/api/posts/finders")

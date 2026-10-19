@@ -804,6 +804,9 @@ class AccountManager:
         self._run_intent_file = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "run_state.json")
         self._run_intent = self._load_run_intent()
+        # rev25: 用户手动点停的账号。自动发作品调度器不会去拉起这些号(避免跟用户操作打架),
+        # 用户下次手动启动时自动清除。
+        self.human_stopped = set()
 
     async def _ensure_playwright(self):
         if self._playwright is None:
@@ -959,6 +962,7 @@ class AccountManager:
             w.start_loop()
             w.start_live_loop()
             self.workers[account_id] = w
+            self.human_stopped.discard(account_id)  # rev25: 手动启动 -> 恢复自动发布资格
             # rev21: 记录运行意图(重启后自动恢复)
             self._run_intent.add(account_id)
             self._save_run_intent()
@@ -1049,6 +1053,8 @@ class AccountManager:
     async def stop_account(self, account_id):
         # rev21: 用户主动停 -> 清运行意图(重启后不恢复该账号)
         self._run_intent.discard(account_id)
+        # rev25: 记下「人工停止」,自动发作品调度器不要替他拉起
+        self.human_stopped.add(account_id)
         self._save_run_intent()
         w = self.workers.pop(account_id, None)
         if w:

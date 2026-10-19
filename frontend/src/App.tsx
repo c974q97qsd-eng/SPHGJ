@@ -15,6 +15,7 @@ import { AutoReplyPage } from "@/pages/AutoReplyPage"
 import { LiveScreenPage } from "@/pages/LiveScreenPage"
 import { AutoDeletePage } from "@/pages/AutoDeletePage"
 import { PostsPage } from "@/pages/PostsPage"
+import { PublishPage } from "@/pages/PublishPage"
 
 /** 失效账号自动依次扫码进度通知:后端驱动弹窗,前端只提示进度。 */
 function AutoReloginNotifier() {
@@ -52,6 +53,7 @@ export default function App() {
                 <Route path="/auto-delete" element={<AutoDeletePage />} />
                 <Route path="/live-screen" element={<LiveScreenPage />} />
                 <Route path="/posts" element={<PostsPage />} />
+                <Route path="/publish" element={<PublishPage />} />
               </Routes>
             </AppShell>
             <Toaster />

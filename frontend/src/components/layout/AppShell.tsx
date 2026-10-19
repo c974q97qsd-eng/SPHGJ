@@ -2,7 +2,7 @@ import { useEffect, useState, type ReactNode } from "react"
 import { NavLink, useLocation } from "react-router-dom"
 import {
   LayoutDashboard, Users, MessageSquare, Moon, Sun,
-  Play, Square, RefreshCw, Loader2, Monitor, Type, Clapperboard,
+  Play, Square, RefreshCw, Loader2, Monitor, Type, Clapperboard, Send,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -27,10 +27,11 @@ const NAV = [
   { to: "/accounts", label: "账号管理", icon: Users },
   { to: "/comments", label: "评论管理", icon: MessageSquare },
   { to: "/posts", label: "作品管理", icon: Clapperboard },
+  { to: "/publish", label: "发布管理", icon: Send },
   { to: "/live-screen", label: "直播大屏", icon: Monitor },
 ]
 
-const TITLES: Record<string, string> = { "/": "仪表盘", "/accounts": "账号管理", "/comments": "评论管理", "/auto-reply": "评论管理", "/auto-delete": "评论管理", "/live-screen": "直播大屏", "/posts": "作品管理" }
+const TITLES: Record<string, string> = { "/": "仪表盘", "/accounts": "账号管理", "/comments": "评论管理", "/auto-reply": "评论管理", "/auto-delete": "评论管理", "/live-screen": "直播大屏", "/posts": "作品管理", "/publish": "发布管理" }
 
 function EngineControls() {
   const { status, refresh } = useAccounts()
