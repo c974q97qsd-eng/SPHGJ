@@ -969,8 +969,12 @@ class LoginSession:
         #    不再用 CSS 选择器抓页面文本:顶栏 .account-info 下根本没有 .name,
         #    回退到容器会把「切换视频号/取消切换」等控件文案一起抓进来(text_content
         #    连隐藏节点都算),这正是账号名被抓错的根因。
+        # rev22 提速:这里原来是固定空等 2.5s。扫码后页面通常已就绪(上一段
+        # localStorage 都读到了),空等纯属浪费 —— 实测「扫码成功 -> 抓取完成」
+        # 的 5s 里约一半耗在这段死等。改成短等待,页面没就绪时由
+        # _fetch_finder_identity 的 3 次重试(每次间隔 1s)兜底,不会更不可靠。
         try:
-            await self.page.wait_for_timeout(2500)
+            await self.page.wait_for_timeout(600)
         except Exception as e:
             logger.debug(f"[login:{self.sid}] 等待页面稳定异常(忽略): {e}")
         await self._ensure_page_alive()

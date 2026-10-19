@@ -86,17 +86,26 @@ export function AddAccountDialog({ open, onOpenChange, onDone, reloginAccountId,
     try {
       const r = await api.loginFinalize(s, reloginAccountId, name || undefined)
       const acc = r?.account as { _dedup_updated?: boolean; id?: string; name?: string } | undefined
-      if (reloginAccountId) {
-        await api.startAccount(reloginAccountId)
-        toast.success("已重新登录并启动")
-      } else if (acc?._dedup_updated && acc.id) {
-        await api.startAccount(acc.id).catch(() => {})
-        toast.success(`已更新账号${acc.name ? ` ${acc.name}` : ""} 并启动`)
-      } else {
-        toast.success("账号已添加")
-      }
+      // rev22 提速:finalize 返回 = 已落盘,立刻关弹窗给反馈。
+      // 启动账号要新开浏览器 + 校验登录态(实测 4s+),放后台跑,
+      // 不让用户对着「正在保存」转圈;失败再单独提示。
       onOpenChange(false)
       onDone()
+      const startId = reloginAccountId || (acc?._dedup_updated ? acc.id : undefined)
+      if (!startId) { toast.success("账号已添加"); return }
+      toast.success(reloginAccountId
+        ? "已重新登录,正在启动…"
+        : `已更新账号${acc?.name ? ` ${acc.name}` : ""},正在启动…`)
+      void (async () => {
+        try {
+          await api.startAccount(startId)
+          toast.success(reloginAccountId ? "已重新登录并启动" : "账号已启动")
+        } catch (e) {
+          toast.error("账号已保存,但启动失败:" + (e as Error).message)
+        } finally {
+          onDone()
+        }
+      })()
     } catch (e) {
       const msg = (e as Error).message
       setError("保存失败:" + msg)

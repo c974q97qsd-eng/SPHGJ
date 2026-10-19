@@ -52,6 +52,8 @@ export function useAccountActions(refresh: () => void) {
     remove: (id: string, removeProfile: boolean) => act(id, (i) => api.deleteAccount(i, removeProfile)),
     // 锁定/解锁微信身份:锁定后该账号只接受锁定的微信登录
     setLock: (id: string, locked: boolean) => act(id, (i) => (locked ? api.lockAccount(i) : api.unlockAccount(i))),
+    // 退出登录态:清该账号登录文件(账号保留),之后需重新扫码
+    logout: (id: string) => act(id, api.logoutAccount),
   }
 }
 

@@ -13,7 +13,7 @@ import { useAccounts, useAccountActions, type AccountStatus } from "@/hooks/useA
 import { api } from "@/lib/api"
 import { fmtTime } from "@/lib/utils"
 import { toast } from "sonner"
-import { Plus, Play, Square, Trash2, Save, Loader2, MessageSquarePlus, Users, ExternalLink, ChevronRight, Lock, Unlock, Clock } from "lucide-react"
+import { Plus, Play, Square, Trash2, Save, Loader2, MessageSquarePlus, Users, ExternalLink, ChevronRight, Lock, Unlock, Clock, LogOut } from "lucide-react"
 
 export function AccountsPage() {
   const { accounts, loading, error, refresh } = useAccounts()
@@ -50,7 +50,7 @@ export function AccountsPage() {
 }
 
 function AccountCard({ acc, onRefresh }: { acc: AccountStatus; onRefresh: () => void }) {
-  const { busy, start, stop, openBrowser, remove, setLock } = useAccountActions(onRefresh)
+  const { busy, start, stop, openBrowser, remove, setLock, logout } = useAccountActions(onRefresh)
   const [delOpen, setDelOpen] = useState(false)
   const [reloginOpen, setReloginOpen] = useState(false)
   const isBusy = busy === acc.id
@@ -73,6 +73,18 @@ function AccountCard({ acc, onRefresh }: { acc: AccountStatus; onRefresh: () => 
         await setLock(acc.id, true)
         toast.success(`已锁定「${acc.name}」,其他微信扫码会被拦截并清除登录态`)
       }
+    } catch (e) {
+      toast.error("操作失败:" + (e as Error).message)
+    }
+  }
+
+  // 退出登录态:清掉该账号的登录文件(账号卡片保留),之后需重新扫码
+  const handleLogout = async () => {
+    if (!window.confirm(`退出「${acc.name}」的登录态?\n\n会清除该账号的登录信息(账号本身保留),之后需要重新扫码登录。`)) return
+    try {
+      const r = await logout(acc.id)
+      if (r?.ok) toast.success(r.message || "已退出登录态,请重新扫码")
+      else toast.error("退出未完成:" + (r?.message || "登录文件未清干净,请重试"))
     } catch (e) {
       toast.error("操作失败:" + (e as Error).message)
     }
@@ -102,7 +114,7 @@ function AccountCard({ acc, onRefresh }: { acc: AccountStatus; onRefresh: () => 
                   <Lock className="h-3 w-3" />已锁定
                 </Badge>
               )}
-              <LoginCountdown loginAt={acc.login_at} />
+              <LoginCountdown loginAt={acc.login_at} logoutAt={acc.logout_at} />
             </CardTitle>
             <div className="flex items-center gap-3 text-xs text-muted-foreground">
               {acc.wx_name && <span>微信: {acc.wx_name}</span>}
@@ -123,6 +135,16 @@ function AccountCard({ acc, onRefresh }: { acc: AccountStatus; onRefresh: () => 
               aria-label={acc.locked ? "解锁微信绑定" : "锁定当前微信"}
             >
               {acc.locked ? <Lock className="h-4 w-4 text-amber-600" /> : <Unlock className="h-4 w-4" />}
+            </Button>
+            <Button
+              size="icon"
+              variant="ghost"
+              onClick={handleLogout}
+              disabled={isBusy || (!acc.logged_in && !acc.login_at)}
+              title="退出登录态(清除登录信息,账号保留,之后需重新扫码)"
+              aria-label="退出登录态"
+            >
+              {isBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <LogOut className="h-4 w-4" />}
             </Button>
             <Button size="icon" variant="ghost" onClick={() => setDelOpen((v) => !v)} aria-label="删除"><Trash2 className="h-4 w-4 text-destructive" /></Button>
           </div>
@@ -224,13 +246,21 @@ function fmtRemain(ms: number): string {
 
 /** 登录态 24h 超时倒计时。锚点 = 登录成功时间 login_at(backend/login_capture.py 落盘),
  *  覆盖手动登录 / 重新登录 / 自动 relogin 三条路径。 */
-function LoginCountdown({ loginAt }: { loginAt: string | null }) {
+function LoginCountdown({ loginAt, logoutAt }: { loginAt: string | null; logoutAt?: string | null }) {
   const [, forceTick] = useState(0)
   useEffect(() => {
     const timer = setInterval(() => forceTick((v) => v + 1), 1000)
     return () => clearInterval(timer)
   }, [])
 
+  // 手动退出过登录态:明确显示「未登录」,而不是含糊的「计时未知」
+  if (!loginAt && logoutAt) {
+    return (
+      <Badge variant="outline" className="gap-1 text-muted-foreground" title={`已于 ${fmtTime(logoutAt)} 退出登录态,重新扫码后开始计时`}>
+        <Clock className="h-3 w-3" />未登录
+      </Badge>
+    )
+  }
   const unknown = (
     <Badge variant="outline" className="gap-1 text-muted-foreground" title="登录时间未知(旧账号数据),重新扫码后开始计时">
       <Clock className="h-3 w-3" />计时未知

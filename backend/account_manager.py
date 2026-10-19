@@ -19,7 +19,7 @@ from .auto_reply import AutoReply
 from .auto_delete import AutoDelete
 from .live_fetcher import LiveFetcher
 from .auto_comment import AutoCommenter
-from .login_capture import LoginSession
+from .login_capture import LoginSession, clear_login_state
 from .browser import launch_stealth, close_context_safely
 from .selectors import COMMENT_URL, POST_CREATE_URL
 from .memtrim import MemoryTrimmer, trim_now
@@ -1050,6 +1050,41 @@ class AccountManager:
             await w.stop()
         await self._emit("engine_status", self.status_snapshot())
 
+    async def logout_account(self, account_id):
+        """手动退出登录态(rev22):停 worker / 关 headed 浏览器 -> 清 profile 内登录文件。
+
+        与「删除账号」的区别:账号配置(名称/ID/profile_dir)全部保留,只清登录 Cookie
+        与 LocalStorage,下次必须重新扫码。_aid / _log_finder_id / locked_* 一律保留 ——
+        重新扫码仍能命中同一账号,锁定校验也照旧生效。
+        返回 (ok, 中文说明)。
+        """
+        acc = next((a for a in self.config.get("accounts", []) if a["id"] == account_id), None)
+        if not acc:
+            return False, "账号不存在"
+        # 1) 先停 worker 释放 profile 目录锁,否则清登录态必然失败
+        if account_id in self.workers:
+            try:
+                await self.stop_account(account_id)
+            except Exception as e:
+                logger.warning(f"[{account_id}] 退出登录前停止 worker 失败: {e}")
+        # 2) 关掉用户手动打开的 headed 浏览器(否则同样占着 profile)
+        ctx = self._open_browsers.pop(account_id, None)
+        if ctx:
+            try:
+                await close_context_safely(ctx, acc.get("profile_dir"), f"[{account_id}] logout")
+            except Exception as e:
+                logger.debug(f"[{account_id}] 退出登录时关闭 headed 浏览器异常(忽略): {e}")
+        # 3) 清 profile 内登录文件(函数自带 ./profiles 范围校验),稍等句柄释放
+        await asyncio.sleep(0.3)
+        ok, msg = clear_login_state(acc.get("profile_dir") or "")
+        # 4) 清登录时间(倒计时归零),另记退出时间供前端展示「未登录」
+        acc["login_at"] = None
+        acc["logout_at"] = datetime.now().isoformat(timespec="seconds")
+        self._save_config()
+        await self._emit("accounts_updated", {"reason": "logout", "account_id": account_id})
+        logger.info(f"[{account_id}] 已退出登录态: {msg}")
+        return ok, msg
+
     # ---------- rev21: 运行意图持久化(重启恢复) ----------
     def _load_run_intent(self) -> set:
         """读取上次退出前的运行中账号集合;文件不存在/损坏返回空集。"""
@@ -1302,6 +1337,7 @@ class AccountManager:
             "has_aid": bool(acc.get("_aid")),
             "wx_name": acc.get("_wx_name", ""),
             "login_at": acc.get("login_at"),
+            "logout_at": acc.get("logout_at"),
             "locked": bool(acc.get("locked_finder_id") or acc.get("locked_name")),
             "locked_name": acc.get("locked_name", ""),
         }

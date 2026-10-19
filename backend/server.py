@@ -1041,6 +1041,19 @@ async def unlock_account(account_id: str):
     return {"ok": True, "locked": False, "accounts": manager.status_snapshot()["accounts"]}
 
 
+@app.post("/api/accounts/{account_id}/logout")
+async def logout_account(account_id: str):
+    """手动退出登录态(rev22):清该账号 profile 内的登录文件,账号配置保留。
+
+    清理失败(浏览器没退干净)不抛 500,如实返回原因,前端据此提示重试 ——
+    这是用户主动操作,失败原因必须可见,不能只留个红叉。
+    """
+    ok, msg = await manager.logout_account(account_id)
+    if msg == "账号不存在":
+        raise HTTPException(404, msg)
+    return {"ok": ok, "message": msg, "accounts": manager.status_snapshot()["accounts"]}
+
+
 @app.post("/api/accounts/{account_id}/start")
 async def start_account(account_id: str):
     w = await manager.start_account(account_id)

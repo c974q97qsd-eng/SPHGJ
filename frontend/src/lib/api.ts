@@ -16,6 +16,8 @@ export interface AccountStatus {
   has_aid: boolean
   wx_name: string
   login_at: string | null
+  /** 手动退出登录态的时间(rev22);未退出过为 undefined */
+  logout_at?: string | null
   locked: boolean
   locked_name: string
 }
@@ -226,6 +228,9 @@ export const api = {
     req<{ ok: boolean; locked: boolean; accounts: AccountStatus[] }>(`/accounts/${id}/lock`, { method: "POST" }),
   unlockAccount: (id: string) =>
     req<{ ok: boolean; locked: boolean; accounts: AccountStatus[] }>(`/accounts/${id}/unlock`, { method: "POST" }),
+  /** 退出登录态:清该账号 profile 内登录文件,账号保留(下次需重新扫码) */
+  logoutAccount: (id: string) =>
+    req<{ ok: boolean; message: string; accounts: AccountStatus[] }>(`/accounts/${id}/logout`, { method: "POST" }),
   openAccountBrowser: (id: string) => req<{ ok: boolean }>(`/accounts/${id}/open-browser`, { method: "POST" }),
   openDashboard: (id: string) => req<{ ok: boolean }>(`/accounts/${id}/open-dashboard`, { method: "POST" }),
 

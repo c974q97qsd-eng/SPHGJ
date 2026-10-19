@@ -1,8 +1,8 @@
 import { useEffect, useState, type ReactNode } from "react"
 import { NavLink, useLocation } from "react-router-dom"
 import {
-  LayoutDashboard, Users, MessageSquare, Reply, Moon, Sun,
-  Play, Square, RefreshCw, Loader2, Trash2, Monitor, Type, Clapperboard,
+  LayoutDashboard, Users, MessageSquare, Moon, Sun,
+  Play, Square, RefreshCw, Loader2, Monitor, Type, Clapperboard,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -21,17 +21,16 @@ import { useAccounts } from "@/hooks/useAccounts"
 import { cn } from "@/lib/utils"
 import { toast } from "sonner"
 
+// rev22:「自动回复」「自动删除」并入「评论管理」,不再单列导航项
 const NAV = [
   { to: "/", label: "仪表盘", icon: LayoutDashboard },
   { to: "/accounts", label: "账号管理", icon: Users },
-  { to: "/comments", label: "评论", icon: MessageSquare },
-  { to: "/auto-reply", label: "自动回复", icon: Reply },
-  { to: "/auto-delete", label: "自动删除", icon: Trash2 },
+  { to: "/comments", label: "评论管理", icon: MessageSquare },
   { to: "/posts", label: "作品管理", icon: Clapperboard },
   { to: "/live-screen", label: "直播大屏", icon: Monitor },
 ]
 
-const TITLES: Record<string, string> = { "/": "仪表盘", "/accounts": "账号管理", "/comments": "评论", "/auto-reply": "自动回复设置", "/auto-delete": "自动删除", "/live-screen": "直播大屏", "/posts": "作品管理" }
+const TITLES: Record<string, string> = { "/": "仪表盘", "/accounts": "账号管理", "/comments": "评论管理", "/auto-reply": "评论管理", "/auto-delete": "评论管理", "/live-screen": "直播大屏", "/posts": "作品管理" }
 
 function EngineControls() {
   const { status, refresh } = useAccounts()
@@ -164,7 +163,7 @@ export function AppShell({ children }: { children: ReactNode }) {
         <div className="p-3">
           <div className="rounded-md bg-muted/50 p-3 text-xs text-muted-foreground">
             <p className="font-medium text-foreground mb-1">视频号评论区</p>
-            <p>多账号 · 增量抓取 · 自动回复</p>
+            <p>多账号 · 增量抓取 · 评论管理</p>
           </div>
         </div>
       </aside>
