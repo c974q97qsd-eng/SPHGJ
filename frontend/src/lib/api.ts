@@ -300,6 +300,21 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
   return (await r.json()) as T
 }
 
+export type PostPlayResult = {
+  ok: boolean
+  url?: string
+  title?: string
+  message?: string
+  refreshed?: boolean
+}
+
+export type RemoteSession = {
+  account_id: string
+  url: string
+  idle_sec: number
+  created_at: number
+}
+
 export const api = {
   // 运行日志(after=0 拉全量;轮询时用上次 seq 拉增量)
   getLogs: (after = 0) => req<LogsResult>(`/logs?after=${after}`),
@@ -429,6 +444,15 @@ export const api = {
   publishAddTitles: (finder_id: string, contents: string) =>
     req<{ ok: boolean; added: number; titles_filled: number }>("/publish/titles", { method: "POST", body: JSON.stringify({ finder_id, contents }) }),
   publishDeleteTitle: (id: number) => req<{ ok: boolean }>(`/publish/titles/${id}`, { method: "DELETE" }),
+  // 作品播放:后端会校验 CDN 地址时效,过期就用当前登录态现取
+  postPlay: (finder_id: string, object_id: string) =>
+    req<PostPlayResult>(`/posts/play?finder_id=${encodeURIComponent(finder_id)}&object_id=${encodeURIComponent(object_id)}`),
+
+  // 远程同步浏览
+  remoteSessions: () => req<{ items: RemoteSession[] }>("/remote/sessions"),
+  remoteClose: (account: string) =>
+    req<{ ok: boolean }>(`/remote/close?account=${encodeURIComponent(account)}`, { method: "POST" }),
+
   publishClearTitles: (finder_id?: string, only_used = false) =>
     req<{ ok: boolean; deleted: number }>("/publish/titles/clear", { method: "POST", body: JSON.stringify({ finder_id, only_used }) }),
   publishSaveSettings: (body: Record<string, unknown>) =>

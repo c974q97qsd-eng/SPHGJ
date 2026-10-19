@@ -71,6 +71,7 @@ def _extract_post(p):
         "export_id": p.get("exportId") or p.get("objectId") or "",
         "title": (desc.get("description") or "").strip(),
         "cover_url": cover_url,
+        "video_url": media.get("url") or media.get("fullUrl") or "",
         "cover_hash": hashlib.md5(cover_url.encode("utf-8")).hexdigest() if cover_url else "",
         "create_time": int(p.get("createTime") or 0),
         "read_count": int(p.get("readCount") or 0),
@@ -104,6 +105,53 @@ class PostFetcher:
     def finder_id(self):
         """作品归属主键:视频号 ID。登录卡片 id 会变,视频号 ID 不会。"""
         return (self.account.get("_log_finder_id") or "").strip()
+
+    async def find_video_url(self, worker, object_id, max_pages=3, page_size=None):
+        """现取某作品的播放地址(CDN 地址有时效,旧作品存的会过期)。
+
+        复用 worker 的 context 开临时页,直接打 post_list 接口翻前几页找 object_id。
+        找不到返回 ""。
+        """
+        oid = (object_id or "").strip()
+        if not oid or worker is None or worker.context is None:
+            return ""
+        ps = int(page_size or self.page_size)
+        aidv = self.account.get("_aid") or ""
+        page = None
+        try:
+            page = await worker.context.new_page()
+            # 先落到 channels 域:new_page() 是 about:blank,跨站 fetch 不会带登录 cookie
+            try:
+                await page.goto(PAGE_URL, wait_until="domcontentloaded", timeout=45000)
+                await page.wait_for_timeout(3000)
+            except Exception as e:
+                logger.debug(f"[posts] 现取地址前打开列表页失败(继续): {e}")
+            for pg in range(1, int(max_pages) + 1):
+                url = f"{BASE}/post/post_list?_aid={aidv}&_pageUrl={quote(PAGE_URL)}"
+                r = await page.evaluate(FETCH_JS, {"url": url, "body": _body(
+                    self.finder_id, pageSize=ps, currentPage=pg,
+                    userpageType=11, stickyOrder=True)})
+                try:
+                    data = json.loads(r.get("body") or "{}")
+                except Exception:
+                    continue
+                lst = (((data.get("data") or {}).get("list")) or [])
+                for p in lst:
+                    if (p.get("objectId") or p.get("exportId")) == oid:
+                        ms = ((p.get("desc") or {}).get("media") or [])
+                        if ms:
+                            return ms[0].get("url") or ms[0].get("fullUrl") or ""
+                if not lst:
+                    break
+        except Exception as e:
+            logger.debug(f"[posts] 现取视频地址失败 {oid}: {e}")
+        finally:
+            if page is not None:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+        return ""
 
     # ---------------- 封面 ----------------
     async def _ensure_covers(self, context, rows):

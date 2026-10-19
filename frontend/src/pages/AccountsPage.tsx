@@ -90,12 +90,19 @@ function AccountCard({ acc, onRefresh }: { acc: AccountStatus; onRefresh: () => 
     }
   }
 
-  const handleOpen = async () => {
-    try {
-      await openBrowser(acc.id)
-      toast.success("已打开浏览器,关闭后自动恢复抓取")
-    } catch (e) {
-      toast.error("打开失败:" + (e as Error).message)
+  // rev27: 「打开」不再弹本机窗口,改为把该账号的浏览器串流到新标签页
+  // (本机内嵌窗口没有多标签,就在当前窗口打开,同一个页面)
+  const handleOpen = () => {
+    const target = `/remote?account=${encodeURIComponent(acc.id)}`
+    const inWebview = !!(window as unknown as { pywebview?: unknown }).pywebview
+    if (inWebview) {
+      window.location.assign(target)
+      return
+    }
+    const w = window.open(target, "_blank")
+    if (!w) {
+      toast.info("浏览器拦截了新标签页,已在当前页打开")
+      window.location.assign(target)
     }
   }
 
@@ -122,7 +129,7 @@ function AccountCard({ acc, onRefresh }: { acc: AccountStatus; onRefresh: () => 
             </div>
           </div>
           <div className="flex items-center gap-1">
-            <Button size="sm" variant="outline" onClick={handleOpen} disabled={isBusy} aria-label="打开账号浏览器">{isBusy ? <Loader2 className="animate-spin" /> : <ExternalLink className="h-3.5 w-3.5" />}打开</Button>
+            <Button size="sm" variant="outline" onClick={handleOpen} disabled={isBusy} aria-label="远程打开账号浏览器" title="在新标签页里远程操作这个账号的浏览器(5 分钟无操作自动关闭)">{<ExternalLink className="h-3.5 w-3.5" />}打开</Button>
             {acc.running
               ? <Button size="sm" variant="outline" onClick={() => stop(acc.id)} disabled={isBusy}>{isBusy ? <Loader2 className="animate-spin" /> : <Square className="h-3.5 w-3.5" />}停止</Button>
               : <Button size="sm" variant="outline" onClick={handleStart} disabled={isBusy}>{isBusy ? <Loader2 className="animate-spin" /> : <Play className="h-3.5 w-3.5" />}启动</Button>}

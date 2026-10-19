@@ -28,6 +28,7 @@ POSTS_DDL = """CREATE TABLE IF NOT EXISTS posts(
             create_time INTEGER, read_count INTEGER, like_count INTEGER, comment_count INTEGER,
             forward_count INTEGER, fav_count INTEGER, follow_count INTEGER,
             visible_type INTEGER, sticky_op INTEGER, stat_sig TEXT,
+            video_url TEXT,
             raw TEXT, updated_at TEXT,
             PRIMARY KEY(finder_id, object_id))"""
 
@@ -153,6 +154,10 @@ class Storage:
         # 作品管理:作品本地库 + 抓取账本 + 本工具发出的评论(自动回复/自动评论/手动回复)
         # 归属主键 = finder_id(视频号 ID);account_id 只记「最后抓取它的登录卡片」,不参与主键。
         c.execute(POSTS_DDL)
+        # rev27: 作品播放地址(CDN 直链,带时效;失效时由 /api/posts/play 现取)
+        _pcols = {r[1] for r in c.execute("PRAGMA table_info(posts)")}
+        if "video_url" not in _pcols:
+            c.execute("ALTER TABLE posts ADD COLUMN video_url TEXT")
         c.execute(META_DDL)
         c.execute("""CREATE TABLE IF NOT EXISTS own_comments(
             finder_id TEXT, account_id TEXT, comment_id TEXT UNIQUE, via TEXT, created_at TEXT)""")
@@ -735,8 +740,9 @@ class Storage:
                 sig = f"{r['read_count']}:{r['like_count']}:{r['comment_count']}"
                 c.execute("""INSERT INTO posts(finder_id,object_id,account_id,export_id,title,cover_url,
                              cover_hash,cover_path,create_time,read_count,like_count,comment_count,
-                             forward_count,fav_count,follow_count,visible_type,sticky_op,stat_sig,raw,updated_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                             forward_count,fav_count,follow_count,visible_type,sticky_op,stat_sig,
+                             video_url,raw,updated_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     ON CONFLICT(finder_id,object_id) DO UPDATE SET
                       account_id=excluded.account_id,
                       export_id=excluded.export_id, title=excluded.title,
@@ -745,12 +751,16 @@ class Storage:
                       comment_count=excluded.comment_count, forward_count=excluded.forward_count,
                       fav_count=excluded.fav_count, follow_count=excluded.follow_count,
                       visible_type=excluded.visible_type, sticky_op=excluded.sticky_op,
-                      stat_sig=excluded.stat_sig, raw=excluded.raw, updated_at=excluded.updated_at""",
+                      stat_sig=excluded.stat_sig,
+                      video_url=CASE WHEN COALESCE(excluded.video_url,'')<>''
+                                     THEN excluded.video_url ELSE posts.video_url END,
+                      raw=excluded.raw, updated_at=excluded.updated_at""",
                     (finder_id, r["object_id"], account_id or "", r["export_id"], r["title"],
                      r["cover_url"], r["cover_hash"], r.get("cover_path") or "",
                      r["create_time"], r["read_count"], r["like_count"], r["comment_count"],
                      r["forward_count"], r["fav_count"], r["follow_count"],
-                     r["visible_type"], r["sticky_op"], sig, r["raw"], now))
+                     r["visible_type"], r["sticky_op"], sig, r.get("video_url") or "",
+                     r["raw"], now))
             c.commit()
         finally:
             c.close()
@@ -859,6 +869,58 @@ class Storage:
                           is_hidden=(r[13] == 3), is_sticky=(r[14] == 2),
                           updated_at=r[15]) for r in rows]
             return items, total
+        finally:
+            c.close()
+
+    def backfill_video_urls(self, limit=100000):
+        """从已存的 raw 里补 video_url(rev27,幂等)。
+
+        历史行没有单独存播放地址,但 raw 里有完整 desc.media[0].url —— 不用重新抓。
+        注意 CDN 地址带时效:补出来的是「当时抓取那一刻」的地址,过期后由
+        /api/posts/play 现取新的。
+        """
+        c = self._conn()
+        n = 0
+        try:
+            rows = c.execute("SELECT finder_id,object_id,raw FROM posts "
+                             "WHERE COALESCE(video_url,'')='' AND raw LIKE ? "
+                             "LIMIT ?", ('%"url"%', int(limit))).fetchall()
+            for fid, oid, raw in rows:
+                url = ""
+                try:
+                    p = json.loads(raw or "{}")
+                    ms = ((p.get("desc") or {}).get("media") or [])
+                    if ms:
+                        url = ms[0].get("url") or ms[0].get("fullUrl") or ""
+                except Exception:
+                    url = ""
+                if url:
+                    c.execute("UPDATE posts SET video_url=? WHERE finder_id=? AND object_id=?",
+                              (url, fid, oid))
+                    n += 1
+            c.commit()
+        finally:
+            c.close()
+        return n
+
+    def get_post_video(self, finder_id, object_id):
+        """取一条作品的播放信息(地址 + 标题)。"""
+        c = self._conn()
+        try:
+            r = c.execute("SELECT title,video_url,create_time FROM posts "
+                          "WHERE finder_id=? AND object_id=?", (finder_id, object_id)).fetchone()
+            if not r:
+                return None
+            return {"title": r[0] or "", "video_url": r[1] or "", "create_time": r[2]}
+        finally:
+            c.close()
+
+    def update_post_video(self, finder_id, object_id, url):
+        c = self._conn()
+        try:
+            c.execute("UPDATE posts SET video_url=? WHERE finder_id=? AND object_id=?",
+                      (url or "", finder_id, object_id))
+            c.commit()
         finally:
             c.close()
 

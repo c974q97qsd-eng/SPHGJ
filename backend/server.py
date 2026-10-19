@@ -17,6 +17,7 @@ from typing import Optional
 import socket
 import time
 import random
+import urllib.request
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query, Request
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -34,6 +35,7 @@ from .metrics import metric_dictionary, validate_card_fields, DEFAULT_CARD_FIELD
 from .memtrim import trim_now
 from .post_fetcher import PostFetcher
 from .publish_queue import PublishQueue
+from .remote_view import RemoteRegistry
 from . import restart as restart_mod
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
@@ -101,9 +103,18 @@ try:
     logger.info(f"[启动] 评论归属迁移: {_cm}")
 except Exception as _e:
     logger.warning(f"[启动] 评论归属迁移失败(不影响启动,下次再试): {_e}")
+# rev27: 历史作品没有单独存播放地址,但 raw 里有 -> 启动补一次(幂等)
+try:
+    _nv = storage.backfill_video_urls()
+    if _nv:
+        logger.info(f"[启动] 回填作品播放地址 {_nv} 条")
+except Exception as _e:
+    logger.warning(f"[启动] 回填作品播放地址失败(不影响启动): {_e}")
 manager = AccountManager(config, storage, emit=hub.emit)
 # rev25: 自动发作品调度器(inbox 扫描 + 队列 + UI 发布)
 publish_queue = PublishQueue(manager, storage, config, emit=hub.emit, save_config=save_config)
+# rev27: 远程同步浏览(CDP 串流),「打开」按钮走这里,5 分钟无操作自动断开
+remote_registry = RemoteRegistry(manager, config, storage)
 # 上次进程中断时还在 running 的任务不能自动重发(可能实际已发出),转 need_review 等人工核对
 try:
     _nr = storage.reset_running_tasks()
@@ -746,6 +757,167 @@ async def publish_probe(account_id: str = "", finder_id: str = "", upload_file: 
             "publish_ready_at": res.get("publish_ready_at"),
             "desc_probe": res.get("desc_probe"),
             "key_nodes": res.get("key_nodes")}
+
+
+def _url_playable(url, timeout=8):
+    """CDN 地址是否还能拉(带 Range 只取 2 字节,便宜)。"""
+    if not url:
+        return False
+    try:
+        req = urllib.request.Request(url, headers={"Range": "bytes=0-1"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status in (200, 206)
+    except Exception:
+        return False
+
+
+@app.get("/api/posts/play")
+async def post_play(finder_id: str = Query(""), object_id: str = Query("")):
+    """取作品播放地址。存的地址过期时用该视频号的浏览器现取一次。
+
+    CDN 直链带时效(实测 2025 年的地址已 400),所以不能只存一次就完事。
+    """
+    if not finder_id or not object_id:
+        raise HTTPException(400, "缺少 finder_id / object_id")
+    row = storage.get_post_video(finder_id, object_id)
+    if row is None:
+        raise HTTPException(404, "作品不存在")
+    url = row.get("video_url") or ""
+    refreshed = False
+    if not await asyncio.to_thread(_url_playable, url):
+        # 地址为空或已过期 -> 用登录着该视频号的 worker 现取
+        aid = ""
+        for a_id, w in (manager.workers or {}).items():
+            if (w.account.get("_log_finder_id") or "").strip() == finder_id:
+                aid = a_id
+                break
+        if not aid:
+            acc = next((a for a in config.get("accounts", [])
+                        if (a.get("_log_finder_id") or a.get("locked_finder_id") or "") == finder_id),
+                       None)
+            aid = (acc or {}).get("id") or ""
+        w = (manager.workers or {}).get(aid)
+        if w is not None and w.logged_in:
+            acc_obj = w.account
+            fresh = await PostFetcher(storage, acc_obj, config).find_video_url(w, object_id)
+            if fresh:
+                storage.update_post_video(finder_id, object_id, fresh)
+                url, refreshed = fresh, True
+    if not await asyncio.to_thread(_url_playable, url):
+        return {"ok": False, "title": row.get("title") or "",
+                "message": "这条作品的播放地址已失效,且当前无法现取"
+                           "(视频号未运行/作品太旧不在列表前几页)。"
+                           "启动该账号后重试,或到视频号后台查看。"}
+    return {"ok": True, "url": url, "refreshed": refreshed,
+            "title": row.get("title") or ""}
+
+
+@app.websocket("/api/remote/ws")
+async def remote_ws(ws: WebSocket, account: str = Query(""), url: str = Query("")):
+    """远程同步浏览通道(rev27)。
+
+    文本帧 = JSON 指令/元信息;二进制帧 = JPEG 画面。
+    客户端 -> 服务端:{t:"mouse"|"text"|"key"|"nav"|"ping"|"close"}
+    服务端 -> 客户端:{t:"opening"|"hello"|"url"|"closed"|"error"} + 二进制 JPEG
+
+    会话期间该账号 worker 会让出 profile 锁(数据抓取暂停),断开/空闲超时后自动恢复。
+    """
+    await ws.accept()
+    if not account:
+        try:
+            await ws.send_json({"t": "error", "message": "缺少 account 参数"})
+            await ws.close()
+        except Exception:
+            pass
+        return
+    sess = None
+    try:
+        await ws.send_json({"t": "opening", "account_id": account})
+        sess, reused = await remote_registry.open(account, url or None)
+        await ws.send_json(sess.meta())
+    except Exception as e:
+        logger.warning(f"[remote] 建立会话失败 {account}: {e}")
+        try:
+            await ws.send_json({"t": "error",
+                                "message": f"{type(e).__name__}: {str(e)[:200]}"})
+            await ws.close()
+        except Exception:
+            pass
+        return
+
+    async def reader():
+        while True:
+            msg = await ws.receive_json()
+            t = msg.get("t")
+            if t == "mouse":
+                await sess.mouse(msg.get("kind") or "move", msg.get("x") or 0,
+                                msg.get("y") or 0, msg.get("button") or "left",
+                                dy=msg.get("dy") or 0, dx=msg.get("dx") or 0)
+            elif t == "text":
+                await sess.text(msg.get("text") or "")
+            elif t == "key":
+                await sess.key(msg.get("name") or "")
+            elif t == "nav":
+                await sess.nav(msg.get("action") or "", msg.get("url") or "")
+            elif t == "close":
+                return
+            elif t == "ping":
+                pass          # 只保活,不刷新「用户动作」时间(否则空闲超时永不触发)
+
+    async def pusher():
+        while not sess.closed:
+            jpeg = await sess.next_frame(timeout=0.8)
+            if jpeg:
+                await ws.send_bytes(jpeg)
+            if sess.closed:
+                break
+
+    async def urlwatch():
+        last = ""
+        while not sess.closed:
+            await asyncio.sleep(1.2)
+            cur = await sess.refresh_url()
+            if cur and cur != last:
+                last = cur
+                await ws.send_json({"t": "url", "url": cur})
+
+    tasks = [asyncio.create_task(reader()), asyncio.create_task(pusher()),
+             asyncio.create_task(urlwatch())]
+    try:
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for p in pending:
+            p.cancel()
+    except Exception as e:
+        logger.debug(f"[remote] WS 循环异常: {e}")
+    finally:
+        reason = sess.close_reason or ("idle" if sess.closed else "client")
+        try:
+            await remote_registry.close(account, reason)
+        except Exception:
+            pass
+        try:
+            await ws.send_json({"t": "closed", "reason": reason})
+        except Exception:
+            pass
+        try:
+            await ws.close()
+        except Exception:
+            pass
+
+
+@app.get("/api/remote/sessions")
+async def remote_sessions():
+    """当前串流会话(用于界面显示「谁在占用」)。"""
+    return {"items": remote_registry.snapshot()}
+
+
+@app.post("/api/remote/close")
+async def remote_close(account: str = Query("")):
+    """手动断开某账号的串流并恢复抓取。"""
+    if not account:
+        raise HTTPException(400, "缺少 account 参数")
+    await remote_registry.close(account, "manual")
+    return {"ok": True}
 
 
 @app.post("/api/system/restart")

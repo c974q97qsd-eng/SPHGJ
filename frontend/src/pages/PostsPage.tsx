@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Card } from "@/components/ui/card"
+import { PlayDialog } from "@/components/posts/PlayDialog"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Badge } from "@/components/ui/badge"
@@ -12,7 +13,7 @@ import { fmtTime, cn } from "@/lib/utils"
 import { toast } from "sonner"
 import {
   Search, RefreshCw, Loader2, EyeOff, Eye, Pin, PinOff,
-  ChevronLeft, ChevronRight, ArrowUpDown, Clapperboard,
+  ChevronLeft, ChevronRight, ArrowUpDown, Clapperboard, Copy, Play,
 } from "lucide-react"
 
 type VisibleFilter = "all" | "public" | "hidden" | "sticky"
@@ -46,6 +47,7 @@ export function PostsPage() {
   const [offset, setOffset] = useState(0)
   const limit = 50
 
+  const [play, setPlay] = useState<{ fid: string; oid: string; title: string } | null>(null)
   const [items, setItems] = useState<PostItem[]>([])
   const [total, setTotal] = useState(0)
   const [loading, setLoading] = useState(true)
@@ -202,8 +204,32 @@ export function PostsPage() {
   const lastRefresh = finders
     .map((f) => f.meta?.last_refresh).filter(Boolean).sort().reverse()[0]
 
+  /** 复制文本。局域网 http 下 navigator.clipboard 不可用(非安全上下文),必须兜底。 */
+  const copyText = async (t: string) => {
+    if (!t) { toast.info("这条作品没有标题"); return }
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(t)
+      } else {
+        const ta = document.createElement("textarea")
+        ta.value = t
+        ta.style.position = "fixed"
+        ta.style.opacity = "0"
+        document.body.appendChild(ta)
+        ta.select()
+        document.execCommand("copy")
+        document.body.removeChild(ta)
+      }
+      toast.success("标题已复制")
+    } catch {
+      toast.error("复制失败,请手动选中标题复制")
+    }
+  }
+
   return (
     <div className="space-y-4">
+      <PlayDialog open={!!play} onOpenChange={(v) => { if (!v) setPlay(null) }}
+        finderId={play?.fid || ""} objectId={play?.oid || ""} title={play?.title} />
       {/* 筛选栏 */}
       <Card className="p-3">
         <div className="flex flex-wrap items-center gap-2">
@@ -345,6 +371,15 @@ export function PostsPage() {
                             className="h-full w-full object-cover"
                             onError={(e) => { (e.target as HTMLImageElement).style.display = "none" }} />
                         ) : null}
+                        {/* 点封面播放(地址过期后端会现取) */}
+                        <button type="button"
+                          onClick={() => setPlay({ fid: p.finder_id, oid: p.object_id, title: p.title })}
+                          className="absolute inset-0 flex items-center justify-center bg-black/30 opacity-0 transition-opacity group-hover:opacity-100"
+                          aria-label="播放作品">
+                          <span className="flex h-11 w-11 items-center justify-center rounded-full bg-white/90 text-black shadow">
+                            <Play className="ml-0.5 h-5 w-5 fill-current" />
+                          </span>
+                        </button>
                         <div className="absolute left-1.5 top-1.5">
                           <Checkbox checked={checked.has(k)} onChange={() => toggleOne(k)} aria-label="选择该作品" />
                         </div>
@@ -359,8 +394,14 @@ export function PostsPage() {
                         </div>
                       </div>
                       <div className="p-2">
-                        <p className="line-clamp-2 min-h-[2.5rem] text-xs leading-5" title={p.title}>
+                        {/* 点标题复制 */}
+                        <p className="group/title line-clamp-2 min-h-[2.5rem] cursor-pointer text-xs leading-5 hover:text-primary"
+                          title={p.title ? `${p.title}\n(点击复制)` : "(无标题)"}
+                          onClick={() => copyText(p.title)}>
                           {p.title || <span className="text-muted-foreground">(无标题)</span>}
+                          {p.title ? (
+                            <Copy className="ml-1 inline h-3 w-3 align-[-1px] opacity-0 transition-opacity group-hover/title:opacity-60" />
+                          ) : null}
                         </p>
                         <div className="mt-1 flex items-center justify-between text-xs text-muted-foreground">
                           {/* 归属显示视频号,不是登录卡片 */}
