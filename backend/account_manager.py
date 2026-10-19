@@ -115,13 +115,18 @@ class AccountWorker:
         except Exception as e:
             logger.warning(f"[{self.account['id']}] 加载直播窗口状态失败: {e}")
         # 自动回复/评论/删除/抓取器:先建(内部持有 api 引用),开浏览器后统一重绑
+        # 归属视频号 getter:每次现取(登录/重登后 _log_finder_id 会变),
+        # 评论、自动回复、自动删除、自动评论统一按视频号归属,不再按登录卡片
+        _fid = (lambda: (self.account.get("_log_finder_id")
+                         or self.account.get("locked_finder_id") or ""))
         self.auto_reply = AutoReply(None, self.storage, self.account["id"],
-                                    self.config.get("auto_reply") or {})
+                                    self.config.get("auto_reply") or {}, finder_getter=_fid)
         self.auto_commenter = AutoCommenter(None, self.storage, self.account)
         self.auto_delete = AutoDelete(None, self.storage, self.account["id"],
-                                      self.config.get("auto_delete") or {})
+                                      self.config.get("auto_delete") or {}, finder_getter=_fid)
         self.fetcher = CommentFetcher(None, self.storage, self.account["id"],
-                                      self.auto_reply, self.auto_commenter, self.auto_delete)
+                                      self.auto_reply, self.auto_commenter, self.auto_delete,
+                                      finder_getter=_fid)
         # 按需开浏览器(懒加载):不长期常驻 Chromium 进程——抓取/直播/手动操作时才开,
         # 空闲(非直播)即收回省内存。失败(如 profile 锁被占用)由调用方处理。
         try:

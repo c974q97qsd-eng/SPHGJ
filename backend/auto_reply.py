@@ -12,11 +12,22 @@ logger = logging.getLogger("sphgj")
 
 
 class AutoReply:
-    def __init__(self, api_client, storage, account_id, auto_config):
+    def __init__(self, api_client, storage, account_id, auto_config, finder_getter=None):
         self.api = api_client
         self.storage = storage
         self.account_id = account_id
         self.auto_config = auto_config or {}
+        self._finder_getter = finder_getter
+
+    @property
+    def finder_id(self):
+        """归属主键 = 视频号 finder_id(取不到用 acct:<卡片> 兜底)。"""
+        try:
+            fid = (self._finder_getter() if self._finder_getter else "") or ""
+        except Exception:
+            fid = ""
+        fid = fid.strip()
+        return fid or ("acct:" + self.account_id)
 
     def is_enabled(self):
         return bool(self.auto_config.get("enabled"))
@@ -71,12 +82,14 @@ class AutoReply:
                 new_cid = self._parse_new_comment_id(resp)
                 if new_cid:
                     await asyncio.to_thread(self.storage.mark_own_comment,
-                                            self.account_id, new_cid, "auto_reply",
-                                            content=reply_text, export_id=export_id)
+                                            self.finder_id, new_cid, "auto_reply",
+                                            content=reply_text, export_id=export_id,
+                                            account_id=self.account_id)
                 else:
                     logger.warning(f"[{self.account_id}] 回复成功但未返回 commentId,已记待确认(抓到该评论后自动补登): {str(resp)[:200]}")
                     await asyncio.to_thread(self.storage.mark_own_comment_pending,
-                                            self.account_id, export_id, reply_text, "auto_reply")
+                                            self.finder_id, export_id, reply_text, "auto_reply",
+                                            self.account_id)
                 logger.info(f"[{self.account_id}] 自动回复 {cid}({content[:15]})-> {reply_text}")
                 return True
             logger.warning(f"[{self.account_id}] 回复失败 {cid}: {resp}")

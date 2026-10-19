@@ -28,6 +28,8 @@ export interface EngineStatus {
 }
 
 export interface Comment {
+  /** 归属视频号(评论是视频号的资产,不是登录卡片的) */
+  finder_id: string
   account_id: string
   export_id: string
   comment_id: string
@@ -47,6 +49,17 @@ export interface CommentPage {
   offset: number
 }
 
+/** 评论归属视频号:评论数、最后抓取时间、承载卡片与是否已登录 */
+export interface CommentFinder {
+  finder_id: string
+  name: string
+  account_id: string
+  account_ids: string[]
+  logged_in: boolean
+  comments: number
+  last_fetched: string | null
+}
+
 export interface AutoReplyConfig {
   enabled: boolean
   rules: { keyword: string; reply: string }[]
@@ -58,6 +71,8 @@ export interface AutoDeleteConfig {
 }
 
 export interface DeleteLogItem {
+  finder_id: string
+  finder_name: string
   account_id: string
   account_name: string
   comment_id: string
@@ -276,22 +291,24 @@ export const api = {
   engineStop: () => req<EngineStatus>("/engine/stop", { method: "POST" }),
   engineFetchNow: () => req<{ ok: boolean }>("/engine/fetch-now", { method: "POST" }),
 
-  getComments: (params: { account_id?: string; replied?: boolean; q?: string; hide_own?: number; limit?: number; offset?: number } = {}) => {
+  getComments: (params: { finder_id?: string; account_id?: string; replied?: boolean; q?: string; hide_own?: number; limit?: number; offset?: number } = {}) => {
     const q = new URLSearchParams()
     Object.entries(params).forEach(([k, v]) => v !== undefined && v !== "" && q.set(k, String(v)))
     return req<CommentPage>(`/comments?${q.toString()}`)
   },
-  replyComment: (comment_id: string, account_id: string, content: string) =>
-    req<{ ok: boolean }>(`/comments/${comment_id}/reply`, { method: "POST", body: JSON.stringify({ account_id, content }) }),
-  deleteComment: (comment_id: string, account_id: string, export_id: string) =>
-    req<{ ok: boolean }>(`/comments/${comment_id}`, { method: "DELETE", body: JSON.stringify({ account_id, export_id }) }),
-  batchDeleteComments: (items: { comment_id: string; account_id: string; export_id: string }[]) =>
+  getCommentFinders: () => req<{ items: CommentFinder[] }>("/comments/finders"),
+  // 写操作一律带 finder_id:卡片删了/换了也能找到登录着该视频号的账号来执行
+  replyComment: (comment_id: string, finder_id: string, account_id: string, content: string) =>
+    req<{ ok: boolean }>(`/comments/${comment_id}/reply`, { method: "POST", body: JSON.stringify({ finder_id, account_id, content }) }),
+  deleteComment: (comment_id: string, finder_id: string, account_id: string, export_id: string) =>
+    req<{ ok: boolean }>(`/comments/${comment_id}`, { method: "DELETE", body: JSON.stringify({ finder_id, account_id, export_id }) }),
+  batchDeleteComments: (items: { finder_id?: string; comment_id: string; account_id: string; export_id: string }[]) =>
     req<{ ok: boolean; deleted: number; failed: { comment_id: string; error: string }[] }>("/comments/batch-delete", {
       method: "POST",
       body: JSON.stringify({ items }),
     }),
-  pinComment: (comment_id: string, account_id: string, export_id: string, op_type = 1) =>
-    req<{ ok: boolean }>(`/comments/${comment_id}/pin`, { method: "POST", body: JSON.stringify({ account_id, export_id, op_type }) }),
+  pinComment: (comment_id: string, finder_id: string, account_id: string, export_id: string, op_type = 1) =>
+    req<{ ok: boolean }>(`/comments/${comment_id}/pin`, { method: "POST", body: JSON.stringify({ finder_id, account_id, export_id, op_type }) }),
 
   getAutoReply: () => req<AutoReplyConfig>("/auto-reply/rules"),
   setAutoReply: (body: AutoReplyConfig) =>
@@ -299,13 +316,13 @@ export const api = {
   getAutoDelete: () => req<AutoDeleteConfig>("/auto-delete/rules"),
   setAutoDelete: (body: AutoDeleteConfig) =>
     req<{ ok: boolean; auto_delete: AutoDeleteConfig }>("/auto-delete/rules", { method: "PATCH", body: JSON.stringify(body) }),
-  getDeleteLogs: (params: { account_id?: string; q?: string; limit?: number; offset?: number } = {}) => {
+  getDeleteLogs: (params: { finder_id?: string; account_id?: string; q?: string; limit?: number; offset?: number } = {}) => {
     const q = new URLSearchParams()
     Object.entries(params).forEach(([k, v]) => v !== undefined && v !== "" && q.set(k, String(v)))
     return req<DeleteLogPage>(`/auto-delete/logs?${q.toString()}`)
   },
-  clearDeleteLogs: (account_id?: string) =>
-    req<{ ok: boolean }>(`/auto-delete/logs${account_id ? `?account_id=${account_id}` : ""}`, { method: "DELETE" }),
+  clearDeleteLogs: (finder_id?: string) =>
+    req<{ ok: boolean }>(`/auto-delete/logs${finder_id ? `?finder_id=${encodeURIComponent(finder_id)}` : ""}`, { method: "DELETE" }),
 
   // ==================== 作品管理 ====================
   getPosts: (params: { finder_id?: string; account_id?: string; q?: string; visible?: string; date_from?: string; date_to?: string; sort?: string; order?: string; limit?: number; offset?: number } = {}) => {
@@ -324,5 +341,5 @@ export const api = {
   getLiveScreenStatus: () => req<{ items: LiveScreenItem[]; card_fields: string[] }>("/live-screen/status"),
   getMetricsDictionary: () => req<{ metrics: MetricDef[]; card_fields: string[] }>("/metrics/dictionary"),
 
-  exportCsvUrl: (account_id?: string) => `/api/comments/export${account_id ? `?account_id=${account_id}` : ""}`,
+  exportCsvUrl: (finder_id?: string) => `/api/comments/export${finder_id ? `?finder_id=${encodeURIComponent(finder_id)}` : ""}`,
 }

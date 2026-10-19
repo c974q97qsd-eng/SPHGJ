@@ -8,7 +8,7 @@ import { useWebSocket, type WsEvent } from "@/lib/ws"
  * WS 新评论的插入策略:只有停在【第一页】时才前置插入 —— 否则会打乱当前页的
  * 分页窗口(第 N 页看到的是别人的内容),此时只更新 total,翻回第一页即可看到。
  */
-export function useComments(params: { account_id?: string; replied?: boolean; q?: string; hide_own?: number; limit?: number; offset?: number }) {
+export function useComments(params: { finder_id?: string; account_id?: string; replied?: boolean; q?: string; hide_own?: number; limit?: number; offset?: number }) {
   const [page, setPage] = useState<CommentPage>({ items: [], total: 0, limit: params.limit ?? 50, offset: params.offset ?? 0 })
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -33,8 +33,15 @@ export function useComments(params: { account_id?: string; replied?: boolean; q?
   // WS:新评论 -> 前置插入;回复/删除 -> 局部更新
   useWebSocket(useCallback((e: WsEvent) => {
     if (e.event === "comments_update") {
-      const incoming = (e.payload as { comments: Comment[] }).comments
-      if (!incoming?.length) return
+      const all = (e.payload as { comments: Comment[] }).comments
+      if (!all?.length) return
+      // 正在筛选某个视频号/账号时,只收归属匹配的新评论 —— 否则别的视频号的新评论
+      // 会被插进当前筛选结果里(列表串号)
+      const cur = paramsRef.current
+      const incoming = all.filter((c) =>
+        (!cur.finder_id || c.finder_id === cur.finder_id) &&
+        (!cur.account_id || c.account_id === cur.account_id))
+      if (!incoming.length) return
       const onFirstPage = (paramsRef.current.offset ?? 0) === 0
       setPage((prev) => ({
         ...prev,

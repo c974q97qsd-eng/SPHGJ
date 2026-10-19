@@ -12,11 +12,22 @@ logger = logging.getLogger("sphgj")
 
 
 class AutoDelete:
-    def __init__(self, api_client, storage, account_id, auto_config):
+    def __init__(self, api_client, storage, account_id, auto_config, finder_getter=None):
         self.api = api_client
         self.storage = storage
         self.account_id = account_id
+        self._finder_getter = finder_getter
         self.update_config(auto_config or {})
+
+    @property
+    def finder_id(self):
+        """归属主键 = 视频号 finder_id(取不到用 acct:<卡片> 兜底)。"""
+        try:
+            fid = (self._finder_getter() if self._finder_getter else "") or ""
+        except Exception:
+            fid = ""
+        fid = fid.strip()
+        return fid or ("acct:" + self.account_id)
 
     def update_config(self, auto_config):
         self.auto_config = auto_config or {}
@@ -53,7 +64,8 @@ class AutoDelete:
                 await asyncio.to_thread(self.storage.mark_deleted, cid)
                 # 写删除记录(命中关键字/内容/昵称/时间),供删除记录卡片展示
                 await asyncio.to_thread(self.storage.log_delete,
-                                        self.account_id, cid, nickname, content, kw, export_id)
+                                        self.finder_id, cid, nickname, content, kw, export_id,
+                                        self.account_id)
                 logger.info(f"[{self.account_id}] 自动删除 {cid}({content[:15]}) 命中关键字 {kw}")
                 return True
             logger.warning(f"[{self.account_id}] 删除失败 {cid}: {resp}")

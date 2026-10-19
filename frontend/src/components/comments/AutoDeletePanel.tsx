@@ -173,7 +173,7 @@ function DeleteLogsCard() {
                   <div className="flex items-center justify-between gap-2">
                     <div className="flex items-center gap-2 min-w-0">
                       <span className="truncate font-medium">{log.nickname || "匿名"}</span>
-                      <Badge variant="secondary" className="shrink-0 font-normal">{log.account_name}</Badge>
+                      <Badge variant="secondary" className="shrink-0 font-normal">{log.finder_name || log.account_name}</Badge>
                     </div>
                     <span className="shrink-0 text-[0.625rem] text-muted-foreground">{fmtTime(log.deleted_at)}</span>
                   </div>

@@ -15,16 +15,20 @@ class AccountUpdate(BaseModel):
 
 
 class ManualReply(BaseModel):
+    # 归属 = 视频号 finder_id(优先);account_id 保留为旧前端兼容与「找不到登录卡片」兜底
+    finder_id: Optional[str] = None
     account_id: str
     content: str = Field(..., min_length=1)
 
 
 class DeleteCommentBody(BaseModel):
+    finder_id: Optional[str] = None
     account_id: str
     export_id: str
 
 
 class BatchDeleteItem(BaseModel):
+    finder_id: Optional[str] = None
     comment_id: str
     account_id: str
     export_id: str
@@ -69,6 +73,7 @@ class AutoDeleteConfig(BaseModel):
 
 
 class PinCommentBody(BaseModel):
+    finder_id: Optional[str] = None
     account_id: str
     export_id: str
     op_type: int = 1  # 1 置顶 / 0 取消

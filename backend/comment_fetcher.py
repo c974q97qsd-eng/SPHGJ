@@ -24,9 +24,10 @@ import logging
 logger = logging.getLogger("sphgj")
 
 
-def _shape(account_id, export_id, cmt):
-    """把 API 原始评论对象整成前端友好的 dict。"""
+def _shape(finder_id, account_id, export_id, cmt):
+    """把 API 原始评论对象整成前端友好的 dict(归属 = finder_id 视频号)。"""
     return {
+        "finder_id": finder_id,
         "account_id": account_id,
         "export_id": export_id,
         "comment_id": cmt.get("commentId"),
@@ -45,13 +46,27 @@ class CommentFetcher:
     # 峰值降到 O(阈值)。200 条约 100KB,对推送开销与内存占用的折中取值。
     FLUSH_THRESHOLD = 200
 
-    def __init__(self, api_client, storage, account_id, auto_reply=None, auto_commenter=None, auto_delete=None):
+    def __init__(self, api_client, storage, account_id, auto_reply=None, auto_commenter=None,
+                 auto_delete=None, finder_getter=None):
         self.api = api_client
         self.storage = storage
         self.account_id = account_id
         self.auto_reply = auto_reply
         self.auto_commenter = auto_commenter
         self.auto_delete = auto_delete
+        # 归属视频号:登录后从 profile 读到的 finder_id(随扫码/重登变化),每次现取
+        self._finder_getter = finder_getter
+
+    @property
+    def finder_id(self):
+        """归属主键 = 视频号 finder_id。读不到(未登录/新卡片)时用 acct:<卡片> 兜底,
+        之后 migrate_comments_to_finder 会把它换成真值,数据不会丢。"""
+        try:
+            fid = (self._finder_getter() if self._finder_getter else "") or ""
+        except Exception:
+            fid = ""
+        fid = fid.strip()
+        return fid or ("acct:" + self.account_id)
 
     async def _s(self, fn, *args):
         """storage 同步方法放线程池执行,避免 SQLite 阻塞事件循环。"""
@@ -87,7 +102,7 @@ class CommentFetcher:
             return await self._fetch_all_inner(max_videos=max_videos, on_batch=on_batch)
         finally:
             try:
-                n = await self._s(self.storage.reconcile_own_comments, self.account_id)
+                n = await self._s(self.storage.reconcile_own_comments, self.finder_id)
                 if n:
                     logger.info(f"[{self.account_id}] 补登自己发出的评论 {n} 条")
             except Exception as e:
@@ -128,7 +143,7 @@ class CommentFetcher:
                     logger.debug(f"[{self.account_id}] {oid} commentCount 缺失,强制抓取")
                     st = None
                 else:
-                    st = await self._s(self.storage.get_video_fetch_state, self.account_id, oid)
+                    st = await self._s(self.storage.get_video_fetch_state, self.finder_id, oid)
                 # 新视频检测(本地无记录)-> 自动评论+置顶
                 is_new = (st is None) or (not st["seen"])
                 if is_new and self.auto_commenter:
@@ -140,7 +155,8 @@ class CommentFetcher:
                     # 优化1:接口明确说没评论 -> 跳过(记录快照)。set 内部有单调性保护,
                     # 不会把已有的正数打回 0。
                     if not cc:
-                        await self._s(self.storage.set_video_comment_count, self.account_id, oid, 0)
+                        await self._s(self.storage.set_video_comment_count, self.finder_id, oid, 0,
+                                       self.account_id)
                         continue
                     # 优化2:评论数没增加 -> 跳过。前提是【本地真抓到过评论】:
                     # has_comments=False 说明历史快照可能是脏 0(从未抓过),
@@ -160,7 +176,8 @@ class CommentFetcher:
                     # 抓到评论才更新为接口汇报值;没抓到(如接口临时失败)不落值,
                     # 免得把「没抓到」写成「评论数=0」再次污染快照。
                     if n or cc == 0:
-                        await self._s(self.storage.set_video_comment_count, self.account_id, oid, cc)
+                        await self._s(self.storage.set_video_comment_count, self.finder_id, oid, cc,
+                                       self.account_id)
                 if max_videos and scanned >= max_videos:
                     return scanned, total_new, new_comments, deleted_ids
             last_buff = data.get("lastBuff") or ""
@@ -190,7 +207,8 @@ class CommentFetcher:
                 if not cid:
                     continue
                 is_new = not (await self._s(self.storage.is_comment_exists, cid))
-                await self._s(self.storage.upsert_comment, self.account_id, export_id, cmt)
+                await self._s(self.storage.upsert_comment, self.finder_id, export_id, cmt,
+                              self.account_id)
                 if is_new:
                     # 自动删除优先:命中关键字则删,不进新评论列表,不触发自动回复
                     deleted = False
@@ -203,7 +221,7 @@ class CommentFetcher:
                         deleted_ids.append(cid)
                     else:
                         new_count += 1
-                        new_list.append(_shape(self.account_id, export_id, cmt))
+                        new_list.append(_shape(self.finder_id, self.account_id, export_id, cmt))
                         # 流式:单视频内评论量大时(直播中)及时推送,避免缓冲膨胀
                         if on_batch and len(new_list) >= self.FLUSH_THRESHOLD:
                             await self._flush(new_list, deleted_ids, on_batch)
@@ -219,7 +237,8 @@ class CommentFetcher:
                     if not sid:
                         continue
                     is_new_sub = not (await self._s(self.storage.is_comment_exists, sid))
-                    await self._s(self.storage.upsert_comment, self.account_id, export_id, sub)
+                    await self._s(self.storage.upsert_comment, self.finder_id, export_id, sub,
+                                  self.account_id)
                     if is_new_sub:
                         deleted_sub = False
                         if self.auto_delete:
@@ -231,7 +250,7 @@ class CommentFetcher:
                             deleted_ids.append(sid)
                         else:
                             new_count += 1
-                            new_list.append(_shape(self.account_id, export_id, sub))
+                            new_list.append(_shape(self.finder_id, self.account_id, export_id, sub))
                             if on_batch and len(new_list) >= self.FLUSH_THRESHOLD:
                                 await self._flush(new_list, deleted_ids, on_batch)
             last_buff = data.get("lastBuff") or ""

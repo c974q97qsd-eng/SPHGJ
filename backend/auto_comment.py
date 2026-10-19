@@ -14,6 +14,13 @@ class AutoCommenter:
         self.storage = storage
         self.account = account
 
+    @property
+    def finder_id(self):
+        """归属主键 = 视频号 finder_id(取不到用 acct:<卡片> 兜底)。"""
+        a = self.account or {}
+        fid = (a.get("_log_finder_id") or a.get("locked_finder_id") or "").strip()
+        return fid or ("acct:" + a.get("id", "unknown"))
+
     def is_enabled(self):
         return bool(self.account.get("auto_comment_enabled")) and bool(self.account.get("auto_comment_content"))
 
@@ -21,7 +28,7 @@ class AutoCommenter:
         """新视频:发评论 + 置顶(未发过才发)。返回是否成功。"""
         if not self.is_enabled():
             return False
-        if self.storage.is_auto_commented(self.account["id"], export_id):
+        if self.storage.is_auto_commented(self.finder_id, export_id):
             return False
         content = self.account["auto_comment_content"]
         try:
@@ -39,10 +46,12 @@ class AutoCommenter:
                 comment_id = comment_id or data.get("commentId") or data.get("comment_id")
             if not comment_id:
                 logger.warning(f"[{self.account['id']}] 自动评论未返回 commentId(已标记已发避免重试,并记待确认,抓到该评论后自动补登): {str(resp)[:200]}")
-                self.storage.set_auto_commented(self.account["id"], export_id, "")
+                self.storage.set_auto_commented(self.finder_id, export_id, "",
+                                                self.account["id"])
                 # 记待确认:下一轮抓到这条评论时按 export_id+内容补登真实 comment_id
                 try:
-                    self.storage.mark_own_comment_pending(self.account["id"], export_id, content, "auto_comment")
+                    self.storage.mark_own_comment_pending(self.finder_id, export_id, content,
+                                                          "auto_comment", self.account["id"])
                 except Exception as e:
                     logger.error(f"[{self.account['id']}] 记待确认登记失败 {export_id}: {e}")
                 return False
@@ -52,12 +61,13 @@ class AutoCommenter:
                 logger.info(f"[{self.account['id']}] 自动评论+置顶 {export_id}: {content}")
             else:
                 logger.warning(f"[{self.account['id']}] 置顶失败 {export_id}: {pin_resp}")
-            self.storage.set_auto_commented(self.account["id"], export_id, comment_id)
+            self.storage.set_auto_commented(self.finder_id, export_id, comment_id, self.account["id"])
             # 同时登记到 own_comments:auto_commented 按作品去重,多次评论会覆盖旧 id,
             # 而 own_comments 一条不落(隐藏与溯源都以它为准)
             try:
-                self.storage.mark_own_comment(self.account["id"], comment_id, "auto_comment",
-                                              content=content, export_id=export_id)
+                self.storage.mark_own_comment(self.finder_id, comment_id, "auto_comment",
+                                              content=content, export_id=export_id,
+                                              account_id=self.account["id"])
             except Exception as e:
                 logger.error(f"[{self.account['id']}] 登记自己评论失败 {comment_id}: {e}")
             return True

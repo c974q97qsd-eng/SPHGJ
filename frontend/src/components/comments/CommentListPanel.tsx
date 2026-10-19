@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react"
+import { useCallback, useEffect, useMemo, useState } from "react"
 import { Card } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -13,7 +13,7 @@ import { EmptyState, LoadingState, ErrorState } from "@/components/common/states
 import { Switch } from "@/components/ui/switch"
 import { useComments } from "@/hooks/useComments"
 import { useAccounts } from "@/hooks/useAccounts"
-import { api, type Comment } from "@/lib/api"
+import { api, type Comment, type CommentFinder } from "@/lib/api"
 import { fmtTime } from "@/lib/utils"
 import { toast } from "sonner"
 import {
@@ -27,10 +27,18 @@ type RepliedFilter = "all" | "unreplied" | "replied"
  *  在 WebView2 里滚动与勾选都会明显卡顿。 */
 const PAGE_SIZES = [50, 100, 200]
 
-/** 评论列表面板(原「评论」页主体)。作为「评论管理」的默认 Tab 内容。 */
+/** 视频号兜底显示名(配置里查不到这个视频号时,如卡片已被删除) */
+const finderLabel = (fid?: string | null) =>
+  fid ? (fid.startsWith("acct:") ? `未识别(${fid.slice(5)})` : `视频号 …${fid.slice(-8)}`) : "未知视频号"
+
+/** 评论列表面板(「评论管理」的默认 Tab 内容)。
+ *
+ *  归属维度 = 视频号(finder_id),不是登录账号卡片:
+ *  卡片删了重建、同视频号挂两张卡片、未锁定卡片换号扫码,评论都不会失联或串号。 */
 export function CommentListPanel() {
   const { accounts } = useAccounts()
-  const [accountId, setAccountId] = useState<string>("all")
+  const [finderId, setFinderId] = useState<string>("all")
+  const [finders, setFinders] = useState<CommentFinder[]>([])
   const [q, setQ] = useState("")
   const [replied, setReplied] = useState<RepliedFilter>("all")
   const [selected, setSelected] = useState<Comment | null>(null)
@@ -47,17 +55,32 @@ export function CommentListPanel() {
   const [offset, setOffset] = useState(0)
 
   const params = useMemo(() => ({
-    account_id: accountId === "all" ? undefined : accountId,
+    finder_id: finderId === "all" ? undefined : finderId,
     replied: replied === "all" ? undefined : replied === "replied",
     q: q.trim() || undefined,
     hide_own: hideOwn ? 1 : undefined,
     limit, offset,
-  }), [accountId, q, replied, hideOwn, limit, offset])
+  }), [finderId, q, replied, hideOwn, limit, offset])
 
   const { items, total, loading, error, refresh } = useComments(params)
 
-  // 新评论高亮(由 useComments 前置插入,这里取最新一条做短暂高亮)
+  // 视频号清单(含卡片已删除的历史视频号)与卡片映射(兜底用)
+  const loadFinders = useCallback(async () => {
+    try {
+      const r = await api.getCommentFinders()
+      setFinders(r.items)
+    } catch {
+      /* 归属清单拉不到不影响列表本体 */
+    }
+  }, [])
+  useEffect(() => { loadFinders() }, [loadFinders])
+
+  const finderMap = useMemo(() => Object.fromEntries(finders.map((f) => [f.finder_id, f])), [finders])
   const accMap = useMemo(() => Object.fromEntries(accounts.map((a) => [a.id, a])), [accounts])
+  /** 该评论能不能执行写操作(删除/回复/置顶):视频号有已登录卡片,或来源卡片本身已登录 */
+  const canAct = (c: Comment) =>
+    Boolean(finderMap[c.finder_id]?.logged_in || accMap[c.account_id]?.logged_in)
+  const finderName = (fid?: string | null) => finderMap[fid || ""]?.name || finderLabel(fid)
 
   // 批量勾选
   const [checkedIds, setCheckedIds] = useState<Set<string>>(new Set())
@@ -70,7 +93,7 @@ export function CommentListPanel() {
     return next
   })
   // 筛选变化:清空勾选并回到第一页(否则会停在一个越界的 offset 上)
-  useEffect(() => { setCheckedIds(new Set()); setOffset(0) }, [accountId, q, replied, hideOwn, limit])
+  useEffect(() => { setCheckedIds(new Set()); setOffset(0) }, [finderId, q, replied, hideOwn, limit])
 
   // 末页被删空 -> 自动回退到最后一个有内容的页,避免停在空白页
   useEffect(() => {
@@ -85,10 +108,13 @@ export function CommentListPanel() {
     if (!window.confirm(`确认删除选中的 ${targets.length} 条评论?此操作不可撤销。`)) return
     setBatchDeleting(true)
     try {
-      const r = await api.batchDeleteComments(targets.map((c) => ({ comment_id: c.comment_id, account_id: c.account_id, export_id: c.export_id })))
+      const r = await api.batchDeleteComments(targets.map((c) => ({
+        finder_id: c.finder_id, comment_id: c.comment_id,
+        account_id: c.account_id, export_id: c.export_id,
+      })))
       toast.success(`已删除 ${r.deleted} 条` + (r.failed.length ? `,失败 ${r.failed.length} 条` : ""))
       setCheckedIds(new Set())
-      refresh()
+      refresh(); loadFinders()
     } catch (e) {
       toast.error("批量删除失败:" + (e as Error).message)
     } finally {
@@ -101,8 +127,9 @@ export function CommentListPanel() {
     if (!window.confirm("确认删除该评论?")) return
     setDeletingId(c.comment_id)
     try {
-      await api.deleteComment(c.comment_id, c.account_id, c.export_id)
+      await api.deleteComment(c.comment_id, c.finder_id, c.account_id, c.export_id)
       toast.success("已删除")
+      loadFinders()
       // WS comment_deleted 会自动从列表中移除
     } catch (e) {
       toast.error("删除失败:" + (e as Error).message)
@@ -116,11 +143,15 @@ export function CommentListPanel() {
       {/* 筛选栏 */}
       <Card className="p-3">
         <div className="flex flex-wrap items-center gap-2">
-          <Select value={accountId} onValueChange={setAccountId}>
-            <SelectTrigger className="w-[160px]"><SelectValue placeholder="全部账号" /></SelectTrigger>
+          <Select value={finderId} onValueChange={setFinderId}>
+            <SelectTrigger className="w-[180px]"><SelectValue placeholder="全部视频号" /></SelectTrigger>
             <SelectContent>
-              <SelectItem value="all">全部账号</SelectItem>
-              {accounts.map((a) => <SelectItem key={a.id} value={a.id}>{a.name}</SelectItem>)}
+              <SelectItem value="all">全部视频号</SelectItem>
+              {finders.map((f) => (
+                <SelectItem key={f.finder_id} value={f.finder_id}>
+                  {f.name}{f.comments ? ` (${f.comments})` : ""}
+                </SelectItem>
+              ))}
             </SelectContent>
           </Select>
           <Select value={replied} onValueChange={(v) => setReplied(v as RepliedFilter)}>
@@ -136,7 +167,7 @@ export function CommentListPanel() {
             <Input className="pl-8" placeholder="搜索评论内容或用户…" value={q} onChange={(e) => setQ(e.target.value)} />
           </div>
           <Button variant="outline" size="sm" asChild className="gap-1.5">
-            <a href={api.exportCsvUrl(accountId === "all" ? undefined : accountId)}><Download className="h-3.5 w-3.5" />导出 CSV</a>
+            <a href={api.exportCsvUrl(finderId === "all" ? undefined : finderId)}><Download className="h-3.5 w-3.5" />导出 CSV</a>
           </Button>
           <Separator orientation="vertical" className="hidden sm:block h-5" />
           <div className="flex items-center gap-2" title="隐藏由自动评论+置顶、自动回复、手动回复发出的评论">
@@ -173,7 +204,7 @@ export function CommentListPanel() {
                   <TableHead className="w-[40px]">
                     <Checkbox checked={allChecked} onChange={toggleAll} aria-label="全选当前页" disabled={items.length === 0} />
                   </TableHead>
-                  <TableHead className="w-[100px]">账号</TableHead>
+                  <TableHead className="w-[120px]">视频号</TableHead>
                   <TableHead className="w-[110px]">用户</TableHead>
                   <TableHead>评论内容</TableHead>
                   <TableHead className="w-[120px]">时间</TableHead>
@@ -197,14 +228,16 @@ export function CommentListPanel() {
                         aria-label="选择该评论"
                       />
                     </TableCell>
-                    <TableCell className="text-xs text-muted-foreground">{accMap[c.account_id]?.name || c.account_id}</TableCell>
+                    <TableCell className="max-w-[120px] truncate text-xs text-muted-foreground" title={c.finder_id}>
+                      {finderName(c.finder_id)}
+                    </TableCell>
                     <TableCell className="max-w-[110px] truncate text-xs">{c.nickname}</TableCell>
                     <TableCell className="max-w-[420px] truncate">{c.content}</TableCell>
                     <TableCell className="text-xs text-muted-foreground">{fmtTime(c.create_time)}</TableCell>
                     <TableCell className="text-xs">{c.like_count || 0}</TableCell>
                     <TableCell>{c.replied ? <Badge variant="success" className="font-normal">已回</Badge> : <Badge variant="secondary" className="font-normal">未回</Badge>}</TableCell>
                     <TableCell className="text-right" onClick={(e) => e.stopPropagation()}>
-                      <Button variant="ghost" size="icon" className="h-7 w-7 text-muted-foreground hover:text-destructive" disabled={!accMap[c.account_id]?.logged_in || deletingId === c.comment_id} onClick={() => handleDelete(c)} aria-label="删除评论">
+                      <Button variant="ghost" size="icon" className="h-7 w-7 text-muted-foreground hover:text-destructive" disabled={!canAct(c) || deletingId === c.comment_id} onClick={() => handleDelete(c)} aria-label="删除评论">
                         {deletingId === c.comment_id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />}
                       </Button>
                     </TableCell>
@@ -242,16 +275,16 @@ export function CommentListPanel() {
       </Card>
 
       {/* 上下文手动回复抽屉(诉求3:仅选中时触发) */}
-      <ReplySheet comment={selected} accountName={selected ? accMap[selected.account_id]?.name : undefined}
-        loggedIn={selected ? accMap[selected.account_id]?.logged_in : false}
-        onClose={() => setSelected(null)} onDone={refresh} />
+      <ReplySheet comment={selected} finderName={selected ? finderName(selected.finder_id) : undefined}
+        loggedIn={selected ? canAct(selected) : false}
+        onClose={() => setSelected(null)} onDone={() => { refresh(); loadFinders() }} />
     </div>
   )
 }
 
-function ReplySheet({ comment, accountName, loggedIn, onClose, onDone }: {
+function ReplySheet({ comment, finderName, loggedIn, onClose, onDone }: {
   comment: Comment | null
-  accountName?: string
+  finderName?: string
   loggedIn?: boolean
   onClose: () => void
   onDone: () => void
@@ -268,19 +301,19 @@ function ReplySheet({ comment, accountName, loggedIn, onClose, onDone }: {
   const reply = async () => {
     if (!text.trim()) { toast.error("请输入回复内容"); return }
     setActing(true)
-    try { await api.replyComment(comment.comment_id, comment.account_id, text); toast.success("回复已发送"); setText(""); onDone() }
+    try { await api.replyComment(comment.comment_id, comment.finder_id, comment.account_id, text); toast.success("回复已发送"); setText(""); onDone() }
     catch (e) { toast.error("回复失败:" + (e as Error).message) }
     finally { setActing(false) }
   }
   const del = async () => {
     setActing(true)
-    try { await api.deleteComment(comment.comment_id, comment.account_id, comment.export_id); toast.success("已删除"); onClose(); onDone() }
+    try { await api.deleteComment(comment.comment_id, comment.finder_id, comment.account_id, comment.export_id); toast.success("已删除"); onClose(); onDone() }
     catch (e) { toast.error("删除失败:" + (e as Error).message) }
     finally { setActing(false) }
   }
   const pin = async () => {
     setActing(true)
-    try { await api.pinComment(comment.comment_id, comment.account_id, comment.export_id); toast.success("已置顶") }
+    try { await api.pinComment(comment.comment_id, comment.finder_id, comment.account_id, comment.export_id); toast.success("已置顶") }
     catch (e) { toast.error("置顶失败:" + (e as Error).message) }
     finally { setActing(false) }
   }
@@ -290,7 +323,7 @@ function ReplySheet({ comment, accountName, loggedIn, onClose, onDone }: {
       <SheetContent className="flex flex-col gap-0">
         <SheetHeader>
           <SheetTitle className="flex items-center gap-2"><ReplyIcon className="h-4 w-4 text-primary" />手动回复</SheetTitle>
-          <SheetDescription>回复选中评论 · 账号 {accountName || comment.account_id}</SheetDescription>
+          <SheetDescription>回复选中评论 · 视频号 {finderName || finderLabel(comment.finder_id)}</SheetDescription>
         </SheetHeader>
 
         {/* 原评论 */}
@@ -306,7 +339,7 @@ function ReplySheet({ comment, accountName, loggedIn, onClose, onDone }: {
 
         {cantAct && (
           <div className="mx-6 mb-2 flex items-center gap-2 rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-xs text-warning">
-            <AlertTriangle className="h-3.5 w-3.5" />该账号未启动或未登录,请先在「账号管理」启动
+            <AlertTriangle className="h-3.5 w-3.5" />该视频号没有已启动/已登录的账号卡片,请先在「账号管理」启动
           </div>
         )}
 
