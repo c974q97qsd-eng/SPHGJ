@@ -17,6 +17,7 @@
 封面判重: md5(cover_url),文件在且 hash 未变 -> 一次请求都不发。
 
 所有状态写 storage;请求量记 post_fetch_meta 账本(今日请求次数可见)。
+归属:作品主键是视频号 finder_id(不是登录卡片 id),封面落 data/covers/<finder_key>/。
 """
 import asyncio
 import hashlib
@@ -26,6 +27,8 @@ import os
 import time
 from datetime import datetime
 from urllib.parse import quote
+
+from .storage import cover_key
 
 logger = logging.getLogger("sphgj")
 
@@ -97,11 +100,17 @@ class PostFetcher:
         data_dir = os.path.dirname(storage.db_path) if getattr(storage, "db_path", "") else "data"
         self.covers_root = os.path.join(data_dir, "covers")
 
+    @property
+    def finder_id(self):
+        """作品归属主键:视频号 ID。登录卡片 id 会变,视频号 ID 不会。"""
+        return (self.account.get("_log_finder_id") or "").strip()
+
     # ---------------- 封面 ----------------
     async def _ensure_covers(self, context, rows):
         """下载缺失/变更的封面(md5 判重,已有即零请求)。返回下载数。"""
         aid = self.account["id"]
-        out_dir = os.path.join(self.covers_root, aid)
+        key = cover_key(self.finder_id)      # 封面目录按视频号归属,换卡片不重下
+        out_dir = os.path.join(self.covers_root, key)
         os.makedirs(out_dir, exist_ok=True)
         todo = []
         for r in rows:
@@ -112,7 +121,7 @@ class PostFetcher:
             fpath = os.path.join(out_dir, fname)
             exists = await asyncio.to_thread(os.path.isfile, fpath)
             if exists and await asyncio.to_thread(os.path.getsize, fpath) > 0:
-                r["cover_path"] = f"/media/covers/{aid}/{fname}"
+                r["cover_path"] = f"/media/covers/{key}/{fname}"
                 continue
             todo.append((r, cu, fpath, fname))
         if not todo:
@@ -131,7 +140,7 @@ class PostFetcher:
                             with open(fpath, "wb") as f:
                                 f.write(b)
                         await asyncio.to_thread(_save)
-                        r["cover_path"] = f"/media/covers/{aid}/{fname}"
+                        r["cover_path"] = f"/media/covers/{key}/{fname}"
                         return 1
                 except Exception as e:
                     logger.debug(f"[{aid}] 封面下载失败: {e}")
@@ -149,7 +158,10 @@ class PostFetcher:
     async def refresh(self, worker):
         """抓取一个账号的全部作品(增量)。worker: AccountWorker(需已 ensure_browser)。"""
         aid = self.account["id"]
-        meta = self.storage.get_post_fetch_meta(aid)
+        fid = self.finder_id
+        if not fid:
+            return {"error": "缺少视频号 ID(_log_finder_id),请先启动引擎抓取一次"}
+        meta = self.storage.get_post_fetch_meta(fid)
         if meta.get("last_refresh"):
             try:
                 last = datetime.fromisoformat(meta["last_refresh"]).timestamp()
@@ -164,10 +176,9 @@ class PostFetcher:
         context = worker.context
         if context is None:
             return {"error": "浏览器未打开"}
-        fid = self.account.get("_log_finder_id", "")
         aidv = self.account.get("_aid", "")
-        if not fid or not aidv:
-            return {"error": "缺少 _aid/_log_finder_id,请先启动引擎抓取一次"}
+        if not aidv:
+            return {"error": "缺少 _aid,请先启动引擎抓取一次"}
 
         page = await context.new_page()
         pages = 0
@@ -208,10 +219,11 @@ class PostFetcher:
                 rows = [_extract_post(p) for p in lst]
                 # 早停判据必须在入库前算:入库后再算的话,刚写入的行必然"已知"
                 page_all_known = await asyncio.to_thread(
-                    self.storage.posts_all_known, aid, [r["object_id"] for r in rows])
+                    self.storage.posts_all_known, fid, [r["object_id"] for r in rows])
                 # 封面判重 + 下载(先算 cover_path 再入库)
                 covers += await self._ensure_covers(context, rows)
-                await asyncio.to_thread(self.storage.upsert_posts, aid, rows)
+                # 归属 = fid;aid 只记「这批作品是哪个登录卡片抓的」,仅作追溯
+                await asyncio.to_thread(self.storage.upsert_posts, fid, rows, aid)
                 pages += 1
                 fetched_total += len(rows)
                 if allow_early_stop and page_all_known:
@@ -224,7 +236,7 @@ class PostFetcher:
             full = bool(reached_end)
             if full:
                 # 标记本地已全量:下次刷新才允许早停
-                await asyncio.to_thread(self.storage.set_post_fetch_meta, aid, full_synced=1)
+                await asyncio.to_thread(self.storage.set_post_fetch_meta, fid, account_id=aid, full_synced=1)
             return {"pages": pages, "fetched": fetched_total, "covers": covers,
                     "early_stop": early_stop, "full": full}
         finally:

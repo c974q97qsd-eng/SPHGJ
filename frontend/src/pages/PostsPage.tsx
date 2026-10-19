@@ -7,8 +7,7 @@ import { Checkbox } from "@/components/ui/checkbox"
 import { Switch } from "@/components/ui/switch"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { EmptyState, LoadingState, ErrorState } from "@/components/common/states"
-import { useAccounts } from "@/hooks/useAccounts"
-import { api, type PostItem, type PostMeta, type PostsJobState } from "@/lib/api"
+import { api, type PostItem, type PostFinder, type PostsJobState } from "@/lib/api"
 import { fmtTime, cn } from "@/lib/utils"
 import { toast } from "sonner"
 import {
@@ -31,9 +30,12 @@ function fmtCount(n: number | null | undefined): string {
   return String(v)
 }
 
+/** 作品唯一键:归属视频号 + 作品 id(同一条作品在不同视频号下不冲突) */
+const pkey = (p: PostItem) => `${p.finder_id}|${p.object_id}`
+
 export function PostsPage() {
-  const { accounts } = useAccounts()
-  const [accountId, setAccountId] = useState<string>("all")
+  // 归属维度 = 视频号(finder_id),不是登录账号卡片
+  const [finderId, setFinderId] = useState<string>("all")
   const [visible, setVisible] = useState<VisibleFilter>("all")
   const [sort, setSort] = useState<SortKey>("create_time")
   const [asc, setAsc] = useState(false)
@@ -52,7 +54,7 @@ export function PostsPage() {
   const [job, setJob] = useState<PostsJobState | null>(null)
   const [refreshing, setRefreshing] = useState(false)
   const [batching, setBatching] = useState(false)
-  const [meta, setMeta] = useState<Record<string, PostMeta>>({})
+  const [finders, setFinders] = useState<PostFinder[]>([])
 
   // 自动刷新配置
   const [autoRefresh, setAutoRefresh] = useState(true)
@@ -60,23 +62,23 @@ export function PostsPage() {
   const autoLoaded = useRef(false)
 
   const [checked, setChecked] = useState<Set<string>>(new Set())
-  const allChecked = items.length > 0 && items.every((p) => checked.has(p.object_id))
-  const toggleAll = () => setChecked(allChecked ? new Set() : new Set(items.map((p) => p.object_id)))
-  const toggleOne = (oid: string) => setChecked((prev) => {
+  const allChecked = items.length > 0 && items.every((p) => checked.has(pkey(p)))
+  const toggleAll = () => setChecked(allChecked ? new Set() : new Set(items.map(pkey)))
+  const toggleOne = (k: string) => setChecked((prev) => {
     const next = new Set(prev)
-    if (next.has(oid)) next.delete(oid); else next.add(oid)
+    if (next.has(k)) next.delete(k); else next.add(k)
     return next
   })
 
   const params = useMemo(() => ({
-    account_id: accountId === "all" ? undefined : accountId,
+    finder_id: finderId === "all" ? undefined : finderId,
     visible: visible === "all" ? undefined : visible,
     sort, order: asc ? "asc" : "desc",
     date_from: dateFrom || undefined,
     date_to: dateTo || undefined,
     q: searchQ.trim() || undefined,
     limit, offset,
-  }), [accountId, visible, sort, asc, dateFrom, dateTo, searchQ, offset])
+  }), [finderId, visible, sort, asc, dateFrom, dateTo, searchQ, offset])
 
   const refresh = useCallback(async () => {
     setLoading(true)
@@ -92,13 +94,13 @@ export function PostsPage() {
     }
   }, [params])
 
-  const loadMeta = useCallback(async () => {
-    try { setMeta((await api.getPostsMeta()).meta) } catch { /* ignore */ }
+  const loadFinders = useCallback(async () => {
+    try { setFinders((await api.getPostFinders()).items) } catch { /* ignore */ }
   }, [])
 
   useEffect(() => { refresh() }, [refresh])
-  useEffect(() => { loadMeta() }, [loadMeta])
-  useEffect(() => { setChecked(new Set()) }, [accountId, visible, sort, asc, dateFrom, dateTo, searchQ])
+  useEffect(() => { loadFinders() }, [loadFinders])
+  useEffect(() => { setChecked(new Set()) }, [finderId, visible, sort, asc, dateFrom, dateTo, searchQ])
 
   // 自动刷新配置加载
   useEffect(() => {
@@ -128,12 +130,12 @@ export function PostsPage() {
             const failN = j.failed?.length || 0
             if (j.kind === "refresh") {
               const oks = Object.values(j.accounts || {}).filter((a: Record<string, unknown>) => a.status === "ok").length
-              toast.success(`作品刷新完成(${oks} 个账号)` + (failN ? `,异常 ${failN}` : ""))
+              toast.success(`作品刷新完成(${oks} 个视频号)` + (failN ? `,异常 ${failN}` : ""))
             } else {
               toast.success(`批量操作完成(${j.done}/${j.total})` + (failN ? `,失败 ${failN}` : ""))
             }
             refresh()
-            loadMeta()
+            loadFinders()
             setRefreshing(false)
             setBatching(false)
             setChecked(new Set())
@@ -143,12 +145,19 @@ export function PostsPage() {
       } catch { /* ignore */ }
     }, 1500)
     return () => clearInterval(t)
-  }, [refresh, loadMeta])
+  }, [refresh, loadFinders])
 
   const startRefresh = async () => {
+    // 抓取要靠登录卡片(视频号本身没有登录态),所以把选中视频号映射回它当前的卡片
+    let aid: string | undefined
+    if (finderId !== "all") {
+      const f = finders.find((x) => x.finder_id === finderId)
+      if (!f?.account_id) { toast.error("该视频号当前没有绑定账号卡片,请先在账号管理里扫码登录"); return }
+      aid = f.account_id
+    }
     setRefreshing(true)
     try {
-      await api.postsRefresh(accountId === "all" ? undefined : accountId)
+      await api.postsRefresh(aid)
       toast.info("作品刷新已开始,进度见下方提示")
     } catch (e) {
       toast.error((e as Error).message)
@@ -157,13 +166,13 @@ export function PostsPage() {
   }
 
   const doBatch = async (action: "hide" | "unhide" | "sticky" | "unsticky") => {
-    const targets = items.filter((p) => checked.has(p.object_id))
+    const targets = items.filter((p) => checked.has(pkey(p)))
     if (!targets.length) return
     const label = { hide: "隐藏(仅自己可见)", unhide: "取消隐藏(公开)", sticky: "置顶", unsticky: "取消置顶" }[action]
     if (!window.confirm(`确认对选中的 ${targets.length} 个作品执行「${label}」?`)) return
     setBatching(true)
     try {
-      await api.postsBatch(action, targets.map((p) => ({ account_id: p.account_id, object_id: p.object_id })))
+      await api.postsBatch(action, targets.map((p) => ({ finder_id: p.finder_id, object_id: p.object_id })))
       toast.info("批量操作已开始(写操作逐条节流,防风控),进度见下方提示")
     } catch (e) {
       toast.error((e as Error).message)
@@ -173,22 +182,40 @@ export function PostsPage() {
 
   const toggleSortDir = () => { setAsc((v) => !v); setOffset(0) }
 
-  const accName = (id: string) => accounts.find((a) => a.id === id)?.name || id
-  const pendingFull = accounts.filter((a) => { const m = meta[a.id]; return m && !m.full_synced })
-  const totalToday = Object.values(meta).reduce((s, m) => s + (m.today_requests || 0), 0)
-  const lastRefresh = Object.values(meta)
-    .map((m) => m.last_refresh).filter(Boolean).sort().reverse()[0]
+  const finderById = useMemo(() => {
+    const m: Record<string, PostFinder> = {}
+    finders.forEach((f) => { m[f.finder_id] = f })
+    return m
+  }, [finders])
+  const nameByAccount = useMemo(() => {
+    const m: Record<string, string> = {}
+    finders.forEach((f) => { if (f.account_id) m[f.account_id] = f.name })
+    return m
+  }, [finders])
+  // 任务进度里的键:刷新按卡片,批量按视频号
+  const jobName = (key: string) => finderById[key]?.name || nameByAccount[key] || key
+
+  const curFinder = finderId === "all" ? null : finderById[finderId]
+  const pendingFull = finders.filter((f) => f.bound && f.meta && !f.meta.full_synced)
+  const totalToday = finders.reduce((s, f) => s + (f.meta?.today_requests || 0), 0)
+  const allWorks = finders.reduce((s, f) => s + (f.works || 0), 0)
+  const lastRefresh = finders
+    .map((f) => f.meta?.last_refresh).filter(Boolean).sort().reverse()[0]
 
   return (
     <div className="space-y-4">
       {/* 筛选栏 */}
       <Card className="p-3">
         <div className="flex flex-wrap items-center gap-2">
-          <Select value={accountId} onValueChange={(v) => { setAccountId(v); setOffset(0) }}>
-            <SelectTrigger className="w-[160px]"><SelectValue placeholder="全部账号" /></SelectTrigger>
+          <Select value={finderId} onValueChange={(v) => { setFinderId(v); setOffset(0) }}>
+            <SelectTrigger className="w-[200px]"><SelectValue placeholder="全部视频号" /></SelectTrigger>
             <SelectContent>
-              <SelectItem value="all">全部账号</SelectItem>
-              {accounts.map((a) => <SelectItem key={a.id} value={a.id}>{a.name}</SelectItem>)}
+              <SelectItem value="all">全部视频号({allWorks})</SelectItem>
+              {finders.map((f) => (
+                <SelectItem key={f.finder_id} value={f.finder_id}>
+                  {f.name}({f.works}){f.bound ? "" : " · 未绑定卡片"}
+                </SelectItem>
+              ))}
             </SelectContent>
           </Select>
           <Select value={visible} onValueChange={(v) => { setVisible(v as VisibleFilter); setOffset(0) }}>
@@ -231,11 +258,17 @@ export function PostsPage() {
         </div>
         <div className="mt-2 flex flex-wrap items-center gap-4 text-xs text-muted-foreground">
           <span>共 {total} 个作品{checked.size > 0 && ` · 已选 ${checked.size} 个`}</span>
+          <span>{finders.length} 个视频号 · 合计 {allWorks} 个作品</span>
           {lastRefresh && <span>上次更新:{new Date(lastRefresh).toLocaleString()}</span>}
           <span>今日已请求 {totalToday} 次</span>
+          {curFinder && !curFinder.logged_in && (
+            <span className="text-amber-600 dark:text-amber-500">
+              {curFinder.bound ? "该视频号当前未登录,写操作需先在账号管理启动卡片" : "该视频号没有绑定账号卡片,只能查看不能操作"}
+            </span>
+          )}
           {pendingFull.length > 0 && (
             <span className="text-amber-600 dark:text-amber-500">
-              {pendingFull.length} 个账号作品未完整同步,点「刷新作品」补全
+              {pendingFull.length} 个视频号作品未完整同步,点「刷新作品」补全
             </span>
           )}
           <div className="flex items-center gap-2 ml-auto">
@@ -279,7 +312,7 @@ export function PostsPage() {
           {job.kind === "refresh" ? "正在刷新作品" : "正在执行批量操作"} · 总 {job.total} · 完成 {job.done}
           {job.accounts && Object.entries(job.accounts).map(([aid, a]) => (
             <span key={aid} className="ml-2">
-              {accName(aid)}:{(a as Record<string, unknown>).status as string}
+              {jobName(aid)}:{(a as Record<string, unknown>).status as string}
               {typeof (a as Record<string, unknown>).fetched === "number" && `(${(a as Record<string, unknown>).fetched} 条)`}
             </span>
           ))}
@@ -300,40 +333,44 @@ export function PostsPage() {
                 <span className="text-xs text-muted-foreground">全选本页({items.length})</span>
               </div>
               <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
-                {items.map((p) => (
-                  <div key={p.object_id}
-                    className={cn("group relative overflow-hidden rounded-lg border bg-card transition-colors",
-                      checked.has(p.object_id) && "border-primary ring-1 ring-primary")}>
-                    <div className="relative aspect-video w-full overflow-hidden bg-muted">
-                      {p.cover_path ? (
-                        <img src={p.cover_path} alt="" loading="lazy"
-                          className="h-full w-full object-cover"
-                          onError={(e) => { (e.target as HTMLImageElement).style.display = "none" }} />
-                      ) : null}
-                      <div className="absolute left-1.5 top-1.5">
-                        <Checkbox checked={checked.has(p.object_id)} onChange={() => toggleOne(p.object_id)} aria-label="选择该作品" />
+                {items.map((p) => {
+                  const k = pkey(p)
+                  return (
+                    <div key={k}
+                      className={cn("group relative overflow-hidden rounded-lg border bg-card transition-colors",
+                        checked.has(k) && "border-primary ring-1 ring-primary")}>
+                      <div className="relative aspect-video w-full overflow-hidden bg-muted">
+                        {p.cover_path ? (
+                          <img src={p.cover_path} alt="" loading="lazy"
+                            className="h-full w-full object-cover"
+                            onError={(e) => { (e.target as HTMLImageElement).style.display = "none" }} />
+                        ) : null}
+                        <div className="absolute left-1.5 top-1.5">
+                          <Checkbox checked={checked.has(k)} onChange={() => toggleOne(k)} aria-label="选择该作品" />
+                        </div>
+                        <div className="absolute right-1.5 top-1.5 flex gap-1">
+                          {p.is_sticky && <Badge className="font-normal text-xs px-1.5 py-0">置顶</Badge>}
+                          {p.is_hidden && <Badge variant="destructive" className="font-normal text-xs px-1.5 py-0">已隐藏</Badge>}
+                        </div>
+                        <div className="absolute bottom-0 left-0 right-0 flex gap-3 bg-black/60 px-2 py-1 text-xs text-white">
+                          <span>▶ {fmtCount(p.read_count)}</span>
+                          <span>👍 {fmtCount(p.like_count)}</span>
+                          <span>💬 {fmtCount(p.comment_count)}</span>
+                        </div>
                       </div>
-                      <div className="absolute right-1.5 top-1.5 flex gap-1">
-                        {p.is_sticky && <Badge className="font-normal text-xs px-1.5 py-0">置顶</Badge>}
-                        {p.is_hidden && <Badge variant="destructive" className="font-normal text-xs px-1.5 py-0">已隐藏</Badge>}
-                      </div>
-                      <div className="absolute bottom-0 left-0 right-0 flex gap-3 bg-black/60 px-2 py-1 text-xs text-white">
-                        <span>▶ {fmtCount(p.read_count)}</span>
-                        <span>👍 {fmtCount(p.like_count)}</span>
-                        <span>💬 {fmtCount(p.comment_count)}</span>
+                      <div className="p-2">
+                        <p className="line-clamp-2 min-h-[2.5rem] text-xs leading-5" title={p.title}>
+                          {p.title || <span className="text-muted-foreground">(无标题)</span>}
+                        </p>
+                        <div className="mt-1 flex items-center justify-between text-xs text-muted-foreground">
+                          {/* 归属显示视频号,不是登录卡片 */}
+                          <span className="truncate max-w-[45%]" title={p.finder_id}>{p.finder_name || p.finder_id}</span>
+                          <span>{p.create_time ? fmtTime(p.create_time) : "-"}</span>
+                        </div>
                       </div>
                     </div>
-                    <div className="p-2">
-                      <p className="line-clamp-2 min-h-[2.5rem] text-xs leading-5" title={p.title}>
-                        {p.title || <span className="text-muted-foreground">(无标题)</span>}
-                      </p>
-                      <div className="mt-1 flex items-center justify-between text-xs text-muted-foreground">
-                        <span className="truncate max-w-[45%]">{accName(p.account_id)}</span>
-                        <span>{p.create_time ? fmtTime(p.create_time) : "-"}</span>
-                      </div>
-                    </div>
-                  </div>
-                ))}
+                  )
+                })}
               </div>
               {/* 分页 */}
               <div className="mt-3 flex items-center justify-between">

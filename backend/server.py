@@ -84,6 +84,16 @@ hub = Hub()
 log_hub = install_log_hub()
 config = load_config()
 storage = Storage(os.path.join(ROOT, config.get("db_path", "./data/comments.db")) or os.path.join(ROOT, "data/comments.db"))
+# rev23: 作品归属主键从「登录卡片 account_id」迁到「视频号 finder_id」(幂等,首次启动执行一次)
+try:
+    _fid_map = {}
+    for _a in config.get("accounts", []):
+        _fid = (_a.get("_log_finder_id") or _a.get("locked_finder_id") or "").strip()
+        if _fid and _a.get("id"):
+            _fid_map[_a["id"]] = _fid
+    storage.migrate_posts_to_finder(_fid_map)
+except Exception as _e:
+    logger.warning(f"[启动] 作品归属迁移失败(不影响启动,下次再试): {_e}")
 manager = AccountManager(config, storage, emit=hub.emit)
 
 app = FastAPI(title="视频号评论区管理")
@@ -1402,6 +1412,67 @@ def _parse_new_comment_id(resp):
     return data.get("commentId") or data.get("comment_id")
 
 
+# ===================== 作品归属:视频号(finder_id)= 主键 =====================
+# 作品是「视频号」的资产,不是「登录卡片」的。卡片只提供登录态(抓取/写操作通道),
+# 作品行里的 finder_id 才是归属;卡片删了/换号了,作品仍然属于那个视频号。
+def _resolve_finder(account_id):
+    """登录卡片 id -> 视频号 finder_id(以配置里当前的登录身份为准)。"""
+    a = next((x for x in config.get("accounts", []) if x.get("id") == account_id), None)
+    if not a:
+        return ""
+    return (a.get("_log_finder_id") or a.get("locked_finder_id") or "").strip()
+
+
+def _finder_label(fid):
+    return "视频号 " + (fid or "")[-8:] if fid else "未知视频号"
+
+
+def _finder_index():
+    """finder_id -> {name, account_id, account_ids, logged_in}(同视频号多卡片时优先已登录的)。"""
+    idx = {}
+    for a in config.get("accounts", []):
+        fid = (a.get("_log_finder_id") or a.get("locked_finder_id") or "").strip()
+        if not fid:
+            continue
+        w = manager.get_worker(a["id"])
+        logged = bool(w and w.logged_in)
+        e = idx.get(fid)
+        if e is None:
+            idx[fid] = {"finder_id": fid, "name": a.get("name") or a["id"],
+                        "account_id": a["id"], "account_ids": [a["id"]],
+                        "logged_in": logged, "_logged_pick": logged}
+            continue
+        e["account_ids"].append(a["id"])
+        e["logged_in"] = e["logged_in"] or logged
+        if logged and not e["_logged_pick"]:
+            e.update(name=a.get("name") or a["id"], account_id=a["id"], _logged_pick=True)
+    for e in idx.values():
+        e.pop("_logged_pick", None)
+    return idx
+
+
+def _all_finders():
+    """所有已知视频号:配置里的 + 作品库里的(含卡片已删除的历史视频号)。"""
+    ids = []
+    seen = set()
+    for fid in _finder_index().keys():
+        if fid not in seen:
+            seen.add(fid); ids.append(fid)
+    for row in storage.posts_finders():
+        fid = row.get("finder_id") or ""
+        if fid and fid not in seen:
+            seen.add(fid); ids.append(fid)
+    return ids
+
+
+def _worker_for_finder(fid):
+    """找当前登录着该视频号的 worker(写操作通道)。"""
+    for _aid, w in manager.workers.items():
+        if (w.account.get("_log_finder_id") or "").strip() == fid and w.logged_in:
+            return w
+    return None
+
+
 class PostsJob:
     """作品刷新/批量操作后台任务(同一时间只允许一个,避免抢浏览器)。"""
 
@@ -1459,8 +1530,10 @@ async def _do_posts_refresh(aids):
                 st["status"] = "error"
             else:
                 st["status"] = "ok"
+                # 账本按视频号记账:同一视频号换卡片登录不用重跑全量
                 storage.set_post_fetch_meta(
-                    aid, last_refresh=datetime.now().isoformat(),
+                    (w.account.get("_log_finder_id") or "").strip() or aid,
+                    account_id=aid, last_refresh=datetime.now().isoformat(),
                     last_pages=int(r.get("pages") or 0),
                     add_requests=int(r.get("pages") or 0) + int(r.get("covers") or 0),
                     full_synced=1 if r.get("full") else None)
@@ -1476,25 +1549,33 @@ async def _do_posts_batch(action, items):
     st_all = posts_job.state
     groups = {}
     for it in items:
-        groups.setdefault(it.account_id, []).append(it.object_id)
-    st_all["accounts"] = {aid: {"status": "pending", "updated": 0, "skipped": 0, "failed": []}
-                          for aid in groups}
-    st_all["total"] = len(items)
+        # 归属键是视频号;旧前端只传 account_id 时按卡片解析成视频号
+        fid = (getattr(it, "finder_id", "") or "").strip() or _resolve_finder(it.account_id)
+        if not fid:
+            continue
+        groups.setdefault(fid, []).append(it.object_id)
+    if not groups:
+        st_all["failed"].append({"error": "找不到作品归属的视频号,请刷新后重试"})
+        return
+    st_all["accounts"] = {fid: {"status": "pending", "updated": 0, "skipped": 0, "failed": []}
+                          for fid in groups}
+    st_all["total"] = sum(len(v) for v in groups.values())
     VIS = {"hide": 3, "unhide": 1}
-    for aid, oids in groups.items():
-        st = st_all["accounts"][aid]
-        w = manager.get_worker(aid)
-        if not w or not w.logged_in:
+    for fid, oids in groups.items():
+        st = st_all["accounts"][fid]
+        w = _worker_for_finder(fid)
+        if not w:
             st["status"] = "not_logged_in"
             for oid in oids:
-                st["failed"].append({"object_id": oid, "error": "账号未启动或未登录"})
+                st["failed"].append({"object_id": oid,
+                                     "error": "该视频号当前没有已登录的账号卡片,请先启动/扫码登录"})
                 st_all["done"] += 1
             continue
         try:
             for oid in oids:
                 # hold 续期(浏览器保持),写操作经 api 客户端节流(4-8s/条) + 每日上限
                 await w.hold_for_manual(delay=600)
-                p = storage.get_post(aid, oid)
+                p = storage.get_post(fid, oid)
                 if not p:
                     st["failed"].append({"object_id": oid, "error": "本地无记录,请先刷新"})
                     st_all["done"] += 1; continue
@@ -1509,17 +1590,17 @@ async def _do_posts_batch(action, items):
                     resp = await w.api.update_post_visible(p["export_id"], VIS[action])
                     ok_call = bool(resp) and not resp.get("__err")
                     if ok_call:
-                        storage.update_post_flags(aid, oid, visible_type=VIS[action])
+                        storage.update_post_flags(fid, oid, visible_type=VIS[action])
                 elif action == "sticky":
                     resp = await w.api.update_post_sticky(p["export_id"], 1)
                     ok_call = bool(resp) and not resp.get("__err")
                     if ok_call:
-                        storage.update_post_flags(aid, oid, sticky_op=2)
+                        storage.update_post_flags(fid, oid, sticky_op=2)
                 else:  # unsticky
                     resp = await w.api.update_post_sticky(p["export_id"], 2)
                     ok_call = bool(resp) and not resp.get("__err")
                     if ok_call:
-                        storage.update_post_flags(aid, oid, sticky_op=0)
+                        storage.update_post_flags(fid, oid, sticky_op=0)
                 if ok_call:
                     st["updated"] += 1
                 else:
@@ -1529,12 +1610,13 @@ async def _do_posts_batch(action, items):
             st["status"] = "ok"
         except Exception as e:
             st["status"] = "error"; st["failed"].append({"error": str(e)[:200]})
-        await hub.emit("posts_batch_progress", {"account_id": aid, **st})
+        await hub.emit("posts_batch_progress", {"finder_id": fid, **st})
 
 
 @app.get("/api/posts")
 async def get_posts(
-    account_id: Optional[str] = None,
+    finder_id: Optional[str] = None,
+    account_id: Optional[str] = None,   # 兼容旧调用:按登录卡片解析成视频号
     q: Optional[str] = None,
     visible: Optional[str] = None,
     date_from: Optional[str] = None,
@@ -1544,24 +1626,60 @@ async def get_posts(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
 ):
-    """作品查询(本地库,零官方请求)。visible: public/follow/hidden/sticky。"""
+    """作品查询(本地库,零官方请求)。按视频号归属筛选;visible: public/follow/hidden/sticky。"""
+    fid = (finder_id or "").strip()
+    if not fid and account_id:
+        fid = _resolve_finder(account_id)
     items, total = storage.query_posts(
-        account_id=account_id, q=q, visible=visible,
+        finder_id=fid or None, q=q, visible=visible,
         date_from=date_from, date_to=date_to, sort=sort, order=order,
         limit=limit, offset=offset)
+    idx = _finder_index()
     name_map = {a["id"]: a.get("name", a["id"]) for a in config.get("accounts", [])}
     for it in items:
-        it["account_name"] = name_map.get(it["account_id"], it["account_id"])
+        e = idx.get(it["finder_id"]) or {}
+        # 归属名以视频号为准;卡片名只作「谁在抓」的追溯
+        it["finder_name"] = e.get("name") or _finder_label(it["finder_id"])
+        it["account_name"] = name_map.get(it.get("account_id") or "",
+                                          it.get("account_id") or "")
     return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+
+@app.get("/api/posts/finders")
+async def get_posts_finders():
+    """作品归属视图:有哪些视频号、各多少作品、当前由哪张卡片承载、抓取账本。
+
+    这是作品管理的主维度 —— 视频号(finder_id),不是登录卡片。
+    卡片删掉/换号后,视频号与它的作品仍然在这里(只会显示「未绑定卡片」)。
+    """
+    idx = _finder_index()
+    rows = {r["finder_id"]: r for r in storage.posts_finders()}
+    out = []
+    for fid in _all_finders():
+        e = idx.get(fid) or {}
+        r = rows.get(fid) or {}
+        out.append({
+            "finder_id": fid,
+            "name": e.get("name") or _finder_label(fid),
+            "account_id": e.get("account_id") or r.get("account_id") or "",
+            "account_ids": e.get("account_ids") or [],
+            "logged_in": bool(e.get("logged_in")),
+            "bound": bool(e),
+            "works": r.get("works", 0),
+            "hidden": r.get("hidden", 0),
+            "sticky": r.get("sticky", 0),
+            "last_create": r.get("last_create"),
+            "last_update": r.get("last_update"),
+            "meta": storage.get_post_fetch_meta(fid),
+        })
+    out.sort(key=lambda x: (-(x["works"] or 0), x["name"]))
+    return {"items": out}
 
 
 @app.get("/api/posts/meta")
 async def get_posts_meta():
-    """各账号抓取账本(上次刷新/今日请求次数)。"""
-    out = {}
-    for a in config.get("accounts", []):
-        out[a["id"]] = storage.get_post_fetch_meta(a["id"])
-    return {"meta": out}
+    """各视频号的抓取账本(上次刷新/今日请求次数),键 = finder_id。"""
+    return {"meta": {fid: storage.get_post_fetch_meta(fid) for fid in _all_finders()}}
 
 
 @app.post("/api/posts/refresh")
@@ -1581,7 +1699,7 @@ async def posts_refresh(body: schemas.PostsRefreshBody):
 
 @app.post("/api/posts/batch")
 async def posts_batch(body: schemas.PostsBatchBody):
-    """批量操作:hide/unhide/sticky/unsticky(后台任务,写操作逐条节流)。"""
+    """批量操作:hide/unhide/sticky/unsticky(后台任务,写操作逐条节流)。items 以 finder_id 归属。"""
     if body.action not in ("hide", "unhide", "sticky", "unsticky"):
         raise HTTPException(400, "action 仅支持 hide/unhide/sticky/unsticky")
     if not body.items:

@@ -126,6 +126,11 @@ export interface AppConfig {
 }
 
 export interface PostItem {
+  /** 归属主键:视频号 ID(作品属于视频号,不属于登录卡片) */
+  finder_id: string
+  /** 视频号展示名(当前承载它的账号卡片名;卡片删了显示「视频号 xxxx」) */
+  finder_name?: string
+  /** 最后一次抓取该作品的登录卡片(仅追溯,不参与归属) */
   account_id: string
   account_name?: string
   object_id: string
@@ -158,6 +163,24 @@ export interface PostMeta {
   last_pages: number
   today_requests: number
   full_synced: number
+  account_id?: string
+}
+
+/** 作品归属视频号(作品管理的主维度) */
+export interface PostFinder {
+  finder_id: string
+  name: string
+  account_id: string
+  account_ids: string[]
+  logged_in: boolean
+  /** 当前是否有账号卡片承载该视频号(卡片删掉后为 false,作品仍然存在) */
+  bound: boolean
+  works: number
+  hidden: number
+  sticky: number
+  last_create: number | null
+  last_update: string | null
+  meta: PostMeta
 }
 
 export interface PostsJobState {
@@ -285,15 +308,16 @@ export const api = {
     req<{ ok: boolean }>(`/auto-delete/logs${account_id ? `?account_id=${account_id}` : ""}`, { method: "DELETE" }),
 
   // ==================== 作品管理 ====================
-  getPosts: (params: { account_id?: string; q?: string; visible?: string; date_from?: string; date_to?: string; sort?: string; order?: string; limit?: number; offset?: number } = {}) => {
+  getPosts: (params: { finder_id?: string; account_id?: string; q?: string; visible?: string; date_from?: string; date_to?: string; sort?: string; order?: string; limit?: number; offset?: number } = {}) => {
     const q = new URLSearchParams()
     Object.entries(params).forEach(([k, v]) => v !== undefined && v !== "" && q.set(k, String(v)))
     return req<PostPage>(`/posts?${q.toString()}`)
   },
+  getPostFinders: () => req<{ items: PostFinder[] }>("/posts/finders"),
   getPostsMeta: () => req<{ meta: Record<string, PostMeta> }>("/posts/meta"),
   postsRefresh: (account_id?: string) =>
     req<{ ok: boolean; accounts: string[] }>("/posts/refresh", { method: "POST", body: JSON.stringify({ account_id }) }),
-  postsBatch: (action: "hide" | "unhide" | "sticky" | "unsticky", items: { account_id: string; object_id: string }[]) =>
+  postsBatch: (action: "hide" | "unhide" | "sticky" | "unsticky", items: { finder_id: string; object_id: string }[]) =>
     req<{ ok: boolean; total: number }>("/posts/batch", { method: "POST", body: JSON.stringify({ action, items }) }),
   postsJob: () => req<PostsJobState>("/posts/job"),
 

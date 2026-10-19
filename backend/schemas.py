@@ -79,7 +79,9 @@ class PostsRefreshBody(BaseModel):
 
 
 class PostOpItem(BaseModel):
-    account_id: str
+    # 归属主键 = 视频号 finder_id;account_id 为旧前端兼容(会被解析成视频号)
+    finder_id: Optional[str] = None
+    account_id: Optional[str] = None
     object_id: str
 
 
