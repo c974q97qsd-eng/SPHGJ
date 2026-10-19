@@ -211,7 +211,12 @@ class Storage:
             queued_at TEXT,
             started_at TEXT,
             finished_at TEXT,
+            archived_name TEXT DEFAULT '',
             UNIQUE(finder_id, file_fp))""")
+        # 老库补列(rev26):归档后的文件名,便于回溯「这条发的是哪个文件」
+        _cols = {r[1] for r in c.execute("PRAGMA table_info(publish_tasks)")}
+        if "archived_name" not in _cols:
+            c.execute("ALTER TABLE publish_tasks ADD COLUMN archived_name TEXT DEFAULT ''")
         c.execute("CREATE INDEX IF NOT EXISTS idx_pub_tasks_status ON publish_tasks(status)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_pub_tasks_finder ON publish_tasks(finder_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_pub_titles_finder ON publish_titles(finder_id)")
@@ -1495,11 +1500,12 @@ class Storage:
 
     def set_task_status(self, task_id, status=None, step=None, error=None, object_id=None,
                         export_id=None, account_id=None, started=False, finished=False,
-                        attempts=None):
+                        attempts=None, archived_name=None):
         sets, args = [], []
         for col, val in (("status", status), ("step", step), ("last_error", error),
                          ("object_id", object_id), ("export_id", export_id),
-                         ("account_id", account_id), ("attempts", attempts)):
+                         ("account_id", account_id), ("attempts", attempts),
+                         ("archived_name", archived_name)):
             if val is not None:
                 sets.append(f"{col}=?"); args.append(val)
         if started:

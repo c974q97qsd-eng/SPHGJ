@@ -719,7 +719,7 @@ class VideoPublisher:
                 except Exception:
                     pass
 
-    async def _verify_in_list(self, page, title, tries=3, gap=15):
+    async def _verify_in_list(self, page, title, tries=4, gap=20):
         """回读作品列表首屏,按描述前 20 字匹配。返回 {object_id, export_id} 或 None。"""
         want = _norm(title)[:20]
         if not want:

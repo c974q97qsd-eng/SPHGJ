@@ -30,6 +30,7 @@ export function SettingsPanel() {
       setForm({
         enabled: !!c.enabled,
         auto_start_account: !!c.auto_start_account,
+        rename_after_publish: c.rename_after_publish !== false,
         window_start: String(c.window_start ?? "08:00"),
         window_end: String(c.window_end ?? "22:30"),
         daily_limit: Number(c.daily_limit ?? 1),
@@ -85,6 +86,11 @@ export function SettingsPanel() {
           </Row>
           <Row label="账号未运行时自动拉起" hint="关闭则只发正在运行的账号,其余排队等待">
             <Switch checked={!!form.auto_start_account} onCheckedChange={(v) => set("auto_start_account", v)} />
+          </Row>
+          <Row label="发布成功后重命名素材"
+            hint={`归档到 _done 时改名为「日期发布-标题-原文件名」,例:2026-10-20发布-厚底老爹鞋视觉增高-原文件名.mp4`}>
+            <Switch checked={form.rename_after_publish !== false}
+              onCheckedChange={(v) => set("rename_after_publish", v)} />
           </Row>
           <Separator />
           <Row label="发布时间窗" hint="窗外不发(支持跨午夜,如 22:00–02:00)">

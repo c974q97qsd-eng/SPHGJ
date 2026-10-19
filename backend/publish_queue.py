@@ -23,6 +23,7 @@ import hashlib
 import logging
 import os
 import random
+import re
 import shutil
 import time
 from datetime import datetime, timedelta
@@ -49,6 +50,8 @@ DEFAULTS = {
     "min_login_remain_sec": 7200,  # 登录态剩余不足 2h 不发(避免发一半掉登录)
     "tick_interval_sec": 30,
     "refresh_posts_after_sec": 180,  # 发完多久触发一次作品列表刷新
+    # 发布成功后把素材重命名为 "发布日期"发布-"标题"-原文件名(归档到 _done/)
+    "rename_after_publish": True,
 }
 
 
@@ -66,6 +69,27 @@ def file_fp(path):
 
 def _hhmm_now():
     return datetime.now().strftime("%H:%M")
+
+
+_BAD_NAME_CHARS = re.compile(r'[\\/:*?"<>|\r\n\t]')
+
+
+def _safe_name(s):
+    """清掉 Windows 文件名非法字符(换成空格)并压缩连续空格。"""
+    s = _BAD_NAME_CHARS.sub(" ", s or "")
+    return re.sub(r"\s{2,}", " ", s).strip()
+
+
+def _unique_path(path):
+    """目标已存在时加 (2)(3) 序号,绝不覆盖已有归档文件。"""
+    if not os.path.exists(path):
+        return path
+    stem, ext = os.path.splitext(path)
+    for i in range(2, 1000):
+        cand = f"{stem} ({i}){ext}"
+        if not os.path.exists(cand):
+            return cand
+    return f"{stem} (dup){ext}"
 
 
 def _in_window(start, end, now=None):
@@ -427,12 +451,15 @@ class PublishQueue:
                     export_id=res.get("export_id") or "", account_id=w.account.get("id"),
                     finished=True)
                 self._fail_streak[fid] = 0
-                self._archive(t, ok=True)
+                archived = self._archive(t, ok=True)
+                if archived:
+                    self.storage.set_task_status(int(task_id), archived_name=archived)
                 logger.info(f"[publish] 发布成功 {t.get('file_name')} -> {self.finder_label(fid)}"
-                            f" object_id={res.get('object_id')}")
+                            f" object_id={res.get('object_id')}"
+                            + (f" | 已归档为 {archived}" if archived else ""))
                 # 稍后触发一次作品列表刷新,让作品管理里能看到这条
                 if self._cfg_get("refresh_posts_after_sec"):
-                    asyncio.create_task(self._refresh_posts_later(w))
+                    asyncio.create_task(self._refresh_posts_later(w, int(task_id)))
             else:
                 attempts_fail = self._fail_streak.get(fid, 0) + 1
                 self._fail_streak[fid] = attempts_fail
@@ -463,22 +490,59 @@ class PublishQueue:
             await self._push()
 
     def _archive(self, task, ok=True):
-        """成功后把源文件移进 _done/(失败不移动,见 run_task 里的说明)。"""
+        """成功后把源文件移进 _done/。返回归档后的文件名(失败返回 "")。
+
+        rev26:开启 rename_after_publish 时按用户要求的格式重命名:
+            "发布日期"发布-"使用的标题"-原文件名
+        例:2026-10-20发布-厚底老爹鞋视觉增高 比例一下就出来了-2月28日 (58).mp4
+        """
         src = task.get("src_path") or ""
         if not src or not os.path.isfile(src):
-            return
+            return ""
         root = self.inbox_dir
         sub = os.path.join(root, SUB_DONE if ok else SUB_FAILED)  # 目前只有成功路径会调用
         try:
             os.makedirs(sub, exist_ok=True)
-            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-            dst = os.path.join(sub, f"{stamp}_{os.path.basename(src)}")
+            name = os.path.basename(src)
+            if ok and self._cfg_get("rename_after_publish"):
+                name = self._published_name(task, src)
+            dst = _unique_path(os.path.join(sub, name))
             shutil.move(src, dst)
+            return os.path.basename(dst)
         except Exception as e:
             logger.warning(f"[publish] 归档文件失败 {src}: {e}")
+            return ""
 
-    async def _refresh_posts_later(self, worker):
-        """发完延迟触发一次作品列表刷新(让作品管理立刻能看到新作品)。"""
+    def _published_name(self, task, src):
+        """拼 "日期发布-标题-原文件名"。标题清洗为合法文件名,整体长度受控。"""
+        stem, ext = os.path.splitext(os.path.basename(src))
+        # 原文件名一般合法,但外部拷入/网络来源可能带非法字符,一并清掉
+        stem = _safe_name(stem) or "video"
+        title = (task.get("title") or "").strip()
+        # 标题里的换行/制表符压成空格,话题 # 保留(它是标题的一部分)
+        title = re.sub(r"\s+", " ", title).strip()
+        title = _safe_name(title)[:60].strip(" .-_")
+        date = datetime.now().strftime("%Y-%m-%d")
+        if title:
+            name = f"{date}发布-{title}-{stem}{ext}"
+        else:
+            name = f"{date}发布-{stem}{ext}"
+        # Windows 路径上限 260:超长时截断标题而不是截断原文件名(原名是溯源关键)
+        room = 250 - len(os.path.join(self.inbox_dir, SUB_DONE))
+        if len(name) > room:
+            over = len(name) - room
+            keep = max(8, len(title) - over - 1)
+            name = f"{date}发布-{title[:keep].strip(' .-_')}-{stem}{ext}"
+            if len(name) > room:
+                name = f"{date}发布-{stem}{ext}"
+        return name
+
+    async def _refresh_posts_later(self, worker, task_id=None):
+        """发完延迟触发一次作品列表刷新(让作品管理立刻能看到新作品)。
+
+        刷新完顺手把 object_id 回填到任务:视频还在转码时 verify 回读不到,
+        等作品真正出现在列表里再补上,任务页就不会一直空着作品 ID。
+        """
         await asyncio.sleep(float(self._cfg_get("refresh_posts_after_sec") or 180))
         try:
             from .post_fetcher import PostFetcher
@@ -494,6 +558,31 @@ class PublishQueue:
                 await worker.release_idle_browser()
         except Exception as e:
             logger.debug(f"[publish] 发布后刷新作品列表失败: {e}")
+            return
+        if task_id:
+            try:
+                self._backfill_object_id(int(task_id))
+            except Exception as e:
+                logger.debug(f"[publish] 回填作品 ID 失败: {e}")
+
+    def _backfill_object_id(self, task_id):
+        """作品已进作品表时,按「视频号 + 标题前 20 字」把 object_id 补回任务。"""
+        t = self.storage.get_task(int(task_id))
+        if not t or (t.get("object_id") or ""):
+            return
+        want = re.sub(r"\s+", "", (t.get("title") or ""))[:20]
+        if not want:
+            return
+        rows, _ = self.storage.query_posts(finder_id=t.get("finder_id"), limit=30)
+        for p in rows or []:
+            if want in re.sub(r"\s+", "", p.get("title") or ""):
+                self.storage.set_task_status(
+                    int(task_id), object_id=p.get("object_id") or "",
+                    export_id=p.get("export_id") or "", error="")
+                logger.info(f"[publish] 回填作品 ID 成功 task={task_id} "
+                            f"object_id={p.get('object_id')}")
+                self.storage.set_task_status(int(task_id), step="done")
+                return
 
     # ---------------- 后台循环 ----------------
     def start(self):
