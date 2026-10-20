@@ -256,18 +256,50 @@ echo.
 
 REM ==================== 1. 环境与状态 ====================
 echo [1/5] 检查更新环境 ...
-where git >nul 2>&1
-if errorlevel 1 (
-    echo   [错误] 没找到 git
-    echo          请先安装 Git: https://git-scm.com/download/win
-    echo          安装时选 Git from the command line,装完重开本窗口
+REM git 先「自动找」再「自动装」:PATH 里没有不代表没装(装的时候没勾
+REM Add to PATH、或装在 D 盘 Program Files 下,都很常见),所以不能只 where。
+set "GIT="
+call :find_git
+if not defined GIT (
+    echo   [提示] 本机没装 Git,自动安装 - 约 60MB,中途无需操作,请耐心等 ...
+    call :install_git
+)
+if not defined GIT (
+    echo   [错误] Git 自动安装没成功
+    echo          请手动装一次: https://git-scm.com/download/win
+    echo          一路默认下一步即可,装完重新双击 一键更新.bat
+    echo          每台机器只需要装一次,之后所有更新都不再需要
     goto :fail
 )
+REM 刚装好的 git 不会进当前进程的环境变量,这里补一次 PATH,
+REM 后面所有命令就能照常写 git,不用重开窗口
+for %%i in ("%GIT%") do set "PATH=%%~dpi;%PATH%"
+for /f "delims=" %%i in ('git --version 2^>nul') do set "GITVER=%%i"
+echo   [OK] !GITVER!
+
 if not exist "%ROOT%.git" (
     echo   [错误] 当前目录不是 git 仓库,无法在线更新
-    echo          这说明你拿到的是压缩包版本,请改用完整包覆盖安装
+    echo          这说明你拿到的是压缩包版本,不是 git clone 下来的
+    echo          请改用完整包覆盖安装 - 只覆盖代码,别覆盖 data / config.json
     goto :fail
 )
+
+REM 有些目录是从别处拷来的 .git,里面没有 remote -> 拉不到东西。
+REM 没有就自动补一个(只读拉取用 https 就够,不需要密钥)。
+set "ORIGIN="
+for /f "delims=" %%i in ('git remote get-url origin 2^>nul') do set "ORIGIN=%%i"
+if not defined ORIGIN (
+    echo   [提示] 这个目录没有配置远程地址,自动补一个 ...
+    git remote add origin https://github.com/c974q97qsd-eng/SPHGJ.git
+    if errorlevel 1 (
+        echo   [错误] 自动配置远程地址失败,请手动执行:
+        echo          git remote add origin https://github.com/c974q97qsd-eng/SPHGJ.git
+        goto :fail
+    )
+    set "ORIGIN=https://github.com/c974q97qsd-eng/SPHGJ.git"
+    echo   [OK] 已指向 https://github.com/c974q97qsd-eng/SPHGJ
+)
+
 for /f %%i in ('git rev-parse --short HEAD 2^>nul') do set "OLD=%%i"
 echo   [OK] 当前版本: !OLD!
 
@@ -283,7 +315,15 @@ REM ==================== 2. 拉取最新版 ====================
 echo [2/5] 拉取最新代码 ...
 git fetch origin --prune
 if errorlevel 1 (
-    echo   [错误] 连不上远程仓库,请检查网络 (github 需能访问)
+    echo   [错误] 拉不到远程仓库,对号入座看是哪一种:
+    echo.
+    echo          当前远程地址: !ORIGIN!
+    echo          1. 网络问题 - 这台机器访问不了 github.com
+    echo             先试: ping github.com
+    echo          2. 用的是 SSH 地址 (git@github.com:...) 但本机没有密钥
+    echo             要么把私钥放到 %USERPROFILE%\.ssh\,要么换成 https:
+    echo             git remote set-url origin https://github.com/c974q97qsd-eng/SPHGJ.git
+    echo          3. 仓库是私有的,https 需要 token - 换成上面的 SSH 方式即可
     goto :fail
 )
 git pull --ff-only
@@ -395,6 +435,56 @@ echo ==========================================
 :end
 echo.
 pause
+goto :eof
+
+
+REM ============================================================
+REM 子过程: 找 git —— 不要求它在 PATH 里
+REM   返回值: 变量 GIT = git.exe 的完整路径(找不到则保持未定义)
+REM ============================================================
+:find_git
+REM 1) PATH 里直接有
+for /f "delims=" %%i in ('where git.exe 2^>nul') do if not defined GIT set "GIT=%%i"
+if defined GIT goto :eof
+REM 2) 常见安装目录 —— 必须遍历各盘符,有机器把 Git 装在 D 盘 Program Files
+for %%D in (C D E F G) do (
+    if not defined GIT if exist "%%D:\Program Files\Git\cmd\git.exe" set "GIT=%%D:\Program Files\Git\cmd\git.exe"
+    if not defined GIT if exist "%%D:\Program Files (x86)\Git\cmd\git.exe" set "GIT=%%D:\Program Files (x86)\Git\cmd\git.exe"
+    if not defined GIT if exist "%%D:\Git\cmd\git.exe" set "GIT=%%D:\Git\cmd\git.exe"
+)
+if defined GIT goto :eof
+REM 3) 装到用户目录的情况(免管理员安装的选项)
+if exist "%LOCALAPPDATA%\Programs\Git\cmd\git.exe" set "GIT=%LOCALAPPDATA%\Programs\Git\cmd\git.exe"
+goto :eof
+
+
+REM ============================================================
+REM 子过程: 装 git —— winget 优先,不行就下官方安装包静默装
+REM ============================================================
+:install_git
+where winget >nul 2>&1
+if errorlevel 1 goto :install_git_pkg
+echo   -- 用 winget 安装 Git --
+winget install --id Git.Git -e --silent --accept-package-agreements --accept-source-agreements
+call :find_git
+if defined GIT goto :eof
+echo   winget 这条路没走通,改用官方安装包 ...
+
+:install_git_pkg
+echo   -- 下载官方安装包并静默安装(约 60MB)--
+set "GSETUP=%TEMP%\sphgj-git-setup.exe"
+if exist "%GSETUP%" del /f /q "%GSETUP%" >nul 2>&1
+REM 走 GitHub API 取最新 64 位安装包的下载地址,不写死版本号
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue';$r=Invoke-RestMethod 'https://api.github.com/repos/git-for-windows/git/releases/latest' -Headers @{'User-Agent'='sphgj'};$a=$r.assets|Where-Object{$_.name -like 'Git-*-64-bit.exe'}|Select-Object -First 1;if(-not $a){exit 2};Invoke-WebRequest $a.browser_download_url -OutFile '%GSETUP%'"
+if not exist "%GSETUP%" (
+    echo   安装包下载失败
+    goto :eof
+)
+echo   正在静默安装(1~2 分钟)...
+"%GSETUP%" /VERYSILENT /NORESTART /NOCANCEL /SP- /o:PathOption=Cmd
+call :find_git
+if defined GIT echo   [OK] Git 安装完成
+goto :eof
 '''
 
 
