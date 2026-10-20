@@ -1324,6 +1324,14 @@ class LoginSession:
             import shutil
             if os.path.exists(target_dir):
                 shutil.rmtree(target_dir, ignore_errors=True)
+                if os.path.isdir(target_dir):
+                    # rev32: 目标被残留 Chromium 占着删不掉 —— 以前直接降级成临时目录,
+                    # 而这个临时路径会被写进 config,临时目录一清账号就永久登录不上
+                    # (9/10 号的事故)。这里先清孤儿再删一次。
+                    reap_profile_orphans(target_dir,
+                                         log_tag=f"[login:{self.sid}] 迁移前", min_age_sec=0)
+                    time.sleep(1.0)
+                    shutil.rmtree(target_dir, ignore_errors=True)
             shutil.move(self.profile_dir, target_dir)
             self.profile_dir = target_dir
             return target_dir

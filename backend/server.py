@@ -147,6 +147,12 @@ async def _capture_loop():
     # rev21: 重启后恢复"关闭之前在运行中的账号"
     # 延迟 15s:等前端 WS 连上先拿到真实状态,恢复过程经 engine_status 事件实时可见
     async def _auto_restore_loop():
+        # rev32: 先把指向扫码临时目录的 profile 搬回正常路径。
+        # 必须赶在自动恢复拉起账号之前(profile 空着才搬得动)。
+        try:
+            await manager.heal_login_profiles()
+        except Exception as e:
+            logger.warning(f"[自愈] 执行异常(忽略): {e}")
         await asyncio.sleep(15)
         if not manager.config.get("auto_restore_running", True):
             logger.info("[恢复] auto_restore_running=false,跳过自动恢复")
