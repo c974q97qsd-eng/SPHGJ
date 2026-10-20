@@ -74,6 +74,50 @@ async def launch_stealth(playwright, profile_dir, headless=True, window_size=Non
     return ctx
 
 
+def reap_profile_orphans(profile_dir, log_tag=""):
+    """按 --user-data-dir 精确匹配, kill 该 profile 的所有 Chromium 进程(rev28)。
+
+    解决的问题:context.close() 不抛异常,但浏览器进程其实还活着(扫码窗口被手动
+    关掉、TargetClosedError、管道异常等)。残留进程会独占 profile 里的
+    Cookies / LocalStorage,此后同一 profile 再 launch 出来的实例既写不进也读不到
+    新的登录态 —— 表现就是「扫码成功,一启动又回登录页」的死循环
+    (2026-10-20 免税仓 uspoloassn2 连续 4 次扫码失败的真因)。
+
+    安全性:Chromium 用 profile 锁保证同一 user_data_dir 同一时刻只有一个实例,
+    所以匹配到的进程必然属于这个 profile;但调用方仍要自己确认此刻没有本进程的
+    合法 context 正在使用它(见 AccountManager._profile_busy)。
+
+    返回被 kill 的 pid 列表(没装 psutil 时返回空列表,不抛错)。
+    """
+    if not profile_dir:
+        return []
+    try:
+        import psutil
+    except ImportError:
+        logger.warning(f"[browser] {log_tag} 未装 psutil,无法清理孤儿 chrome 进程")
+        return []
+    abs_dir = os.path.abspath(profile_dir)
+    killed = []
+    for p in psutil.process_iter(["pid", "cmdline"]):
+        try:
+            for arg in (p.info.get("cmdline") or []):
+                if arg.startswith("--user-data-dir="):
+                    if os.path.abspath(arg.split("=", 1)[1]) == abs_dir:
+                        pid = p.info["pid"]
+                        p.kill()
+                        killed.append(pid)
+                        break
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+        except Exception:
+            continue
+    if killed:
+        more = "…" if len(killed) > 8 else ""
+        logger.info(f"[browser] {log_tag} 清理 {len(killed)} 个孤儿 chrome 进程 "
+                    f"pids={killed[:8]}{more} profile={profile_dir}")
+    return killed
+
+
 async def close_context_safely(ctx, profile_dir=None, log_tag=""):
     """关闭持久化 context,吞异常;close 失败时按 profile_dir 兜底 kill 残留 chrome 进程。
 
@@ -91,24 +135,4 @@ async def close_context_safely(ctx, profile_dir=None, log_tag=""):
         logger.debug(f"[browser] {log_tag} context.close 异常(将兜底 kill): {e}")
     if closed_ok or not profile_dir:
         return
-    try:
-        import psutil
-    except ImportError:
-        logger.warning(f"[browser] {log_tag} context.close 失败且未装 psutil,无法兜底 kill 残留进程")
-        return
-    abs_dir = os.path.abspath(profile_dir)
-    killed = 0
-    for p in psutil.process_iter(["pid", "cmdline"]):
-        try:
-            for arg in (p.info.get("cmdline") or []):
-                if arg.startswith("--user-data-dir="):
-                    if os.path.abspath(arg.split("=", 1)[1]) == abs_dir:
-                        p.kill()
-                        killed += 1
-                        break
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
-        except Exception:
-            continue
-    if killed:
-        logger.info(f"[browser] {log_tag} 兜底 kill {killed} 个残留 chrome 进程(profile={profile_dir})")
+    reap_profile_orphans(profile_dir, log_tag=f"{log_tag} 兜底")

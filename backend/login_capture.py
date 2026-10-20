@@ -13,13 +13,14 @@ import re
 import json
 import uuid
 import shutil
+import time
 import base64
 import asyncio
 import datetime
 from urllib.parse import urlparse, parse_qs
 import logging
 logger = logging.getLogger("sphgj")
-from .browser import launch_stealth, close_context_safely
+from .browser import launch_stealth, close_context_safely, reap_profile_orphans
 from .selectors import (QR_CANDIDATES, COMMENT_URL, LOGIN_URL,
                         ACCOUNT_SELECT_MARKERS, ACCOUNT_SELECT_ROLE_WORDS)
 
@@ -49,6 +50,20 @@ def check_account_lock(acc: dict, captured: dict) -> str:
             f"本次登录的是「{nm or '未知'}」,已拒绝保存")
 
 
+def _wipe_dir(target):
+    """清空目录内容(尽力而为,保留目录本身)。删不掉的项只记 debug,由调用方统计残留。"""
+    for name in os.listdir(target):
+        p = os.path.join(target, name)
+        try:
+            if os.path.isdir(p) and not os.path.islink(p):
+                shutil.rmtree(p, ignore_errors=True)
+            else:
+                os.remove(p)
+        except Exception as e:
+            logger.debug(f"[lock-clean] 删除 {p} 失败: {e}")
+    os.makedirs(target, exist_ok=True)
+
+
 def clear_login_state(profile_dir: str):
     """清空账号 profile 目录内的登录态文件并重建空目录(全新登录环境)。
 
@@ -66,19 +81,21 @@ def clear_login_state(profile_dir: str):
         return False, f"拒绝清理非 profiles 目录: {profile_dir}"
     try:
         if os.path.isdir(target):
-            for name in os.listdir(target):
-                p = os.path.join(target, name)
-                try:
-                    if os.path.isdir(p) and not os.path.islink(p):
-                        shutil.rmtree(p, ignore_errors=True)
-                    else:
-                        os.remove(p)
-                except Exception as e:
-                    logger.debug(f"[lock-clean] 删除 {p} 失败: {e}")
+            _wipe_dir(target)
         os.makedirs(target, exist_ok=True)
     except Exception as e:
         return False, f"清理登录态失败: {e}"
     leftover = os.listdir(target) if os.path.isdir(target) else ["<目录不存在>"]
+    if leftover:
+        # rev28: 残留基本都是孤儿 Chromium 占着 Cookies / LocalStorage 删不掉(文件锁)。
+        # 以前这里直接返回 false,调用方只提示「浏览器可能未完全退出」,脏 profile 就
+        # 一直留着,之后每次扫码写进去的 cookie 都被它顶掉 —— 免税仓 2026-10-20 的
+        # 死循环根因。现在先按 profile_dir kill 孤儿,等句柄释放后再清一遍。
+        pids = reap_profile_orphans(target, log_tag="[lock-clean] 兜底")
+        if pids:
+            time.sleep(1.2)
+            _wipe_dir(target)
+            leftover = os.listdir(target) if os.path.isdir(target) else ["<目录不存在>"]
     if leftover:
         return False, f"登录态未清干净(残留 {len(leftover)} 项,浏览器可能未完全退出)"
     return True, "已清除本账号登录态,登录环境已重置"
@@ -136,6 +153,9 @@ class LoginSession:
         if self.account:
             # relogin:复用原账号 profile_dir(失效 cookie 会被扫码覆盖)
             self.profile_dir = self.account["profile_dir"]
+            # rev28: 复用旧目录前先清孤儿。有残留进程独占该 profile 时,扫码写进去的
+            # cookie 落不了盘,关掉就没了 —— 表现为「扫码成功但一启动又回登录页」。
+            reap_profile_orphans(self.profile_dir, log_tag=f"[login:{self.sid}] 扫码前")
         else:
             self.profile_dir = f"./profiles/_login_{self.sid}"
             os.makedirs(self.profile_dir, exist_ok=True)
@@ -211,6 +231,13 @@ class LoginSession:
             await close_context_safely(self.context, self.profile_dir, f"[login:{self.sid}]")
             self.context = None
             self.page = None
+        # rev28: context 关完再兜底清一次 —— ctx.close() 不抛错不代表进程真退了
+        # (扫码窗口被手动关掉时最常见),孤儿会一直锁着 profile。
+        if self.profile_dir:
+            try:
+                reap_profile_orphans(self.profile_dir, log_tag=f"[login:{self.sid}] 收尾")
+            except Exception as e:
+                logger.debug(f"[login:{self.sid}] 收尾清理孤儿失败: {e}")
         if not keep_profile and self.profile_dir and not self._finalized:
             # 清理临时登录 profile
             try:

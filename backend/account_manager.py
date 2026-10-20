@@ -20,7 +20,7 @@ from .auto_delete import AutoDelete
 from .live_fetcher import LiveFetcher
 from .auto_comment import AutoCommenter
 from .login_capture import LoginSession, clear_login_state
-from .browser import launch_stealth, close_context_safely
+from .browser import launch_stealth, close_context_safely, reap_profile_orphans
 from .selectors import COMMENT_URL, POST_CREATE_URL
 from .memtrim import MemoryTrimmer, trim_now
 
@@ -807,6 +807,40 @@ class AccountManager:
         # rev25: 用户手动点停的账号。自动发作品调度器不会去拉起这些号(避免跟用户操作打架),
         # 用户下次手动启动时自动清除。
         self.human_stopped = set()
+        # rev28: 由 server 注入,判断 profile 是否正被远程串流占用(清孤儿时避免误杀)
+        self.remote_registry = None
+
+    # ---------- rev28: 孤儿进程清理 ----------
+    _LOGIN_TERMINAL = ("finalized", "success", "failed", "cancelled")
+
+    def _has_active_login(self, account_id):
+        """该账号是否有一个还没到终态的扫码会话(说明 profile 正被它占用)。"""
+        for s in list((self.login_sessions or {}).values()):
+            acc = getattr(s, "account", None) or {}
+            if acc.get("id") == account_id and \
+                    getattr(s, "status", "") not in self._LOGIN_TERMINAL:
+                return True
+        return False
+
+    def _profile_busy(self, account_id):
+        """该账号 profile 是否正被已知的活会话占用:worker context / 扫码 / 远程串流。
+
+        清孤儿是「按 profile_dir 全杀」,所以必须先确认没有自己的合法 context 在用,
+        否则会把正在抓取或正在串流的浏览器一起杀掉。
+        """
+        w = self.workers.get(account_id)
+        if w is not None and getattr(w, "context", None) is not None:
+            return True
+        if self._has_active_login(account_id):
+            return True
+        reg = getattr(self, "remote_registry", None)
+        if reg is not None:
+            try:
+                if reg.get(account_id) is not None:
+                    return True
+            except Exception:
+                pass
+        return False
 
     async def _ensure_playwright(self):
         if self._playwright is None:
@@ -932,6 +966,14 @@ class AccountManager:
         await self._emit("engine_status", self.status_snapshot())
 
     async def add_account(self, account, headless=True):
+        # rev28: launch 之前清掉锁死 profile 的孤儿 Chromium。有残留进程占着
+        # Cookies / LocalStorage 时,新实例既写不进也读不到登录态,扫多少次码都白扫。
+        if not self._profile_busy(account["id"]):
+            try:
+                reap_profile_orphans(account.get("profile_dir"),
+                                     log_tag=f"[{account['id']}] 启动前")
+            except Exception as e:
+                logger.warning(f"[{account['id']}] 启动前清理孤儿进程失败: {e}")
         worker = AccountWorker(account, self.storage, self.config, self._emit)
         try:
             await worker.start(self._playwright, headless=headless)
@@ -987,6 +1029,17 @@ class AccountManager:
             return None
         if account_id in self.workers:
             await self.stop_account(account_id)
+        # rev28: 停掉 worker 后立刻清孤儿,给扫码一个真正干净的 profile
+        try:
+            reap_profile_orphans(acc.get("profile_dir"), log_tag=f"[{account_id}] 扫码前")
+        except Exception as e:
+            logger.warning(f"[{account_id}] 扫码前清理孤儿进程失败: {e}")
+        if on_finished is None:
+            # rev28: 手动扫码成功后自动把账号拉起来。以前手动模式不给回调,扫码到终态
+            # 后没人 start_account,而上面已经把 worker 停掉了 —— 用户看到的是
+            # 「扫码成功但账号仍然未登录」,还得自己再点一次启动。
+            def on_finished(sid, status, aid):
+                asyncio.create_task(self._on_relogin_finished(aid, status, sid))
         pw = await self._ensure_playwright()
         sess = LoginSession(pw, self.config, self._emit, account=acc,
                             auto_finalize=auto, on_finished=on_finished)
@@ -1029,18 +1082,23 @@ class AccountManager:
             logger.error(f"自动 relogin 启动失败 {acc_id}: {e}")
             await self._on_relogin_finished(acc_id, "failed")
 
-    async def _on_relogin_finished(self, account_id, status):
-        if self._relogin_active_sid:
+    async def _on_relogin_finished(self, account_id, status, sid=None):
+        if sid:
+            self.login_sessions.pop(sid, None)
+        elif self._relogin_active_sid:
             self.login_sessions.pop(self._relogin_active_sid, None)
         if status == "finalized":
             try:
                 await self.start_account(account_id)
             except Exception as e:
-                logger.warning(f"自动 relogin 后启动失败 {account_id}: {e}")
-        self._relogin_active_acc = None
-        self._relogin_active_sid = None
-        await self._emit("relogin_queue", self._relogin_snapshot())
-        await self._run_next_relogin()
+                logger.warning(f"relogin 后启动失败 {account_id}: {e}")
+        # rev28: 只有「当前活跃的那个自动 relogin」结束才推进队列。
+        # 手动扫另一个号结束时也走这个回调,无条件清会把自动队列的状态抹掉。
+        if self._relogin_active_acc == account_id:
+            self._relogin_active_acc = None
+            self._relogin_active_sid = None
+            await self._emit("relogin_queue", self._relogin_snapshot())
+            await self._run_next_relogin()
 
     def _relogin_snapshot(self):
         active = self._relogin_active_acc

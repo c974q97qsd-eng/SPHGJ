@@ -36,6 +36,7 @@ from .memtrim import trim_now
 from .post_fetcher import PostFetcher
 from .publish_queue import PublishQueue
 from .remote_view import RemoteRegistry
+from .browser import reap_profile_orphans
 from . import restart as restart_mod
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
@@ -115,6 +116,7 @@ manager = AccountManager(config, storage, emit=hub.emit)
 publish_queue = PublishQueue(manager, storage, config, emit=hub.emit, save_config=save_config)
 # rev27: 远程同步浏览(CDP 串流),「打开」按钮走这里,5 分钟无操作自动断开
 remote_registry = RemoteRegistry(manager, config, storage)
+manager.remote_registry = remote_registry  # rev28: 清孤儿时避免误杀正在串流的浏览器
 # 上次进程中断时还在 running 的任务不能自动重发(可能实际已发出),转 need_review 等人工核对
 try:
     _nr = storage.reset_running_tasks()
@@ -918,6 +920,29 @@ async def remote_close(account: str = Query("")):
         raise HTTPException(400, "缺少 account 参数")
     await remote_registry.close(account, "manual")
     return {"ok": True}
+
+
+@app.post("/api/system/reap-orphans")
+async def system_reap_orphans(account: str = Query("")):
+    """清理锁死 profile 的孤儿 Chromium 进程(rev28)。
+
+    不传 account 则遍历配置里的所有账号;正被占用(运行中 / 扫码中 / 串流中)
+    的账号自动跳过,不会误杀。返回每个账号被 kill 的 pid 列表。
+    """
+    accs = [a for a in manager.config.get("accounts", [])
+            if (not account or a.get("id") == account)]
+    if account and not accs:
+        raise HTTPException(404, "账号不存在")
+    items = []
+    for a in accs:
+        aid = a.get("id") or ""
+        if manager._profile_busy(aid):
+            items.append({"account": aid, "skipped": "profile 正被占用(运行中/扫码中/串流中)"})
+            continue
+        pids = reap_profile_orphans(a.get("profile_dir"), log_tag=f"[reap:{aid}]")
+        items.append({"account": aid, "profile_dir": a.get("profile_dir"),
+                      "killed": pids})
+    return {"items": items}
 
 
 @app.post("/api/system/restart")
