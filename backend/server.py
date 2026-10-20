@@ -716,6 +716,59 @@ async def comment_health_reset():
     return await asyncio.to_thread(_impl)
 
 
+_LOCAL_IPS = {"ips": None, "ts": 0.0}
+
+
+def _local_ip_set():
+    """本机所有 IPv4 地址(含回环)。缓存 60 秒,网卡热插拔也能跟上。"""
+    now = time.time()
+    if _LOCAL_IPS["ips"] is not None and now - _LOCAL_IPS["ts"] < 60:
+        return _LOCAL_IPS["ips"]
+    import socket
+    ips = {"127.0.0.1", "::1"}
+    try:
+        import psutil
+        for _name, addrs in psutil.net_if_addrs().items():
+            for a in addrs:
+                if a.family == socket.AF_INET:
+                    ips.add(a.address)
+    except Exception:
+        try:
+            for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+                ips.add(info[4][0])
+        except Exception:
+            pass
+    _LOCAL_IPS["ips"], _LOCAL_IPS["ts"] = ips, now
+    return ips
+
+
+def _client_is_local(request):
+    """请求是否来自「运行程序的这台机器」。
+
+    判据:client.host in {127.0.0.1, ::1} 或命中本机任一网卡 IPv4。
+    本机浏览器用局域网 IP(如 192.168.1.27)访问自己时,TCP 源地址就是本机网卡 IP,
+    所以也能正确判为本机;别的电脑访问时源地址是它自己的 IP,判为非本机。
+    """
+    try:
+        host = request.client.host if request.client else ""
+    except Exception:
+        host = ""
+    if not host:
+        return False
+    if host in ("127.0.0.1", "::1", "localhost"):
+        return True
+    return host in _local_ip_set()
+
+
+@app.get("/api/system/whoami")
+async def system_whoami(request: Request):
+    """当前访问者是不是运行程序的这台机器(决定是否显示本机专属功能)。"""
+    local = _client_is_local(request)
+    return {"local": local,
+            "client": (request.client.host if request.client else ""),
+            "local_ips": sorted(_local_ip_set()) if local else []}
+
+
 @app.get("/api/system/info")
 async def system_info():
     """运行信息 —— 远程重启后靠 pid 变化判断是否重启成功。
@@ -936,7 +989,7 @@ async def remote_close(account: str = Query("")):
 
 # ===================== 本机可见浏览器窗口(rev31) =====================
 @app.post("/api/accounts/{account_id}/open-window")
-async def account_open_window(account_id: str):
+async def account_open_window(account_id: str, request: Request):
     """在运行程序的本机拉起该账号的独立浏览器窗口。
 
     与后台抓取/直播大屏完全隔离:该账号 worker 活着时,从它的 context 只读导出
@@ -944,6 +997,10 @@ async def account_open_window(account_id: str):
     本来就空着,直接用。两种情形都不会占用后台那份 profile。
     窗口 5 分钟无操作自动关闭。
     """
+    # 非本机访问不弹窗口:窗口会出现在运行程序的屏幕上,访问者根本看不到
+    if not _client_is_local(request):
+        raise HTTPException(403, "本机窗口只能在运行程序的这台机器上打开"
+                                 "(远程请用「远程」按钮走网页串流)")
     acc = next((a for a in config.get("accounts", []) if a["id"] == account_id), None)
     if not acc:
         raise HTTPException(404, "账号不存在")

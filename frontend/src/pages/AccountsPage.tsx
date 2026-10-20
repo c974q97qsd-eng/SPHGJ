@@ -49,8 +49,25 @@ export function AccountsPage() {
   )
 }
 
+// rev33: 只在「运行程序的这台机器」上显示「打开」按钮。
+// 模块级缓存,多张卡片共用同一个请求;失败按非本机处理(宁可少显示也别让人误点)。
+let _whoamiPromise: Promise<{ local: boolean }> | null = null
+function useIsLocal() {
+  const [isLocal, setIsLocal] = useState(false)
+  useEffect(() => {
+    if (!_whoamiPromise) {
+      _whoamiPromise = api.whoami().catch(() => ({ local: false, client: "" }))
+    }
+    let alive = true
+    _whoamiPromise.then((r) => { if (alive) setIsLocal(!!r.local) })
+    return () => { alive = false }
+  }, [])
+  return isLocal
+}
+
 function AccountCard({ acc, onRefresh }: { acc: AccountStatus; onRefresh: () => void }) {
   const { busy, start, stop, openBrowser, remove, setLock, logout } = useAccountActions(onRefresh)
+  const isLocal = useIsLocal()
   const [delOpen, setDelOpen] = useState(false)
   const [reloginOpen, setReloginOpen] = useState(false)
   const isBusy = busy === acc.id
@@ -141,7 +158,9 @@ function AccountCard({ acc, onRefresh }: { acc: AccountStatus; onRefresh: () => 
             </div>
           </div>
           <div className="flex items-center gap-1">
-            <Button size="sm" variant="outline" onClick={handleOpen} disabled={isBusy} aria-label="在本机打开账号浏览器" title="在运行程序的这台电脑上直接打开浏览器窗口(不影响后台抓取与直播,5 分钟无操作自动关闭)">{<ExternalLink className="h-3.5 w-3.5" />}打开</Button>
+            {isLocal && (
+              <Button size="sm" variant="outline" onClick={handleOpen} disabled={isBusy} aria-label="在本机打开账号浏览器" title="在运行程序的这台电脑上直接打开浏览器窗口(不影响后台抓取与直播,5 分钟无操作自动关闭)">{<ExternalLink className="h-3.5 w-3.5" />}打开</Button>
+            )}
             <Button size="icon" variant="ghost" onClick={handleRemote} disabled={isBusy} aria-label="远程串流查看" title="在网页标签里远程查看/操作这个账号的浏览器(适合不在本机前)">{<Monitor className="h-3.5 w-3.5" />}</Button>
             {acc.running
               ? <Button size="sm" variant="outline" onClick={() => stop(acc.id)} disabled={isBusy}>{isBusy ? <Loader2 className="animate-spin" /> : <Square className="h-3.5 w-3.5" />}停止</Button>

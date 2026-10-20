@@ -341,6 +341,8 @@ export const api = {
   closeAccountWindow: (id: string) =>
     req<{ ok: boolean; account_id: string; reason?: string }>(
       `/accounts/${id}/close-window`, { method: "POST" }),
+  // rev33: 当前访问者是否「运行程序的这台机器」(决定是否显示「打开」按钮)
+  whoami: () => req<{ local: boolean; client: string }>("/system/whoami"),
   getLocalWindows: () =>
     req<{ items: { account_id: string; name: string; opened_sec: number; idle_sec: number; temp_profile: boolean; injected: boolean }[] }>(
       "/local-windows"),
