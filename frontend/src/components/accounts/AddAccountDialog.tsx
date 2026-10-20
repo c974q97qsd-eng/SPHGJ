@@ -272,7 +272,7 @@ export function AddAccountDialog({ open, onOpenChange, onDone, reloginAccountId,
                   <img
                     src={qrImage}
                     alt="扫码登录"
-                    className="w-[180px] h-[180px] rounded-md bg-white object-contain"
+                    className="max-h-[190px] max-w-[190px] w-auto h-auto rounded-md bg-white"
                   />
                   <p className="mt-1.5 text-[11px] leading-tight text-muted-foreground">
                     微信扫码后自动抓取账号信息
