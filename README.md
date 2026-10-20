@@ -33,18 +33,40 @@
 - `post/post_update_visible` 隐藏(设为仅自己可见)/ 取消隐藏
 
 ## 安装运行
-```bash
-pip install -r requirements.txt
-playwright install chromium
-python main.py        # 桌面窗口(Windows 用 WebView2 原生窗口)
-```
-Windows 用户直接双击 `setup.bat`(一次性初始化:装 Python 依赖 + Playwright Chromium + 检测/安装 WebView2 Runtime)再双击 `start.bat` 运行。
 
-> **前端已预构建**(`frontend/dist/` 随仓库),`setup.bat` 不再需要 Node.js/npm。仅当修改前端时才需 Node.js 18+:在 `frontend/` 下执行 `npm install && npm run build` 重新构建。
+### 三种装法(按场景选)
 
-> **仅以桌面窗口运行,不回退系统浏览器**:窗口创建失败时弹原生消息框提示安装 WebView2 Runtime,绝不降级为浏览器打开。无图形服务器开发调试可设环境变量 `PINLUN_FORCE_BROWSER=1` 临时回退。
+| 场景 | 做法 |
+|---|---|
+| Windows 双击即用(推荐) | 双击 `setup.bat` 初始化(装依赖 + Playwright Chromium + 检测 WebView2),之后双击 `start.bat` 运行 |
+| 全新机器 / 无网络 | 用 `配置环境安装\一键安装.bat`(便携 Python 3.14 + 离线 wheels + Chromium 1223,详见该目录 `安装说明.md`;**此目录 1.1G,不入 git,需单独拷**) |
+| 已有 Python 环境 | `pip install -r requirements-lock.txt` → `playwright install chromium` → `python main.py` |
+
+> **依赖清单有两个**:`requirements.txt` 是范围写法(宽松,能用但有版本漂移风险),`requirements-lock.txt` 是与实测环境一致的**精确版本**(推荐)。前端依赖由 `frontend/package.json` + `frontend/package-lock.json` 锁定。
+
+> **Playwright 浏览器版本必须是 chromium revision 1223**(对应 playwright 1.60)。`playwright install chromium` 会自己装对版本;从别的机器直接拷 `ms-playwright` 时拷错 revision 会报 `Executable doesn't exist`。
+
+> **前置组件**:.NET 6/8/9 任一(pywebview 经 pythonnet 调用) + WebView2 Runtime(Win10 21H2+ / Win11 自带)。缺失时桌面窗口打不开,软件会弹原生提示,不会降级用系统浏览器。
+
+> **前端已预构建**(`frontend/dist/` 随仓库),日常不需要 Node.js。仅改前端时用 Node 18+:在 `frontend/` 下 `npm install && npm run build`。
+
+> **仅以桌面窗口运行**:窗口创建失败时弹原生消息框提示安装 WebView2 Runtime,绝不降级为浏览器打开。无图形服务器开发调试可设环境变量 `PINLUN_FORCE_BROWSER=1` 临时回退。
 
 开发模式:前端 `npm run dev`(5173),后端 `python -m uvicorn backend.server:app --port 8000`。
+
+### 换机 / 换主机部署清单
+
+代码走 git(`git clone`),但**下面这些不在 git 里,必须单独拷**:
+
+| 目录 / 文件 | 为什么不在 git | 说明 |
+|---|---|---|
+| `data\`(含 `sphgj.db`) | 生产数据、体积大 | 整个目录拷;**程序停机后再拷**,或在跑的时候连 `-wal` / `-shm` 一起拷 |
+| `config.json` | 含账号卡片与登录态 | 从旧机拷(仓库里只有 `config.example.json`) |
+| `profiles\` | 视频号 cookie | 不拷就得重扫每个号的码 |
+| `配置环境安装\`(1.1G) | 体积大、可再生 | 离线环境包;无网机器必需 |
+| `frontend\node_modules` | 可再生(202M) | 不拷就 `npm install` 重装 |
+
+老库升到当前版本前,先跑 `python tools\upgrade_check.py` 体检(见该脚本说明):它会指出哪些账号卡片缺视频号映射 —— 作品归属是**一次性迁移**,首次启动没映射上就不会再自动纠正。
 
 ## 添加账号(扫码登录,软件自动抓取字段)
 1. 「账号管理」->「添加账号」-> 弹出二维码。
