@@ -48,11 +48,13 @@ DEFAULT_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 
 
-async def launch_stealth(playwright, profile_dir, headless=True, window_size=None):
+async def launch_stealth(playwright, profile_dir, headless=True, window_size=None,
+                         window_position=None):
     """启动持久化 Chromium context,带反检测配置。
 
     登录会话与账号 worker 共用,保证视频号页面看到的环境一致。
     window_size=(w,h):设 headed 浏览器窗口大小(加 --window-size args + viewport);None 用默认 1280x800。
+    window_position=(x,y):headed 窗口左上角坐标(rev31,本机窗口用,避免盖住别的窗口)。
     """
     args = list(STEALTH_ARGS)
     # rev14: headless 模式下禁用 GPU 进程与软件光栅化(后端 context 不渲染可见画面,
@@ -62,6 +64,13 @@ async def launch_stealth(playwright, profile_dir, headless=True, window_size=Non
             "--disable-gpu",
             "--disable-software-rasterizer",
         ])
+    else:
+        # headed 时关掉「Chrome 正受自动测试软件控制」的提示条,本机窗口更像正常浏览器
+        args.append("--disable-blink-features=AutomationControlled")
+        args.append("--no-first-run")
+        args.append("--no-default-browser-check")
+    if window_position:
+        args.append(f"--window-position={window_position[0]},{window_position[1]}")
     if window_size:
         args.append(f"--window-size={window_size[0]},{window_size[1]}")
         viewport = {"width": window_size[0], "height": window_size[1]}

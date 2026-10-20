@@ -37,6 +37,7 @@ from .post_fetcher import PostFetcher
 from .publish_queue import PublishQueue
 from .remote_view import RemoteRegistry
 from .browser import reap_profile_orphans
+from .local_window import local_windows, sweep_stale_view_profiles
 from . import restart as restart_mod
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
@@ -157,6 +158,11 @@ async def _capture_loop():
     asyncio.create_task(_auto_restore_loop())
     # rev25: 自动发作品调度器(等自动恢复账号跑完再开始,见 PublishQueue._loop 的 20s 延迟)
     publish_queue.start()
+    # rev31: 清掉上次进程遗留的本机窗口临时 profile(_view_*)
+    try:
+        sweep_stale_view_profiles()
+    except Exception as e:
+        logger.debug(f"[启动] 清理遗留窗口 profile 失败: {e}")
     # 打印运行版本(懒导入 main.VERSION,避免与 main 的循环依赖)
     try:
         from main import VERSION
@@ -920,6 +926,43 @@ async def remote_close(account: str = Query("")):
         raise HTTPException(400, "缺少 account 参数")
     await remote_registry.close(account, "manual")
     return {"ok": True}
+
+
+# ===================== 本机可见浏览器窗口(rev31) =====================
+@app.post("/api/accounts/{account_id}/open-window")
+async def account_open_window(account_id: str):
+    """在运行程序的本机拉起该账号的独立浏览器窗口。
+
+    与后台抓取/直播大屏完全隔离:该账号 worker 活着时,从它的 context 只读导出
+    登录态(storage_state),再用临时 profile 另起一个窗口;worker 没跑时 profile
+    本来就空着,直接用。两种情形都不会占用后台那份 profile。
+    窗口 5 分钟无操作自动关闭。
+    """
+    acc = next((a for a in config.get("accounts", []) if a["id"] == account_id), None)
+    if not acc:
+        raise HTTPException(404, "账号不存在")
+    pw = await manager._ensure_playwright()
+    r = await local_windows.open(manager, acc, pw)
+    if not r.get("ok"):
+        raise HTTPException(400, r.get("error") or "打开失败")
+    await hub.emit("local_windows", {"items": local_windows.snapshot()})
+    return r
+
+
+@app.post("/api/accounts/{account_id}/close-window")
+async def account_close_window(account_id: str):
+    """关闭该账号的本机窗口(超时也会自动关)。"""
+    r = await local_windows.close(account_id, "手动关闭")
+    await hub.emit("local_windows", {"items": local_windows.snapshot()})
+    if not r.get("ok"):
+        raise HTTPException(404, r.get("error") or "没有打开的窗口")
+    return r
+
+
+@app.get("/api/local-windows")
+async def local_window_list():
+    """当前打开的本机窗口(用于界面显示)。"""
+    return {"items": local_windows.snapshot()}
 
 
 @app.post("/api/system/reap-orphans")

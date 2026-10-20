@@ -334,6 +334,16 @@ export const api = {
     req<{ ok: boolean; config: AppConfig }>("/config", { method: "PATCH", body: JSON.stringify(body) }),
 
   getAccounts: () => req<EngineStatus>("/accounts"),
+  // rev31: 本机可见浏览器窗口(独立 profile,不影响后台抓取/直播)
+  openAccountWindow: (id: string) =>
+    req<{ ok: boolean; account_id: string; name: string; temp_profile: boolean; injected: boolean; already?: boolean; hint?: string }>(
+      `/accounts/${id}/open-window`, { method: "POST" }),
+  closeAccountWindow: (id: string) =>
+    req<{ ok: boolean; account_id: string; reason?: string }>(
+      `/accounts/${id}/close-window`, { method: "POST" }),
+  getLocalWindows: () =>
+    req<{ items: { account_id: string; name: string; opened_sec: number; idle_sec: number; temp_profile: boolean; injected: boolean }[] }>(
+      "/local-windows"),
   patchAccount: (id: string, body: Record<string, unknown>) =>
     req<{ ok: boolean; accounts: AccountStatus[] }>(`/accounts/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
   setAutoComment: (id: string, enabled: boolean, content: string) =>
