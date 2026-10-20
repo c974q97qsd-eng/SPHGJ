@@ -9,6 +9,23 @@ set "PORTABLE=%~dp0配置环境安装\Python314\python.exe"
 set "PYEXE="
 set "PYTHONIOENCODING=gbk"
 
+REM 运行主机(母本)标记:.no_git_update 存在就不碰 git 直接退出。
+REM 母本的代码由开发机投递同步,它的 .git 是个没 remote 的空壳;
+REM 在这台机器上跑更新会去装 Git、改 .git/config,只会制造混乱。
+if exist "%~dp0.no_git_update" (
+    echo ==========================================
+    echo   本机是「运行主机」,不走 git 更新
+    echo ==========================================
+    echo   这台机器的代码由开发机投递同步,不需要也不应该跑一键更新。
+    echo   要更新到最新代码,请到开发机上投递,然后在界面上点重启。
+    echo.
+    echo   如果这是一台普通用户机器、只是误留了这个标记文件,
+    echo   删掉项目目录下的 .no_git_update 再双击本脚本即可。
+    echo.
+    pause
+    exit /b 0
+)
+
 echo ==========================================
 echo   SPHGJ 一键更新到 git 最新版
 echo ==========================================

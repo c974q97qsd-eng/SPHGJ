@@ -46,6 +46,8 @@
 
 > 三个脚本的关系:`一键安装环境.bat` 只解决「第一次跑起来」,可以重复跑(已装好的会跳过);`一键更新.bat` 只解决「升到最新版」,不改本地数据;`启动-SPHGJ.bat` 是日常启动入口,会自己判断用便携版 Python 还是系统 `python`,所以干净克隆的目录也能直接双击启动。
 
+> **谁该用一键更新**:只有**从 git 克隆出来**的机器才用。程序实际跑的那台「运行主机」不要用——它的代码是由开发机投递同步的,`.git` 目录并不跟踪实际文件,在那里跑更新会去装 Git、改 `.git/config`,只会把状态搞乱。这类机器在项目根目录放一个空的 `.no_git_update`,`一键更新.bat` 见到它就只打印说明然后退出(该文件已在 `.gitignore` 里,不会传到别人机器上)。
+
 > **依赖清单有两个**:`requirements.txt` 是范围写法(宽松,能用但有版本漂移风险),`requirements-lock.txt` 是与实测环境一致的**精确版本**(推荐)。前端依赖由 `frontend/package.json` + `frontend/package-lock.json` 锁定。
 
 > **Playwright 浏览器版本必须是 chromium revision 1223**(对应 playwright 1.60)。`playwright install chromium` 会自己装对版本;从别的机器直接拷 `ms-playwright` 时拷错 revision 会报 `Executable doesn't exist`。
