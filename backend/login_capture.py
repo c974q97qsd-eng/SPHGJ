@@ -134,6 +134,8 @@ class LoginSession:
         self._picked_name = ""
         # auth_finder_list 最近一次成功的结果(含 finder_id),page 死亡时反查仍可用
         self._finder_list_cache = []
+        # rev29: 扫码成功后导出的登录态(cookies),作为 profile 磁盘落盘失败的双保险
+        self._storage_state = None
 
     def _finished(self, status):
         """终态通知(防重复):auto 模式下触发 manager 推进下一个 relogin。"""
@@ -235,7 +237,8 @@ class LoginSession:
         # (扫码窗口被手动关掉时最常见),孤儿会一直锁着 profile。
         if self.profile_dir:
             try:
-                reap_profile_orphans(self.profile_dir, log_tag=f"[login:{self.sid}] 收尾")
+                reap_profile_orphans(self.profile_dir, log_tag=f"[login:{self.sid}] 收尾",
+                                     min_age_sec=10)
             except Exception as e:
                 logger.debug(f"[login:{self.sid}] 收尾清理孤儿失败: {e}")
         if not keep_profile and self.profile_dir and not self._finalized:
@@ -519,14 +522,33 @@ class LoginSession:
             except Exception as e:
                 logger.debug(f"[login:{self.sid}] 选择器 {sel} 失败: {e}")
                 continue
-        # 4. fallback:整页截图
+        # 4. fallback:整页截图 -> 只裁二维码区域(rev29)
+        #    原来直接把整页推给前端:登录页下方「用微信扫描上方二维码…」+ 深色背景
+        #    一起进了弹窗(又大又难看);账号选择页 fallback 更是完全不相干的图。
+        #    现在先在页面里找方形二维码元素,裁得到才推,裁不到就不推本轮。
         try:
-            png = await self.page.screenshot(timeout=5000)
-            if len(png) > 1000:
-                logger.info(f"[login:{self.sid}] 二维码选择器未命中,fallback 整页截图 bytes={len(png)}")
-                return "data:image/png;base64," + base64.b64encode(png).decode()
+            box = await self.page.evaluate("""() => {
+                const cands = [];
+                const els = document.querySelectorAll('img, canvas, .qrcode, [class*=qrcode], [class*=qr-code]');
+                els.forEach(el => {
+                    const r = el.getBoundingClientRect();
+                    if (r.width >= 120 && r.height >= 120 && Math.abs(r.width - r.height) <= 40) {
+                        cands.push({x: r.x, y: r.y, width: r.width, height: r.height, area: r.width * r.height});
+                    }
+                });
+                if (!cands.length) return null;
+                cands.sort((a, b) => b.area - a.area);
+                const c = cands[0];
+                return {x: Math.round(c.x), y: Math.round(c.y), width: Math.round(c.width), height: Math.round(c.height)};
+            }""")
+            if box and box.get("width", 0) >= 120:
+                png = await self.page.screenshot(clip=box, timeout=5000)
+                if len(png) > 1000:
+                    logger.info(f"[login:{self.sid}] 整页 fallback 裁剪出二维码 {box} bytes={len(png)}")
+                    return "data:image/png;base64," + base64.b64encode(png).decode()
         except Exception as e:
-            logger.warning(f"[login:{self.sid}] 整页截图失败: {e}")
+            logger.debug(f"[login:{self.sid}] fallback 裁剪二维码失败: {e}")
+        logger.info(f"[login:{self.sid}] 本轮未定位到二维码,不推送图片")
         return None
 
     # ---------- 等扫码 ----------
@@ -935,8 +957,22 @@ class LoginSession:
                 return
             self.status = "captured"
             logger.info(f"[login:{self.sid}] 抓取完成 aid/finder_id 齐全 name={self.captured['name']}")
+            # rev29: 关浏览器前先把登录态导出来存住。
+            # Chromium 的 cookie 是延迟批量写盘的(不是每次变更立刻落盘),扫码成功后
+            # 立刻 close 会把写盘队列丢掉 -> profile 里的 Cookies 一条都不多,下次启动
+            # 又是登录页。这就是免税仓「扫码 5 次全成功却始终登录不上」的真因。
+            # 导出 storage_state 后:①写进 config 账号,启动时 add_cookies 注入(双保险);
+            # ②再等 2.5s 给 Chromium 自己 flush 到 profile 的时间,两条路总有一条生效。
+            try:
+                if self.context:
+                    self._storage_state = await self.context.storage_state()
+                    n = len((self._storage_state or {}).get("cookies") or [])
+                    logger.info(f"[login:{self.sid}] 已导出登录态 cookies={n} 条")
+            except Exception as e:
+                logger.warning(f"[login:{self.sid}] 导出登录态失败(仅影响双保险): {e}")
             await self.emit("login_status", {"sid": self.sid, "status": "captured",
                                              "captured": dict(self.captured)})
+            await asyncio.sleep(2.5)
             # 字段已抓全,立即关 headed context 释放进程(finalize 只做 profile 改名+写 config,
             # 不再用 context);手动模式下用户编辑名字/确认期间不再白开 headed 进程。
             # auto 模式 finalize_with_id 内的 _close 会因 context=None 幂等跳过。
@@ -1143,6 +1179,9 @@ class LoginSession:
             acc["name"] = (name or self.captured["name"] or acc.get("name") or acc["id"]).strip()
             acc["_wx_name"] = self.captured.get("wx_name") or acc.get("_wx_name", "")
             acc["login_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+            if self._storage_state and (self._storage_state.get("cookies") or []):
+                # rev29: 登录态快照随 config 保存,账号启动时注入(防 profile 落盘失败)
+                acc["storage_state"] = self._storage_state
             self._save_config()
             await self.emit("accounts_updated", {"reason": "login_finalize", "sid": self.sid})
             self._finalized = True

@@ -6,6 +6,7 @@ HeadlessChrome UA 等),检测到就不渲染二维码或拦截接口。此处统
 让 headless Chromium 尽量接近真实浏览器。仍抓不到时用「在新窗口扫码」(headed)兜底。
 """
 import os
+import time
 import logging
 logger = logging.getLogger("sphgj")
 
@@ -74,7 +75,7 @@ async def launch_stealth(playwright, profile_dir, headless=True, window_size=Non
     return ctx
 
 
-def reap_profile_orphans(profile_dir, log_tag=""):
+def reap_profile_orphans(profile_dir, log_tag="", min_age_sec=0):
     """按 --user-data-dir 精确匹配, kill 该 profile 的所有 Chromium 进程(rev28)。
 
     解决的问题:context.close() 不抛异常,但浏览器进程其实还活着(扫码窗口被手动
@@ -98,8 +99,15 @@ def reap_profile_orphans(profile_dir, log_tag=""):
         return []
     abs_dir = os.path.abspath(profile_dir)
     killed = []
-    for p in psutil.process_iter(["pid", "cmdline"]):
+    # rev29: min_age_sec 保护 —— 刚 launch 出来正在登录/扫码的进程绝不能被当孤儿杀掉。
+    # 免税仓事故：扫码成功后自动 start_account 拉起浏览器，紧接着登录会话收尾的
+    # reap 把它杀了 -> "Target page, context or browser has been closed"。
+    now = time.time()
+    for p in psutil.process_iter(["pid", "cmdline", "create_time"]):
         try:
+            age = now - (p.info.get("create_time") or 0)
+            if min_age_sec > 0 and age < min_age_sec:
+                continue
             for arg in (p.info.get("cmdline") or []):
                 if arg.startswith("--user-data-dir="):
                     if os.path.abspath(arg.split("=", 1)[1]) == abs_dir:
@@ -135,4 +143,4 @@ async def close_context_safely(ctx, profile_dir=None, log_tag=""):
         logger.debug(f"[browser] {log_tag} context.close 异常(将兜底 kill): {e}")
     if closed_ok or not profile_dir:
         return
-    reap_profile_orphans(profile_dir, log_tag=f"{log_tag} 兜底")
+    reap_profile_orphans(profile_dir, log_tag=f"{log_tag} 兜底", min_age_sec=4)

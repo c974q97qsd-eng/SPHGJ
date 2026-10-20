@@ -268,10 +268,14 @@ export function AddAccountDialog({ open, onOpenChange, onDone, reloginAccountId,
             <>
               {/* 网页二维码模式:渲染二维码图片 */}
               {mode === "web" && qrImage ? (
-                <div className="flex flex-col items-center gap-2">
-                  <img src={qrImage} alt="扫码登录" className="rounded-lg border shadow-sm max-w-[220px]" />
-                  <p className="text-xs text-muted-foreground text-center max-w-[280px]">
-                    用微信扫描上方二维码,确认后自动抓取账号信息
+                <div className="flex flex-col items-center">
+                  <img
+                    src={qrImage}
+                    alt="扫码登录"
+                    className="w-[180px] h-[180px] rounded-md bg-white object-contain"
+                  />
+                  <p className="mt-1.5 text-[11px] leading-tight text-muted-foreground">
+                    微信扫码后自动抓取账号信息
                   </p>
                 </div>
               ) : (

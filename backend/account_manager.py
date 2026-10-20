@@ -145,6 +145,16 @@ class AccountWorker:
         if self.context is not None:
             return
         self.context = await launch_stealth(self._pw, self.account["profile_dir"], headless=self._headless)
+        # rev29: 注入扫码时导出的登录态(双保险)。profile 磁盘 cookie 有时写入不成功
+        # (Chromium 延迟写盘 + 进程被中途关闭),只靠磁盘会反复「扫码成功但登录不上」。
+        try:
+            _ss = (self.account.get("storage_state") or {})
+            _ck = _ss.get("cookies") or []
+            if _ck:
+                await self.context.add_cookies(_ck)
+                logger.info(f"[{self.account['id']}] 已注入登录态 cookies={len(_ck)} 条")
+        except Exception as e:
+            logger.warning(f"[{self.account['id']}] 注入登录态失败(回退用 profile 磁盘): {e}")
         self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
         await self.page.goto(COMMENT_URL, wait_until="domcontentloaded")
         await self.page.wait_for_timeout(3000)
@@ -971,7 +981,8 @@ class AccountManager:
         if not self._profile_busy(account["id"]):
             try:
                 reap_profile_orphans(account.get("profile_dir"),
-                                     log_tag=f"[{account['id']}] 启动前")
+                                     log_tag=f"[{account['id']}] 启动前",
+                                     min_age_sec=5)
             except Exception as e:
                 logger.warning(f"[{account['id']}] 启动前清理孤儿进程失败: {e}")
         worker = AccountWorker(account, self.storage, self.config, self._emit)
@@ -1031,7 +1042,8 @@ class AccountManager:
             await self.stop_account(account_id)
         # rev28: 停掉 worker 后立刻清孤儿,给扫码一个真正干净的 profile
         try:
-            reap_profile_orphans(acc.get("profile_dir"), log_tag=f"[{account_id}] 扫码前")
+            reap_profile_orphans(acc.get("profile_dir"), log_tag=f"[{account_id}] 扫码前",
+                                 min_age_sec=5)
         except Exception as e:
             logger.warning(f"[{account_id}] 扫码前清理孤儿进程失败: {e}")
         if on_finished is None:
@@ -1088,6 +1100,9 @@ class AccountManager:
         elif self._relogin_active_sid:
             self.login_sessions.pop(self._relogin_active_sid, None)
         if status == "finalized":
+            # rev29: 等登录会话把 profile 彻底释放再启动。以前立刻 start,和会话收尾的
+            # 孤儿清理并发,刚 launch 的浏览器被 reap 当孤儿杀掉(Target closed)。
+            await asyncio.sleep(1.5)
             try:
                 await self.start_account(account_id)
             except Exception as e:
