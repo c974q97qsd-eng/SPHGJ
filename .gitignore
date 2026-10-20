@@ -5,7 +5,7 @@ __pycache__/
 *.egg-info/
 .pyinstaller/
 
-# 前端构建产物 / 依赖
+# 前端依赖(可再生)
 frontend/node_modules/
 frontend/*.tsbuildinfo
 frontend/vite.config.d.ts
@@ -37,8 +37,10 @@ config.*.json
 .env
 .env.*
 
-# 前端构建产物(不应纳入版本库)
-frontend/dist/
+# 注意: frontend/dist/ 已改为【纳入版本库】(rev34) ——
+# 它只有 ~700KB,但如果不入库,用户 git pull 拿不到新前端,
+# 「一键更新」就只更新后端,表现为「界面还是旧的」。
+# 提交前端改动时请一并提交 frontend/dist。
 
 # 杂项垃圾 / 临时文件
 nul

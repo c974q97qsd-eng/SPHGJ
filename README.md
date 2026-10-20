@@ -38,9 +38,13 @@
 
 | 场景 | 做法 |
 |---|---|
-| Windows 双击即用(推荐) | 双击 `setup.bat` 初始化(装依赖 + Playwright Chromium + 检测 WebView2),之后双击 `start.bat` 运行 |
+| **git 克隆后第一次跑(推荐)** | 双击 **`一键安装环境.bat`** — 自动定位 Python(没有就调 winget 装)→ 装 `requirements-lock.txt` → 装 Chromium → 检测 WebView2 / .NET / 前端文件,跑完直接问你要不要启动 |
+| **以后升级到最新版** | 双击 **`一键更新.bat`** — `git pull` 到最新 → 依赖清单变了才重装 → 提示重启。`data\` / `config.json` / `profiles\` **不会被覆盖** |
+| 老流程(setup + start) | 双击 `setup.bat` 初始化(装依赖 + Playwright Chromium + 检测 WebView2),之后双击 `start.bat` 运行 |
 | 全新机器 / 无网络 | 用 `配置环境安装\一键安装.bat`(便携 Python 3.14 + 离线 wheels + Chromium 1223,详见该目录 `安装说明.md`;**此目录 1.1G,不入 git,需单独拷**) |
 | 已有 Python 环境 | `pip install -r requirements-lock.txt` → `playwright install chromium` → `python main.py` |
+
+> 三个脚本的关系:`一键安装环境.bat` 只解决「第一次跑起来」,可以重复跑(已装好的会跳过);`一键更新.bat` 只解决「升到最新版」,不改本地数据;`启动-SPHGJ.bat` 是日常启动入口,会自己判断用便携版 Python 还是系统 `python`,所以干净克隆的目录也能直接双击启动。
 
 > **依赖清单有两个**:`requirements.txt` 是范围写法(宽松,能用但有版本漂移风险),`requirements-lock.txt` 是与实测环境一致的**精确版本**(推荐)。前端依赖由 `frontend/package.json` + `frontend/package-lock.json` 锁定。
 
@@ -56,7 +60,7 @@
 
 ### 换机 / 换主机部署清单
 
-代码走 git(`git clone`),但**下面这些不在 git 里,必须单独拷**:
+代码走 git(`git clone` + 双击 `一键安装环境.bat` 补依赖),但**下面这些不在 git 里,必须单独拷**:
 
 | 目录 / 文件 | 为什么不在 git | 说明 |
 |---|---|---|
