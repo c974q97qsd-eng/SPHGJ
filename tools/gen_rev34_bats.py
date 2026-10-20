@@ -296,6 +296,9 @@ if errorlevel 1 (
     echo          处理办法(二选一):
     echo            A. 想保留本地改动: 先手工合并,再执行 git pull
     echo            B. 放弃本地改动: 执行 git stash 后重新双击本脚本
+    echo            C. 若提示 frontend\dist 里的文件将被覆盖
+    echo               旧版把前端产物当临时文件、没入库,直接删掉
+    echo               frontend\dist 整个目录再重跑本脚本,git 会自动还原
     goto :fail
 )
 for /f %%i in ('git rev-parse --short HEAD 2^>nul') do set "NEW=%%i"
