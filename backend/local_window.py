@@ -114,8 +114,15 @@ class LocalWindowManager:
                 temp_profile = f"./profiles/_view_{aid}"
                 _reset_dir(temp_profile)
         if temp_profile is None:
-            # 情形 2:worker 没跑 -> profile 空着,直接用
+            # 情形 2:worker 没跑 -> profile 空着,直接用。
+            # rev37: 但 profile 磁盘 cookie 不可靠(rev29 实证延迟写盘),所以再拿
+            # config 里存着的扫码登录态兜底,和 remote_view 保持一致。
             temp_profile = None
+            _ss = account.get("storage_state") or {}
+            if _ss.get("cookies"):
+                state = _ss
+                logger.info(f"[local-window] {aid} worker 未运行,改用 config 保存的"
+                            f"登录态 cookies={len(_ss.get('cookies') or [])} 条")
 
         profile_dir = temp_profile or account["profile_dir"]
         try:

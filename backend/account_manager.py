@@ -140,6 +140,72 @@ class AccountWorker:
 
     # ======================== 按需浏览器生命周期(省内存) ========================
 
+    # ============== 登录态真伪校验(rev37) ==============
+
+    async def _probe_auth(self):
+        """在页面内调 auth_data 硬验登录态,返回 (state, finder_id)。
+
+        state: "ok" 真登录 / "no" 明确未登录 / "err" 拿不到结论(接口异常)。
+        为什么必须调接口:视频号是异步鉴权,sessionid 服务端失效后 SPA 会先把
+        /platform/interaction/comment 这个 URL 留住(先渲染壳,再请求鉴权),
+        十几秒后才 location 跳 login.html。只看 URL 会把空壳判成已登录 ——
+        账号卡片一直亮、点抓取全失败,用户根本看不出问题在哪(2026-10-21
+        8 号实证:日志说已登录,18 秒后远程窗口打开是 login.html)。
+        """
+        try:
+            aid = await self.page.evaluate(
+                "() => localStorage.getItem('__ml::aid')"
+                " || localStorage.getItem('__rx::aid') || ''")
+        except Exception:
+            aid = ""
+        aid = (aid or "").strip().strip('"')
+        try:
+            txt = await self.page.evaluate("""async (aid) => {
+                const u = `https://channels.weixin.qq.com/cgi-bin/mmfinderassistant-bin/auth/auth_data?_aid=${aid}&_pageUrl=${encodeURIComponent('https://channels.weixin.qq.com/micro/interaction/comment')}`;
+                const r = await fetch(u, {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}', credentials:'include'});
+                return await r.text();
+            }""", aid)
+        except Exception as e:
+            logger.debug(f"[{self.account['id']}] auth_data 探活异常: {e}")
+            return ("err", "")
+        try:
+            data = json.loads(txt or "{}")
+        except Exception:
+            return ("err", "")
+        d = data.get("data")
+        if not isinstance(d, dict):
+            return ("err", "")
+        fid = ((d.get("finderUser") or {}).get("finderUsername") or "").strip()
+        if fid:
+            return ("ok", fid)
+        return ("no", "")
+
+    async def _verify_login(self, wait_sec=10.0):
+        """判定当前是否真的登录(rev37)。先硬验接口,拿不到结论再等 URL 跳转。"""
+        deadline = time.time() + wait_sec
+        while True:
+            state, fid = await self._probe_auth()
+            if state == "ok":
+                # auth_data 给的 finder_id 比 localStorage 残留更权威,先记下
+                if fid:
+                    self.account["_log_finder_id"] = fid
+                return True
+            if state == "no":
+                return False
+            # 注意:只把「真在 login 页」当未登录。不能要求 URL 里必须有
+            # interaction/comment —— 实测有效登录时深链也会被前端弹回
+            # /platform(2 秒在 comment、4 秒回首页),那种判法会把好账号全判成
+            # 未登录,进而触发无谓的重登。
+            url = self.page.url or ""
+            if "login" in url:
+                return False
+            if time.time() >= deadline:
+                # 接口始终给不出结论 -> 回退 URL 判据(只看有没有被弹到登录页)
+                logger.warning(f"[{self.account['id']}] auth_data 无有效响应,"
+                               f"回退按 URL 判定登录态")
+                return "login" not in url
+            await self.page.wait_for_timeout(2000)
+
     async def _open_context(self):
         """懒加载开 Chromium:建 context+评论页,登录校验,建/重绑 API 客户端。幂等。"""
         if self.context is not None:
@@ -157,8 +223,10 @@ class AccountWorker:
             logger.warning(f"[{self.account['id']}] 注入登录态失败(回退用 profile 磁盘): {e}")
         self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
         await self.page.goto(COMMENT_URL, wait_until="domcontentloaded")
-        await self.page.wait_for_timeout(3000)
-        self.logged_in = "interaction/comment" in (self.page.url or "")
+        await self.page.wait_for_timeout(2500)
+        # rev37: 不再只看 URL —— sessionid 失效时 SPA 会先把 comment 这个 URL
+        # 留住十几秒才跳 login.html,固定 3 秒查 URL 会把空壳判成已登录。
+        self.logged_in = await self._verify_login()
         if self.logged_in:
             logger.info(f"[{self.account['id']}] 已登录")
         else:

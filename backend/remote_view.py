@@ -26,6 +26,7 @@ import os
 import time
 
 from .browser import launch_stealth, close_context_safely
+from .local_window import _local_storage_script
 
 logger = logging.getLogger("sphgj")
 
@@ -88,12 +89,51 @@ class RemoteSession:
         self._was_running = self.account_id in (getattr(self.manager, "workers", {}) or {})
         self._was_human_stopped = self.account_id in getattr(
             self.manager, "human_stopped", set())
+
+        # rev37: 必须在 park 之前把登录态导出来 —— park 会把 worker 的 context
+        # 一起关掉,之后就再也拿不到了。而 profile 磁盘的 cookie 是不可靠的
+        # (Chromium 延迟写盘,进程被中途关掉就是 0 条,见 rev29),只靠磁盘会出现
+        # 「worker 明明登录着,远程窗口一打开却是扫码页」(2026-10-21 用户实证)。
+        state = None
+        try:
+            _w = (getattr(self.manager, "workers", {}) or {}).get(self.account_id)
+            _ctx = getattr(_w, "context", None) if _w else None
+            if _ctx is not None:
+                state = await _ctx.storage_state()
+                logger.info(f"[remote] {self.account_id} 从运行中的 context 导出"
+                            f"登录态 cookies={len(state.get('cookies') or [])} 条")
+        except Exception as e:
+            logger.warning(f"[remote] {self.account_id} 导出登录态失败: {e}")
+            state = None
+        if not (state or {}).get("cookies"):
+            # worker 没跑 / 导出失败 -> 退回 config 里存的扫码登录态
+            _ss = acc.get("storage_state") or {}
+            if _ss.get("cookies"):
+                state = _ss
+                logger.info(f"[remote] {self.account_id} 使用 config 内保存的登录态 "
+                            f"cookies={len(_ss.get('cookies') or [])} 条")
+
         await _park_worker(self.manager, self.account_id)
 
         pw = await self.manager._ensure_playwright()
         self.ctx = await launch_stealth(pw, acc["profile_dir"], headless=True)
         pages = list(self.ctx.pages)
         self.page = pages[0] if pages else await self.ctx.new_page()
+        # rev37: 注入登录态(cookie + localStorage)。视频号的身份 aid 存在
+        # localStorage,只注 cookie 不够 —— 缺了它页面照样把你当没登录。
+        if state:
+            try:
+                _ck = state.get("cookies") or []
+                if _ck:
+                    await self.ctx.add_cookies(_ck)
+                _origins = state.get("origins") or []
+                if _origins:
+                    await self.ctx.add_init_script(_local_storage_script(_origins))
+                logger.info(f"[remote] {self.account_id} 已注入登录态 "
+                            f"cookies={len(_ck)} origins={len(_origins)}")
+            except Exception as e:
+                logger.warning(f"[remote] {self.account_id} 注入登录态失败: {e}")
+
         self.page.set_default_timeout(20000)
         try:
             await self.page.goto(url or DEFAULT_URL, wait_until="domcontentloaded",
