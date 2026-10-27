@@ -348,6 +348,75 @@ async def t_client():
     ck(m == {"1": "E1", "2": "E2"}, "map_item_ids 建明文->加密映射")
     ck(len(t.calls) == 2, "找到全部后不再多翻页")
 
+    # 5.12b 回归：item/list 只有 cursor 字段也要能翻页（rev56d 踩过的真 bug）
+    c, t = _client([
+        {"extra": {}, "item_info_list": [{"item_id": "E1", "item_id_plain": "1"}],
+         "cursor": 1725392030000, "has_more": True},
+        {"extra": {}, "item_info_list": [{"item_id": "E2", "item_id_plain": "2"}],
+         "cursor": 1722244517000, "has_more": False},
+    ])
+    m = await c.map_item_ids(["1", "2"])
+    ck(m == {"1": "E1", "2": "E2"}, "只有 cursor 字段时也能翻页（坑 4 回归）")
+    ck(len(t.calls) == 2, "cursor 翻了两页，实际 %d" % len(t.calls))
+    ck("cursor=1725392030000" in t.calls[1]["url"],
+       "第二页把响应 cursor 原样回传")
+
+    # 5.12c item_map_of 直接测：字段名 + 空值归一
+    mp, nxt, more = api.item_map_of({"item_info_list": [
+        {"item_id": "E1", "item_id_plain": "1"}], "cursor": "1699999999000",
+        "has_more": True})
+    ck(mp == {"1": "E1"} and nxt == "1699999999000" and more is True,
+       "item_map_of 读 cursor")
+    mp, nxt, more = api.item_map_of({"item_info_list": [], "max_cursor": 123})
+    ck(nxt == "123", "没有 cursor 时回落到 max_cursor")
+    mp, nxt, more = api.item_map_of({"item_info_list": [], "cursor": 0})
+    ck(nxt == "", "cursor=0 归一成空串（等价于到头）")
+    mp, nxt, more = api.item_map_of({"item_info_list": [], "cursor": ""})
+    ck(nxt == "", "cursor 空串保持空串")
+    mp, nxt, more = api.item_map_of(None)
+    ck(mp == {} and nxt == "" and more is False, "响应不是 dict -> 空结果不抛异常")
+
+    # 5.12d 复现真机数字：每页 19 条、共 91 条，必须全部覆盖
+    pages = []
+    all_ids = [str(1000 + i) for i in range(91)]
+    for k in range(0, 91, 19):
+        chunk = all_ids[k:k + 19]
+        last = (k + 19) >= 91
+        pages.append({"extra": {},
+                      "item_info_list": [{"item_id": "E" + x, "item_id_plain": x}
+                                         for x in chunk],
+                      "cursor": "" if last else str(1700000000000 + k),
+                      "has_more": not last})
+    c, t = _client(pages)
+    m = await c.map_item_ids(all_ids, max_pages=30)
+    ck(len(m) == 91, "91 条作品全覆盖（每页 19 条，翻 5 页），实际 %d" % len(m))
+    ck(len(t.calls) == 5, "共翻 5 页，实际 %d" % len(t.calls))
+
+    # 5.12e cursor 不前进必须停，不能死循环
+    c, t = _client([{"extra": {},
+                     "item_info_list": [{"item_id": "E9", "item_id_plain": "9"}],
+                     "cursor": "1700000000000", "has_more": True}] * 5)
+    m = await c.map_item_ids(["1"])   # 永远找不到 "1"
+    ck(len(t.calls) <= 2, "cursor 不前进 -> 立即停，实际 %d 次" % len(t.calls))
+    ck(m == {}, "找不到就返回空（调用方跳过，不拿明文硬试）")
+
+    # 5.12f 加密串缓存：第二轮零请求，清缓存后重新拉
+    c, t = _client([
+        {"extra": {}, "item_info_list": [{"item_id": "E1", "item_id_plain": "1"}],
+         "cursor": "", "has_more": False},
+        {"extra": {}, "item_info_list": [{"item_id": "E1x", "item_id_plain": "1"}],
+         "cursor": "", "has_more": False},
+    ])
+    m1 = await c.map_item_ids(["1"])
+    n1 = len(t.calls)
+    m2 = await c.map_item_ids(["1"])
+    ck(m1 == m2 == {"1": "E1"} and len(t.calls) == n1,
+       "第二轮命中缓存，零请求")
+    c.clear_item_cache()
+    m3 = await c.map_item_ids(["1"])
+    ck(m3 == {"1": "E1x"} and len(t.calls) == n1 + 1,
+       "clear_item_cache() 后重新拉（换账号必须清）")
+
     # 5.13 self_identity
     c, t = _client([{"extra": {}, "aweme_list": [{"aweme_id": "1",
                                                   "author": {"uid": "9", "sec_uid": "S"}}],

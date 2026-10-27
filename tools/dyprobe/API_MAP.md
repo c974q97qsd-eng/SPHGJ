@@ -152,13 +152,21 @@ GET /janus/douyin/creator/pc/work_list
 
 ### 2.2 作品列表（带加密 ID，评论要用）
 ```
-GET /aweme/v1/creator/item/list?cursor=&aid=2906&count=5
+GET /aweme/v1/creator/item/list?cursor=&aid=2906
 ```
 - 返回 `item_id`（**加密**，评论接口用）+ `item_id_plain`（数字 aweme_id）
-- `cursor` 也是时间戳
-- ⚠️ 排序与 work_list 不同，新作品不一定在第一页，所以要**多翻几页**才能覆盖
+- 🚨 **翻页游标叫 `cursor`，没有 `max_cursor` 字段**（2026-10-28 实测修正）
+  - 首页传 `cursor=`（空串），响应里 `cursor` 是**时间戳字符串**，原样回传即可翻页
+  - 曾经按 work_list 的习惯读 `max_cursor` → 永远读到 0 → 第一页就停 → 只覆盖 19 条
+  - 实测同一账号：`cursor` 翻 5 页覆盖 **90/91** 条作品（唯一缺的是 `status_value=141`
+    的私密作品，本来就没有公开评论，属正常排除）
+- ⚠️ **每页上限 20 条**：`count` 传 10/20/50/100 分别回 10/19/19/19 条，
+  放大 `count` 无效，只能靠翻页（首页常是 19 条，因为有一条被过滤掉）
+- ✅ 顺序是**发布时间倒序**（新作品在第 1 页）。原文档写「新作品不一定在第一页」是错的，
+  已用首页 19 条 id 与 work_list 时间序逐条对照确认
 - ✅ 映射可靠性已核对：前 6 条作品的 `item_id_plain` 对应的 `comment_count`
   与 work_list 的 `statistics.comment_count` **完全一致** → `item_id_plain` 就是明文 aweme_id
+- ⚠️ 不支持按 id 过滤：`item_id_plain=` / `item_id=` 参数会被忽略（返回条数不变）
 - 返回字段：`item_id` / `item_id_plain` / `comment_count` / `create_time` / `duration` /
   `title` / `cover_image_url` / `item_link` / `media_type` / `creator_item_setting`
 
@@ -329,3 +337,28 @@ Header：`Content-Type: application/json` + `x-secsdk-csrf-token` +
    归属键退化成 `acct:<账号id>`，**不猜**。
 
 验证脚本：`tools/dyprobe/verify_step1.py`（真机 19 项）。
+
+### 6.1 第 2 步（评论抓取入库 + 回复/删除）已落地
+
+新增三个文件，职责严格分开：
+
+| 文件 | 职责 | 离线单测 |
+|---|---|---|
+| `backend/douyin/fetcher.py` | 作品列表 → 分区 → 加密 id 映射 → 评论分页 → 子回复 → 入库 | `test_rev56b_dy_fetcher.py` 46 项 |
+| `backend/douyin/manager.py` | 一个抖音账号的运行容器（**不接管登录/浏览器**，page 靠注入） | 随 verify_step2 |
+| `backend/server.py` 新增 6 条路由 | `/api/dy/{status,attach,detach,fetch}` + 评论回复/删除 | — |
+
+复用视频号那套「用血换来的四条规矩」：commentCount 缺失 ≠ 没有评论；
+早停前提是 `has_comments`；请求失败不能当成功；子回复失败必须降级。
+
+第 2 步又踩出两个真 bug（都写了回归单测）：
+
+3. **加密 item_id 覆盖不全**：读错游标字段名（见 §2.2），91 条作品只覆盖 19 条，
+   表现为「评论只抓 21%、回复老作品报拿不到加密 id」。修好后 90/91。
+4. **子回复入库把加密串当 `export_id` 存**：`export_id` 的语义是**明文 aweme_id**，
+   存成 `@jPdq…==` 以后 `reply()`/`delete_comment()` 再拿它查映射必然查不到，
+   报错还伪装成「拿不到加密 item_id」（误导性报错，多花了两轮排查）。
+   现在发请求用加密串、入库用明文，两者在代码里是**两个不同形参**。
+
+验证脚本：`tools/dyprobe/verify_step2.py`（真机 38 项，`--write` 跑真实
+「回复 → 找回 → 删除 → 复查消失」全链路，自清理）。

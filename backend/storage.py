@@ -368,21 +368,23 @@ class Storage:
             c.execute("DROP TABLE auto_commented_old")
         c.commit()
 
-    def upsert_comment(self, finder_id, export_id, comment, account_id=None):
+    def upsert_comment(self, finder_id, export_id, comment, account_id=None,
+                       platform="wx"):
         c = self._conn()
         cid = comment.get("commentId")
         # 作者身份:接口每条评论都带 username(作者的视频号 id),同一次响应里与评论同源,不会错位
         author_id = comment.get("username") or comment.get("commentUsername") or ""
         # INSERT OR IGNORE:新评论插入(replied=0);已存在的不动 replied
         c.execute("""INSERT OR IGNORE INTO comments
-            (finder_id,account_id,export_id,comment_id,author_id,nickname,content,head_url,create_time,like_count,read_flag,replied,raw,fetched_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (finder_id,account_id,export_id,comment_id,author_id,nickname,content,head_url,create_time,like_count,read_flag,replied,raw,fetched_at,platform)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (finder_id, account_id, export_id, cid, author_id, comment.get("commentNickname"),
              comment.get("commentContent"), comment.get("commentHeadurl"),
              int(comment.get("commentCreatetime", 0) or 0),
              int(comment.get("commentLikeCount", 0) or 0),
              1 if comment.get("readFlag") else 0, 0,
-             json.dumps(comment, ensure_ascii=False), datetime.now().isoformat()))
+             json.dumps(comment, ensure_ascii=False), datetime.now().isoformat(),
+             platform or "wx"))
         # UPDATE 其他字段(不覆盖 replied)。
         # finder_id 自愈:历史兜底值 acct:<卡片> 一律换回真实视频号 ——
         # 一条评论只可能属于一个作品,也就只可能属于一个视频号,后写的真值一定更准。
@@ -457,7 +459,8 @@ class Storage:
         c.close()
         return dict(seen=r is not None, cc=cc, has_comments=has)
 
-    def set_video_comment_count(self, finder_id, export_id, count, account_id=None):
+    def set_video_comment_count(self, finder_id, export_id, count, account_id=None,
+                                platform="wx"):
         """记录该视频本次看到的评论数。
 
         单调性保护:接口偶发把 commentCount 返回成 0(字段缺失 / 请求失败),
@@ -477,20 +480,22 @@ class Storage:
             new = old            # 脏值:保留旧值,不回退
         # ON CONFLICT DO UPDATE(不用 INSERT OR REPLACE):REPLACE 是整行删除再插入,
         # 会把不参与本次写入的列(如 account_id)清空。
-        c.execute("""INSERT INTO video_stats(finder_id,export_id,comment_count,updated_at,account_id)
-            VALUES(?,?,?,?,?)
+        c.execute("""INSERT INTO video_stats(finder_id,export_id,comment_count,updated_at,account_id,platform)
+            VALUES(?,?,?,?,?,?)
             ON CONFLICT(finder_id,export_id) DO UPDATE SET
                 comment_count=excluded.comment_count,
                 updated_at=excluded.updated_at,
-                account_id=COALESCE(NULLIF(excluded.account_id,''), account_id)""",
-                  (finder_id, export_id, new, datetime.now().isoformat(), account_id or ""))
+                account_id=COALESCE(NULLIF(excluded.account_id,''), account_id),
+                platform=COALESCE(NULLIF(excluded.platform,''), platform)""",
+                  (finder_id, export_id, new, datetime.now().isoformat(), account_id or "",
+                   platform or "wx"))
         c.commit()
         c.close()
         return new
 
     # ==================== rev52: 播放数每日采样(分区用) ====================
 
-    def upsert_video_activity(self, finder_id, items, account_id=None):
+    def upsert_video_activity(self, finder_id, items, account_id=None, platform="wx"):
         """批量写入当日播放数采样。items = [{"objectId","readCount","likeCount","commentCount"}]
 
         同一天重复写入会覆盖成当次读数(只留最后一条),所以日末那次读数即当日快照。
@@ -522,21 +527,23 @@ class Storage:
                 cc = int(cc) if cc is not None else None
             except (TypeError, ValueError):
                 cc = None
-            rows.append((finder_id, oid, day, rc, lc, cc, account_id or "", now))
+            rows.append((finder_id, oid, day, rc, lc, cc, account_id or "", now,
+                         platform or "wx"))
         if not rows:
             return 0
         c = self._conn()
         try:
             c.executemany("""INSERT INTO video_activity(
                     finder_id,export_id,day,read_count,like_count,comment_count,
-                    account_id,updated_at)
-                VALUES(?,?,?,?,?,?,?,?)
+                    account_id,updated_at,platform)
+                VALUES(?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(finder_id,export_id,day) DO UPDATE SET
                     read_count=excluded.read_count,
                     like_count=excluded.like_count,
                     comment_count=excluded.comment_count,
                     account_id=COALESCE(NULLIF(excluded.account_id,''), account_id),
-                    updated_at=excluded.updated_at""", rows)
+                    updated_at=excluded.updated_at,
+                    platform=COALESCE(NULLIF(excluded.platform,''), platform)""", rows)
             c.commit()
         finally:
             c.close()
@@ -754,11 +761,13 @@ class Storage:
         c = self._conn()
         try:
             rows = c.execute("""SELECT finder_id, COUNT(*) AS comments,
-                        MAX(account_id) AS account_id, MAX(fetched_at) AS last_fetched
+                        MAX(account_id) AS account_id, MAX(fetched_at) AS last_fetched,
+                        MAX(platform) AS platform
                     FROM comments WHERE deleted=0 GROUP BY finder_id
                     ORDER BY comments DESC""").fetchall()
             return [dict(finder_id=r[0] or "", comments=r[1] or 0,
-                         account_id=r[2] or "", last_fetched=r[3]) for r in rows]
+                         account_id=r[2] or "", last_fetched=r[3],
+                         platform=(r[4] or "wx")) for r in rows]
         finally:
             c.close()
 

@@ -116,6 +116,9 @@ class DouyinClient:
         self._daily_day = None
         #: 登录态已被服务端明确判死（status_code=8）。上层据此判掉线，别再发包。
         self.auth_fail = None
+        #: 明文 aweme_id -> 加密 item_id 缓存。加密结果对同一个 aweme_id 是稳定的，
+        #: 免得每轮都从第 1 页翻起（91 条作品 = 5 页，纯浪费）。上限 2000 条足够。
+        self._item_enc = {}
 
     # ---------------- 小工具 ----------------
     @staticmethod
@@ -272,38 +275,64 @@ class DouyinClient:
         return out, True
 
     async def fetch_item_page(self, cursor="", count=20):
+        """一页 item/list。返回 {"__ok","map","cursor","has_more","raw"}。
+
+        🚨 游标键是 `cursor`（时间戳字符串）；`max_cursor` 只是兼容别名，
+        item/list 真机上从来没有这个字段（坑 4）。新代码一律用 cursor。
+        """
         env = await self._request("GET", api.item_list_url(cursor=cursor, count=count))
         if not env["__ok"]:
             return env
         m, nxt, more = api.item_map_of(env["raw"])
-        return {"__ok": True, "map": m, "max_cursor": nxt, "has_more": more,
-                "raw": env["raw"]}
+        return {"__ok": True, "map": m, "cursor": nxt, "max_cursor": nxt,
+                "has_more": more, "raw": env["raw"]}
 
-    async def map_item_ids(self, aweme_ids, max_pages=20, count=20):
+    async def map_item_ids(self, aweme_ids, max_pages=30, count=20, use_cache=True):
         """建 明文 aweme_id -> 加密 item_id 映射（评论接口只认加密串）。
 
         只翻到「需要的 id 全部找到」或没更多为止；找不到的留给调用方跳过并记日志，
         绝不拿明文 id 硬试（明文一定失败，白打一次请求）。
+
+        🚨 这里的游标是 item/list 的 `cursor`（时间戳字符串），不是 work_list 的
+        max_cursor（坑 4）。读错字段会永远读到 0 -> 第一页就 break -> 只覆盖 19 条。
+        顺序是发布时间倒序，所以「只要最近的作品」通常 1 页就够；老作品才需要翻深。
+
+        use_cache: 命中进程内缓存就不发请求。加密串对同一 aweme_id 稳定，
+        缓存不会过期；但**换账号必须清缓存**（spec 里 item_id 与登录会话相关），
+        见 clear_item_cache()。
         """
         want = {str(x) for x in (aweme_ids or []) if x}
-        found, cursor, pages = {}, "", 0
+        found = {}
+        if use_cache:
+            found = {k: self._item_enc[k] for k in want if k in self._item_enc}
+        todo = want - set(found)
+        if not todo:
+            return found
+
+        cursor, pages = "", 0
         while pages < max_pages:
             env = await self.fetch_item_page(cursor=cursor, count=count)
             pages += 1
             if not env["__ok"]:
                 break
             for plain, enc in env["map"].items():
-                if plain in want:
+                if plain in todo:
                     found[plain] = enc
-            if want and len(found) >= len(want):
+                    if len(self._item_enc) < 2000:
+                        self._item_enc[plain] = enc
+            if len(found) >= len(want):
                 break
             if not env["has_more"]:
                 break
-            nxt = env["max_cursor"]
+            nxt = env.get("cursor") or env.get("max_cursor") or ""
             if not nxt or str(nxt) == str(cursor):
                 break
             cursor = nxt
         return found
+
+    def clear_item_cache(self):
+        """换账号 / 登录态变化后必须清，否则拿着别人的加密串去打评论接口。"""
+        self._item_enc = {}
 
     async def self_identity(self):
         """取当前登录账号的身份（uid / sec_uid / unique_id / nickname）。

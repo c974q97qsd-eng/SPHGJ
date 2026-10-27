@@ -34,10 +34,21 @@ status_code 仍然是 0。唯一可靠的「打到了真接口」信号是响应
     发布 create_v2                    -> application/json
 见 *_FORM 常量与 form=True 标记。
 
-另外两条实测结论：
-  · 作品列表的 `max_cursor` 是**毫秒时间戳**，不是 offset；
+另外几条实测结论：
+  · 作品列表（work_list）的 `max_cursor` 是**毫秒时间戳**，不是 offset；
   · 评论列表的 `item_id` 必须是**加密串**（@jPdq…==），明文 aweme_id 无效，
     加密串要从 /aweme/v1/creator/item/list 的 item_id 字段拿。
+
+🚨 坑 4：item/list 的翻页游标叫 `cursor`，**没有 `max_cursor` 字段**。
+这一条踩过一次：曾经按 work_list 的习惯去读 `max_cursor`，永远读到 0，
+于是 map_item_ids 第一页就 break，只覆盖到 19 条作品（91 条里缺 72 条），
+表现为「评论只能抓 21%、回复老作品时报拿不到加密 id」。
+实测真相：
+  · 首页传 `cursor=`（空串），响应里 `cursor` 是**时间戳字符串**，原样回传即可翻页；
+  · 每页上限 20 条，`count` 传 20/50/100 都只回 19~20 条（放大 count 无效）；
+  · 顺序是**发布时间倒序**（新作品在第 1 页），所以「只要最近的作品」时翻 1~2 页就够；
+  · `has_more` 为假就是到底了。
+  · 私密作品（status_value=141）不会出现在 item/list 里 —— 属正常排除，不是丢数据。
 """
 
 import json
@@ -191,8 +202,10 @@ def item_list_url(cursor="", count=20):
     """作品列表（带加密 item_id）。
 
     返回 item_id（加密，评论接口要用）+ item_id_plain（数字 aweme_id）。
-    ⚠️ 排序与 work_list 不同，新作品不一定在第一页 —— 所以评论抓取不能只靠它，
-       要用 work_list 的 aweme_id 去这里建映射（见 client.map_item_ids）。
+
+    🚨 cursor 在这里是**时间戳字符串**（坑 4），不是 work_list 的 max_cursor：
+       首页传空串 ""，下一页传响应里的 `cursor` 原样。count 上限 20，
+       传更大也不会多给。顺序为发布时间倒序。
     """
     return "%s?%s" % (PATH_ITEM_LIST, _qs((
         ("cursor", str(cursor or "")),
@@ -387,17 +400,66 @@ def works_of(resp):
 
 
 def item_map_of(resp):
-    """从 item/list 响应里取 明文 aweme_id -> 加密 item_id 的映射。"""
+    """从 item/list 响应里取 明文 aweme_id -> 加密 item_id 的映射。
+
+    返回 (映射, 下一页游标, 是否有更多)。
+
+    🚨 游标字段是 `cursor`（坑 4）。这里**同时兼容 max_cursor** 只是为了不让
+    上游拿到 None 就崩，真机上 item/list 从来没有 max_cursor 字段 ——
+    主要看 cursor。游标是时间戳字符串，原样回传即可（不要当 offset 递增）。
+    """
     out = {}
     if not isinstance(resp, dict):
-        return out, 0, False
+        return out, "", False
     rows = resp.get("item_info_list") or []
     for it in rows:
         plain = str(it.get("item_id_plain") or "")
         enc = str(it.get("item_id") or "")
         if plain and enc:
             out[plain] = enc
-    return out, _int(resp.get("max_cursor")), bool(resp.get("has_more"))
+    nxt = resp.get("cursor")
+    if nxt is None or nxt == "":
+        nxt = resp.get("max_cursor")
+    nxt = "" if nxt is None else str(nxt)
+    if nxt == "0":
+        nxt = ""
+    return out, nxt, bool(resp.get("has_more"))
+
+
+def to_storage_comment(c):
+    """归一化评论 -> storage.upsert_comment 认的字段名（视频号口径）。
+
+    为什么要做这层转换而不是另写一个 dy 版 upsert：comments 表的结构、去重
+    (comment_id UNIQUE)、replied/deleted 语义、分页查询全是为所有平台共用的，
+    差异化只在**字段名**。在边界上做一次改名，比复制 40 行 SQL 安全得多
+    （那种复制一旦一边修了 bug 另一边没跟上，就是两套行为）。
+
+    映射：
+        commentId        <- comment_id
+        commentNickname  <- nickname
+        commentContent   <- text
+        commentHeadurl   <- head_url
+        commentCreatetime<- create_time
+        commentLikeCount <- like_count
+        username         <- author_id（用于识别「自己发的评论」，别丢）
+        _dy              <- 原始抖音字段，整份留档，方便以后加功能不用重抓
+    """
+    c = c if isinstance(c, dict) else {}
+    return {
+        "commentId": c.get("comment_id"),
+        "commentNickname": c.get("nickname"),
+        "commentContent": c.get("text"),
+        "commentHeadurl": c.get("head_url"),
+        "commentCreatetime": _int(c.get("create_time")),
+        "commentLikeCount": _int(c.get("like_count")),
+        "username": c.get("author_id") or "",
+        "readFlag": False,
+        "replyCount": _int(c.get("reply_count")),
+        "level": _int(c.get("level"), 1),
+        "isAuthor": bool(c.get("is_author")),
+        "_dy": c.get("raw"),
+    }
+
 
 
 def dumps_form(body):
