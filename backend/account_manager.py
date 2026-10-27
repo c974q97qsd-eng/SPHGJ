@@ -148,7 +148,17 @@ class AccountWorker:
                                       self.config.get("auto_delete") or {}, finder_getter=_fid)
         self.fetcher = CommentFetcher(None, self.storage, self.account["id"],
                                       self.auto_reply, self.auto_commenter, self.auto_delete,
-                                      finder_getter=_fid)
+                                      finder_getter=_fid, config=self.config)
+        # rev52: 先建一个「无浏览器」的 API 客户端。rev50 之后读接口全程走进程内 HTTP,
+        # 浏览器只在 HTTP 走不通时才需要 —— 但原来这条路径必须先 ensure_browser()
+        # 才能拿到 api/fetcher,等于每轮强制 launch Chromium(8~15s)+ goto + auth 硬验,
+        # 8 个账号每天 120 轮 = 960 次启停。这里预建一个 page=None 的客户端,
+        # _open_context() 之后仍会重建带 page 的版本覆盖(浏览器 = HTTP 的回退路径)。
+        self.api = WxApiClient(None, self.account, self.config, self.storage)
+        self.auto_reply.api = self.api
+        self.auto_commenter.api = self.api
+        self.auto_delete.api = self.api
+        self.fetcher.api = self.api
         # 按需开浏览器(懒加载):不长期常驻 Chromium 进程——抓取/直播/手动操作时才开,
         # 空闲(非直播)即收回省内存。失败(如 profile 锁被占用)由调用方处理。
         try:
@@ -855,40 +865,41 @@ class AccountWorker:
             # 串行抓取:全局队列锁,保证多账号不同时拉起浏览器(省内存 + 防风控关联)
             if self._fetch_lock is not None:
                 await self._fetch_lock.acquire()
+            used_browser = False
             try:
-                ok = await self.ensure_browser()
-                if not ok:
-                    logger.warning(f"[{self.account['id']}] 抓取前开浏览器失败(未登录),跳过本轮")
+                res, used_browser = await self._run_fetch_round()
+                if res is None:
                     await asyncio.sleep(min(interval, 60))
                     continue
-                if self.logged_in and self.fetcher:
-                    try:
-                        # rev15 P2: 传 on_batch 启用流式推送,避免高评论量账号在内存堆积全量新评论
-                        scanned, new_c, new_comments, deleted_ids = await self.fetcher.fetch_all(
-                            on_batch=self._emit_comment_batch)
-                        self.last_scan_at = datetime.now().isoformat()
-                        if new_c:
-                            today = datetime.now().strftime("%Y-%m-%d")
-                            if self._new_count_date != today:
-                                self._new_count_date = today
-                                self.new_count = 0
-                            self.new_count += new_c
-                        logger.info(f"[{self.account['id']}] 扫描{scanned}视频 新增{new_c}评论")
-                        if new_comments:
-                            await self._emit("comments_update",
-                                             {"account_id": self.account["id"], "comments": new_comments})
-                        for cid in deleted_ids:
-                            await self._emit("comment_deleted", {"comment_id": cid})
-                    except Exception as e:
-                        logger.error(f"[{self.account['id']}] 抓取异常: {e}")
+                scanned, new_c, new_comments, deleted_ids, complete = res
+                self.last_scan_at = datetime.now().isoformat()
+                if new_c:
+                    today = datetime.now().strftime("%Y-%m-%d")
+                    if self._new_count_date != today:
+                        self._new_count_date = today
+                        self.new_count = 0
+                    self.new_count += new_c
+                if not complete:
+                    # rev52: 原来这种情况静默中断 —— 打的是「扫描N视频 新增0评论」INFO,
+                    # 看起来这轮成功了,其实后面的作品压根没检查。
+                    logger.warning(f"[{self.account['id']}] 本轮抓取不完整:有请求连续失败,"
+                                   f"部分作品未检查(未覆盖部分下一轮会重新扫)")
+                if new_comments:
+                    await self._emit("comments_update",
+                                     {"account_id": self.account["id"], "comments": new_comments})
+                for cid in deleted_ids:
+                    await self._emit("comment_deleted", {"comment_id": cid})
                 # 周期内顺带检测直播(非直播则收回进程)
                 await self._cycle_live_check()
             finally:
                 if self._fetch_lock is not None:
                     try: self._fetch_lock.release()
                     except Exception: pass
-                # 无动作(非直播/无手动操作)则收回浏览器进程省内存
-                await self.release_idle_browser()
+                # 无动作(非直播/无手动操作)则收回浏览器进程省内存。
+                # rev52: 只有本轮真的开过浏览器才释放 —— 纯 HTTP 那一轮没有对应的
+                # ensure_browser(+1),无条件 release 会吃掉手动操作/直播持有的引用计数。
+                if used_browser:
+                    await self.release_idle_browser()
             # 夜间降频(0~6 点间隔拉长)+ 抖动
             # rev16 F3: 账号在播时改用直播专用间隔(已足够长,不再叠加夜间倍率 ——
             # 夜间倍率是为风控降频设计,3600s 本身即很保守,叠加后单夜仅 0~1 次意义不大,
@@ -901,14 +912,53 @@ class AccountWorker:
                     cur = int(interval * night_mult)
             await asyncio.sleep(cur + random.uniform(0, min(cur, 30)))
 
-    async def fetch_once(self):
+    async def _run_fetch_round(self):
+        """一轮评论抓取:HTTP 直连优先,只有走不通时才开浏览器。
+
+        rev52: 原来每轮开头无条件 ensure_browser()。既然读接口(rev50)已经在进程内
+        发 HTTP,浏览器就只在「HTTP 不可用」时才有价值 —— 典型是 6/9/10 号那种
+        profile 磁盘上还登录着、但 config.storage_state 已过期(errCode=300333)的账号。
+
+        返回 (5 元组, 是否用了浏览器);连登录态都拿不到时返回 (None, False)。
+        """
+        if self.fetcher is None:
+            return None, False
+        # 1) 纯 HTTP:不需要任何 Chromium 进程
+        http_ok = False
+        if self.api is not None:
+            try:
+                http_ok = bool(self.api.http_available())
+            except Exception:
+                http_ok = False
+        if http_ok:
+            try:
+                res = await self.fetcher.fetch_all(on_batch=self._emit_comment_batch)
+                if res[4]:
+                    if self.context is None:
+                        logger.debug(f"[{self.account['id']}] 本轮抓取全程 HTTP 直连(未开浏览器)")
+                    return res, False
+                logger.info(f"[{self.account['id']}] HTTP 直连本轮不完整,开浏览器重跑(补漏)")
+            except Exception as e:
+                logger.warning(f"[{self.account['id']}] HTTP 抓取异常,改用浏览器: {e}")
+        # 2) 浏览器回退
         ok = await self.ensure_browser()
+        if not ok:
+            logger.warning(f"[{self.account['id']}] 抓取前开浏览器失败(未登录),跳过本轮")
+            return None, False
+        if not self.logged_in:
+            return None, True
         try:
-            if ok and self.logged_in and self.fetcher:
-                return await self.fetcher.fetch_all()
-        finally:
+            return await self.fetcher.fetch_all(on_batch=self._emit_comment_batch), True
+        except Exception as e:
+            logger.error(f"[{self.account['id']}] 抓取异常: {e}")
+            return None, True
+
+    async def fetch_once(self):
+        """手动「立即抓取一次」。同样先试 HTTP,失败再开浏览器。"""
+        res, used_browser = await self._run_fetch_round()
+        if used_browser:
             await self.release_idle_browser()
-        return 0, 0, [], []
+        return res if res is not None else (0, 0, [], [], False)
 
     async def _emit_comment_batch(self, comments, deleted_ids):
         """rev15 P2: 评论流式推送回调(由 CommentFetcher 在缓冲达阈值时调用)。
@@ -959,7 +1009,11 @@ class AccountWorker:
         或 sessionid 过期),就退回 live_probe_slow_interval_sec(默认 300s),
         避免高频开浏览器 —— 母本 OOM 过一次,这个代价必须让频率来背。
         """
-        interval = max(30, int(self.config.get("live_probe_interval_sec", 120)))
+        # rev52: 未播间隔 120s -> 300s。轻量 HTTP 探测单次约 1.1s,8 个账号 120s 一轮
+        # = 5760 次/天(占总请求 12%),而未播时探得再勤也只是"未播"。
+        # 开播发现延迟由 180s 快速捕获窗口(start_live_probe 的 boost 30s)兜住,
+        # 用户手动点检测也会立刻唤醒(Event),所以降频不影响"开播即被发现"。
+        interval = max(30, int(self.config.get("live_probe_interval_sec", 300)))
         slow_interval = max(interval, int(self.config.get("live_probe_slow_interval_sec", 300)))
         boost_interval = max(5, int(self.config.get("live_probe_boost_interval_sec", 20)))
         gap = float(self.config.get("live_probe_min_gap_sec", 60))
@@ -1875,7 +1929,20 @@ class AccountManager:
             logger.info(f"[{account_id}] headed 浏览器已关闭(原未运行,不自动启动)")
 
     async def fetch_all_once(self):
-        tasks = [w.fetch_once() for w in self.workers.values() if w.logged_in]
+        """全部账号立即抓取一次。
+
+        rev52: 判定条件不能只看 logged_in —— 纯 HTTP 模式下根本没开浏览器,
+        logged_in 还是初始的 False,会导致「立即抓取」把所有 HTTP 可用账号跳掉。
+        """
+        def _usable(w):
+            if w.logged_in:
+                return True
+            try:
+                return bool(w.api is not None and w.api.http_available())
+            except Exception:
+                return False
+
+        tasks = [w.fetch_once() for w in self.workers.values() if _usable(w)]
         return await asyncio.gather(*tasks, return_exceptions=True)
 
     def get_worker(self, account_id):

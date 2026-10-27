@@ -103,6 +103,12 @@ class WxApiClient:
         base = resp.get("base_resp")
         if isinstance(base, dict) and base.get("ret") not in (None, 0):
             return True
+        # rev52: 视频号接口的业务错误码在 errCode 上,原来这里只看 ret ——
+        # errCode=-1 时被当成"成功",既不退避也不计数,于是连续被拒还照常猛打。
+        # 线上实测 2 号重扫后 20 分钟内出现 4 次 errCode=-1(post_list/comment_list 各 2 次)。
+        code = self._err_code(resp)
+        if code not in (0, None):
+            return True
         return False
 
     def _on_failure(self):
@@ -271,8 +277,28 @@ class WxApiClient:
                         f"backend={wx_http.backend_name()}),{kind}接口走进程内请求")
         return resp
 
+    def http_available(self):
+        """本地有没有可用于 HTTP 直连的登录态。不访问网络,纯查 config。
+
+        rev52: 抓取流程要靠它决定「这轮要不要开浏览器」。有 storage_state 就先走纯
+        HTTP(零 Chromium);没有(或已过期)才走 ensure_browser 那条老路。
+
+        也要尊重 `_http_block_until` —— no_cookie / errCode=300333 之后会阻塞 180s,
+        这段时间 cookie 不会自己长回来,再试只是白跑一次请求。
+        """
+        if time.time() < self._http_block_until:
+            return False
+        try:
+            return bool(wx_http.cookie_header_of(self._latest_account()))
+        except Exception:
+            return False
+
     async def _post_via_page(self, path, url, body):
         """原路径:页面内 fetch(同源、带真 cookie)。"""
+        if self.page is None:
+            # rev52: 纯 HTTP 模式(未开浏览器)下的回退请求。不能抛异常 ——
+            # 抛出去会让整轮抓取炸掉,而正确语义只是「这条走不通」。
+            return {"__err": "no_page"}
         js = """
         async (args) => {
             try {
@@ -299,6 +325,19 @@ class WxApiClient:
             return json.loads(result)
         except Exception:
             return {"__err": "parse", "raw": (result or "")[:200]}
+
+    def write_blocked(self):
+        """今日写操作是否已达上限。
+
+        rev52: 供上层在每轮/每视频判断前先问一句,避免明知会被拒还逐条调用
+        (原来 auto_comment 对每个新视频都 try_comment -> post_comment 被上限挡回,
+        线上一天打了 5574 条 WARNING,把日志淹掉)。
+        """
+        today = time.strftime("%Y-%m-%d")
+        try:
+            return self._daily_count(today) >= self._daily_write_limit
+        except Exception:
+            return False
 
     def _daily_count(self, today):
         """今日写计数:有 storage 走持久化,否则内存兜底(按日期重置)。"""
@@ -350,8 +389,23 @@ class WxApiClient:
         except Exception:
             return ""
 
-    async def fetch_video_list(self, last_buff="", only_unread=False, page_size=20):
-        """视频列表。返回 {data:{list:[{objectId,commentCount,createTime,...}], ...}}。lastBuff 分页。"""
+    async def fetch_video_list(self, last_buff="", only_unread=False, page_size=None):
+        """视频列表。返回 {data:{list:[{objectId,commentCount,createTime,...}], ...}}。lastBuff 分页。
+
+        rev52: pageSize 默认 20 -> 100。这是本项目请求量最大的一条路径 ——
+        每轮都要翻完全部作品,pageSize=20 时 8 个账号合计 348 页/轮(白天 10 分钟一轮
+        = 41760 次/天,占总请求 88%,单轮串行耗时 10.1 分钟已把 10 分钟的周期额度吃满)。
+        实测 100 条/页可用:返回 100 条、errCode=0、约 1 秒、427KB,连翻 3 页无重复
+        且时间连续(08-31 11:01 跨页正确衔接)。响应体大小与 20 条/页按比例放大,
+        总流量不变,省的是请求数(348->70 页/轮)与节流等待。
+        上限按 100 封顶:再大未实测,不拿线上账号试。
+        """
+        if page_size is None:
+            try:
+                page_size = int((self.config or {}).get("post_list_page_size", 100) or 100)
+            except (TypeError, ValueError):
+                page_size = 100
+        page_size = max(1, min(100, page_size))
         return await self._post("post/post_list", self._body(
             pageSize=page_size, onlyUnread=only_unread, needAllCommentCount=True,
             userpageType=13, forMcn=False, lastBuff=last_buff))
