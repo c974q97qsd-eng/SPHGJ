@@ -51,6 +51,7 @@ from collections import deque
 from datetime import datetime
 from .selectors import LIVE_URL
 from .metrics import extract_all, shrink_conv
+from . import wx_http
 
 # ======================== rev43: 已学 API 规格持久化 ========================
 # 现象:学到的 get_live_info/check_live_status 规格只活在内存。live_page 一重建
@@ -111,6 +112,7 @@ logger = logging.getLogger("sphgj")
 DASHBOARD_DATA_API = "https://channels.weixin.qq.com/micro/statistic/cgi-bin/mmfinderassistant-bin/statistic/get_ec_conversion_dashboard_data_v3"
 DISTRIBUTION_CHANNEL_API = "https://channels.weixin.qq.com/micro/statistic/cgi-bin/mmfinderassistant-bin/svrkit/MmFinderECAssistantDataSvr/getLiveDistributionChannel"
 EC_DATA_SUMMARY_API = "https://channels.weixin.qq.com/micro/statistic/cgi-bin/mmfinderassistant-bin/statistic/get_live_ec_data_summary"
+DASHBOARD_PAGE_URL = "https://channels.weixin.qq.com/micro/statistic/dashboardV4"
 DASHBOARD_PAGE_URL_ENC = "https%3A%2F%2Fchannels.weixin.qq.com%2Fmicro%2Fstatistic%2FdashboardV4"
 
 # 渠道大类:newLiveDstChannelType 1=公域 / 2=加热 / 4=私域
@@ -220,7 +222,7 @@ def judge_live(live_stats=None, stats_fresh=True, stream_url=None,
 
 
 class LiveFetcher:
-    def __init__(self, page, account_id, learned=None):
+    def __init__(self, page, account_id, learned=None, account=None):
         """learned: rev16 F4 —— 继承上一实例的 API 规格 {name: spec}。
 
         重建 live_page(信号丢失自愈 / 定期释放 renderer)时传入旧实例的 _learned,
@@ -229,6 +231,9 @@ class LiveFetcher:
         """
         self.page = page
         self.account_id = account_id
+        # rev50: 账号 dict（含 _aid / _log_finder_id / storage_state）。给了就让 dashboard
+        # 走纯 HTTP，不必等页面渲染；不给则只能读 localStorage（浏览器路径）。
+        self._account = account or {}
         self.live_stats = None
         self.stream_url = None
         self.updated_at = None
@@ -1004,8 +1009,22 @@ class LiveFetcher:
     # ======================== Dashboard 主动抓取 ========================
 
     async def _ensure_ids(self):
-        """从 liveBuild page localStorage 读 _aid + _log_finder_id。"""
+        """确定 _aid + _log_finder_id。
+
+        rev50: 优先用账号 dict 里已经存好的值 —— 这两个值每次登录就写回 config，
+        不需要再去 liveBuild 的 localStorage 读。原实现把"页面在场"变成了
+        dashboard 抓取的前置条件，纯属自找麻烦。
+        """
         if self._aid and self._log_finder_id:
+            return
+        acc = self._account or {}
+        if not self._aid:
+            self._aid = (acc.get("_aid") or "").strip() or None
+        if not self._log_finder_id:
+            self._log_finder_id = (acc.get("_log_finder_id") or "").strip() or None
+        if self._aid and self._log_finder_id:
+            return
+        if self.page is None:
             return
         try:
             ids = await _with_timeout(self.page.evaluate("""()=>{
@@ -1022,7 +1041,11 @@ class LiveFetcher:
             logger.debug(f"[live:{self.account_id}] 读取 localStorage 失败: {e}")
 
     async def _dashboard_post(self, url, body):
-        """在 liveBuild page 同源 fetch dashboard API(POST,cookie 自动带)。"""
+        """取 dashboard 数据。
+
+        rev50: 先走进程内 HTTP(不需要 live_page、不用等 SPA 渲染)，失败回退页面 fetch。
+        这三个接口是纯 JSON POST，与浏览器路径唯一的差别是少了跨进程 IPC。
+        """
         await self._ensure_ids()
         if not self._aid or not self._log_finder_id:
             return None
@@ -1037,6 +1060,22 @@ class LiveFetcher:
             "reqScene": 7,
             **body,
         }
+        # ---------- 1) HTTP 直连 ----------
+        if self._account:
+            try:
+                j = await wx_http.post_json(
+                    self._account, full_url, payload,
+                    page_url=DASHBOARD_PAGE_URL, timeout=_EVAL_TIMEOUT)
+                if isinstance(j, dict) and not j.get("__err")                         and j.get("errCode") in (0, None):
+                    return j
+                logger.debug(f"[live:{self.account_id}] dashboard HTTP 不可用: "
+                             f"{j.get('__err') or ('errCode=' + str(j.get('errCode')))
+                                if isinstance(j, dict) else j}")
+            except Exception as e:
+                logger.debug(f"[live:{self.account_id}] dashboard HTTP 异常: {e}")
+        # ---------- 2) 页面 fetch 回退 ----------
+        if self.page is None:
+            return None
         js = """async (args) => {
             const r = await fetch(args.url, {method:'POST', credentials:'include',
                 headers:{'Content-Type':'application/json'}, body: JSON.stringify(args.body)});

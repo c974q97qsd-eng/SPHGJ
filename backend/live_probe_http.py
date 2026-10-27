@@ -34,20 +34,20 @@ context 用 `ctx.request` 发一次请求(4~6 秒)。但探测本质上就是**�
 
 **绝不在这里凭空造一个"未播"结论** —— 判不了就是判不了,交回给能判的路径。
 """
-import asyncio
 import json
 import os
 import re
 import time
 
 from .live_fetcher import LiveFetcher, _load_spec_cache, judge_live
-
-try:
-    import httpx as _httpx
-    HAS_HTTPX = True
-except Exception:            # 干净克隆的机器可能还没装
-    _httpx = None
-    HAS_HTTPX = False
+# rev50: HTTP 原语统一搬到 wx_http(依赖图的叶子节点),这里只保留探测业务逻辑。
+# 名字原样 re-export, extern 调用点(live_probe_http.build_cookie_header)无需改动。
+from .wx_http import (        # noqa: F401
+    HAS_HTTPX,
+    backend_name,
+    build_cookie_header,
+    request_raw,
+)
 
 DEFAULT_TIMEOUT = 8.0        # 探测是"看一眼",宁可漏一轮也不要挂住探测器
 _API_HOST = "channels.weixin.qq.com"
@@ -59,34 +59,6 @@ _SKIP_HEADERS = {"cookie", "content-length", "host", "connection"}
 def _data_dir():
     return os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
-
-
-def _cookie_domain_ok(dom):
-    """这个 cookie 的域,浏览器会不会发给 channels.weixin.qq.com?
-
-    必须是精确的"该 host"或"父域泛 cookie"。曾经用 `dom.endswith("weixin.qq.com")`
-    过滤,结果把 `developers.weixin.qq.com` 的 bid/bidjs 也带上了,还让 `wxuin`
-    出现两次(两个域各一份、值可能不同)—— 重复的同名 cookie 发给服务端是隐患。
-    """
-    if not dom:
-        return False
-    if dom == _API_HOST:
-        return True
-    return dom in (_ROOT_DOMAIN, "." + _ROOT_DOMAIN)
-
-
-def build_cookie_header(storage_state):
-    """storage_state -> `k=v; k=v`。只保留会发给 API host 的 cookie。"""
-    out = []
-    for c in ((storage_state or {}).get("cookies") or []):
-        name = c.get("name")
-        val = c.get("value")
-        if not name or val is None:
-            continue
-        if not _cookie_domain_ok((c.get("domain") or "").lower()):
-            continue
-        out.append("%s=%s" % (name, val))
-    return "; ".join(out)
 
 
 def load_live_status_spec(account_id):
@@ -153,46 +125,6 @@ def prepare_request(spec, account=None, borrowed=False):
     return url, method, headers, body
 
 
-async def _post_httpx(url, headers, body, timeout):
-    async with _httpx.AsyncClient(timeout=timeout, follow_redirects=True) as cli:
-        if body is None:
-            r = await cli.get(url, headers=headers)
-        else:
-            r = await cli.post(url, headers=headers, content=body.encode("utf-8"))
-        return r.status_code, r.text
-
-
-async def _post_urllib(url, headers, body, timeout):
-    """标准库兜底。阻塞调用丢进线程,不占事件循环。"""
-    import urllib.request
-    import urllib.error
-
-    def _call():
-        data = body.encode("utf-8") if body else None
-        req = urllib.request.Request(url, data=data, headers=headers,
-                                     method="POST" if data else "GET")
-        opener = urllib.request.build_opener()
-        try:
-            with opener.open(req, timeout=timeout) as r:
-                return r.status, r.read().decode("utf-8", "replace")
-        except urllib.error.HTTPError as e:
-            return e.code, (e.read() or b"").decode("utf-8", "replace")
-
-    return await asyncio.to_thread(_call)
-
-
-async def _request(url, method, headers, body, timeout=DEFAULT_TIMEOUT):
-    """返回 (status_code, text)。method 目前实测只用到 POST。"""
-    if method == "GET":
-        body = None
-    if HAS_HTTPX:
-        try:
-            return await _post_httpx(url, headers, body, timeout)
-        except Exception:
-            pass          # httpx 挂了不要紧,标准库再来一次
-    return await _post_urllib(url, headers, body, timeout)
-
-
 def _dump_live_response(account_id, text):
     """首次探到"在播"时把完整响应留一份 —— status 在播时的真实取值一直没证据。
 
@@ -236,7 +168,7 @@ async def probe_http(account, diag=None):
     url, method, headers, body = prepare_request(spec, account, borrowed)
     headers["Cookie"] = cookie
     try:
-        code, txt = await _request(url, method, headers, body)
+        code, txt = await request_raw(method, url, headers, body, DEFAULT_TIMEOUT)
     except Exception as e:
         if diag is not None:
             diag["why"] = "request_error"
@@ -287,8 +219,3 @@ async def probe_http(account, diag=None):
     finally:
         lf = None
         txt = None
-
-
-def backend_name():
-    """诊断用:当前实际走哪个 HTTP 后端。"""
-    return "httpx" if HAS_HTTPX else "urllib"

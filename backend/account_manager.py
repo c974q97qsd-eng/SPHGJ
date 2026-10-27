@@ -473,7 +473,7 @@ class AccountWorker:
             return None
         lf = None
         try:
-            lf = LiveFetcher(None, self.account["id"])
+            lf = LiveFetcher(None, self.account["id"], account=self.account)
             # 抑制"拿到 liveObjectId, dashboard 抓取启用"这类只对常驻实例有意义的日志
             # 与首次落盘(轻量探测每几分钟一次,不该重复写文件)
             lf.live_object_id = "-"
@@ -675,7 +675,7 @@ class AccountWorker:
             self.live_page = await self.context.new_page()
             # 用局部 lf 持有 LiveFetcher,避免并发 _close_context/release_idle_browser 将
             # self.live_fetcher 置 None 后,本方法内再访问 .updated_at_ts 触发 'NoneType' 崩溃。
-            lf = LiveFetcher(self.live_page, self.account["id"])
+            lf = LiveFetcher(self.live_page, self.account["id"], account=self.account)
             self.live_fetcher = lf
             await lf.goto_live()
             self._live_opened_ts = time.time()
@@ -1021,7 +1021,8 @@ class AccountWorker:
                         await self.live_page.close()         # 关 page 促 renderer 退出
                         self.live_page = await self.context.new_page()
                         lf = LiveFetcher(self.live_page, self.account["id"],
-                                         learned=inherited_learned)
+                                         learned=inherited_learned,
+                                         account=self.account)
                         self.live_fetcher = lf
                         await lf.goto_live()
                         self._last_live_reload = now
@@ -1134,7 +1135,8 @@ class AccountWorker:
                                     await lf.close()
                                 await self.live_page.reload(wait_until="domcontentloaded")
                                 lf = LiveFetcher(self.live_page, self.account["id"],
-                                                 learned=inherited_learned)
+                                                 learned=inherited_learned,
+                                                 account=self.account)
                                 self.live_fetcher = lf
                                 await lf.goto_live()
                                 self._last_live_reload = now
