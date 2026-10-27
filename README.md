@@ -39,12 +39,16 @@
 | 场景 | 做法 |
 |---|---|
 | **git 克隆后第一次跑(推荐)** | 双击 **`一键安装环境.bat`** — 自动定位 Python(没有就调 winget 装)→ 装 `requirements-lock.txt` → 装 Chromium → 检测 WebView2 / .NET / 前端文件,跑完直接问你要不要启动 |
-| **以后升级到最新版** | 双击 **`一键更新.bat`** — `git pull` 到最新 → 依赖清单变了才重装 → 提示重启。`data\` / `config.json` / `profiles\` **不会被覆盖** |
+| **以后升级到最新版** | 双击 **`一键更新.bat`** — 自动拉取最新代码(直连失败自动换国内镜像) → 依赖清单变了才重装 → 提示重启。`data\` / `config.json` / `profiles\` **不会被覆盖** |
 | 老流程(setup + start) | 双击 `setup.bat` 初始化(装依赖 + Playwright Chromium + 检测 WebView2),之后双击 `start.bat` 运行 |
 | 全新机器 / 无网络 | 用 `配置环境安装\一键安装.bat`(便携 Python 3.14 + 离线 wheels + Chromium 1223,详见该目录 `安装说明.md`;**此目录 1.1G,不入 git,需单独拷**) |
 | 已有 Python 环境 | `pip install -r requirements-lock.txt` → `playwright install chromium` → `python main.py` |
 
 > 三个脚本的关系:`一键安装环境.bat` 只解决「第一次跑起来」,可以重复跑(已装好的会跳过);`一键更新.bat` 只解决「升到最新版」,不改本地数据;`启动-SPHGJ.bat` 是日常启动入口,会自己判断用便携版 Python 还是系统 `python`,所以干净克隆的目录也能直接双击启动。
+
+> **连不上 github 怎么办**:`一键更新.bat` 会先直连 GitHub,失败后自动换两个国内镜像通道(`ghfast.top` / `gh-proxy.com`)重试,单个通道最多等 30 秒。三个都不通才会报错——这时看提示:能挂代理就设 `HTTPS_PROXY` 再重跑,完全上不了外网就去云盘下最新 zip 包解压覆盖(只覆盖程序文件,`data\` / `config.json` / `profiles\` 都保留)。
+
+> **提示「本机版本和远端不是同一条历史」**:说明这台机器是很早以前用 zip 包 + 自己 `git init` 装的,历史和仓库对不上。脚本会问要不要对齐,输入 `Y` 就自动 `git reset --hard` 到最新版——只替换程序文件,`data\` / `config.json` / `profiles\` 一律不动,账号不会掉。
 
 > **谁该用一键更新**:只有**从 git 克隆出来**的机器才用。程序实际跑的那台「运行主机」不要用——它的代码是由开发机投递同步的,`.git` 目录并不跟踪实际文件,在那里跑更新会去装 Git、改 `.git/config`,只会把状态搞乱。这类机器在项目根目录放一个空的 `.no_git_update`,`一键更新.bat` 见到它就只打印说明然后退出(该文件已在 `.gitignore` 里,不会传到别人机器上)。
 

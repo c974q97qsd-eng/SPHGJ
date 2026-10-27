@@ -330,33 +330,80 @@ echo.
 
 REM ==================== 2. 拉取最新版 ====================
 echo [2/5] 拉取最新代码 ...
-git fetch origin --prune
+
+REM 当前分支(取不到或处于分离头指针就用 master)
+set "BRANCH="
+for /f "delims=" %%i in ('git rev-parse --abbrev-ref HEAD 2^>nul') do set "BRANCH=%%i"
+if not defined BRANCH set "BRANCH=master"
+if /i "!BRANCH!"=="HEAD" set "BRANCH=master"
+
+REM 直连 GitHub。30 秒内低于 1000 B/s 就主动放弃,免得卡着不动
+set "GOTFETCH="
+set "VIA=GitHub 直连"
+echo   正在连接 github.com ...
+git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 fetch origin "!BRANCH!" --prune >nul 2>&1
+if not errorlevel 1 set "GOTFETCH=1"
+if defined GOTFETCH goto :fetch_done
+
+echo   [提示] 直连失败 - 常见原因是连接被重置,国内网络访问 github 经常这样
+echo          自动换国内镜像通道重试,请稍候,单个通道最多等 30 秒 ...
+echo.
+
+set "VIA=ghfast.top 镜像"
+call :try_mirror "https://ghfast.top/https://github.com/c974q97qsd-eng/SPHGJ.git" "!BRANCH!"
+if not errorlevel 1 set "GOTFETCH=1"
+if defined GOTFETCH goto :fetch_done
+
+set "VIA=gh-proxy.com 镜像"
+call :try_mirror "https://gh-proxy.com/https://github.com/c974q97qsd-eng/SPHGJ.git" "!BRANCH!"
+if not errorlevel 1 set "GOTFETCH=1"
+if defined GOTFETCH goto :fetch_done
+
+echo.
+echo   [错误] 所有通道都拉不到远程仓库,对号入座看是哪一种:
+echo.
+echo          当前远程地址: !ORIGIN!
+echo          1. 这台机器完全上不了外网: 换手机热点再重跑
+echo          2. 公司网络只放行代理: 先设好代理再重跑本脚本
+echo             set HTTPS_PROXY=http://代理地址:端口
+echo          3. 用的是 SSH 地址但本机没密钥: 换成 https
+echo             git remote set-url origin https://github.com/c974q97qsd-eng/SPHGJ.git
+echo          4. 以上都不行: 从云盘下载最新 zip 包,解压覆盖到本目录
+echo             只覆盖程序文件,data\ config.json profiles\ 都会保留
+goto :fail
+
+:fetch_done
+echo   [OK] 已取到最新代码,通道: !VIA!
+echo.
+
+REM 镜像通道不会更新 origin\分支 这个本地引用,所以统一用 FETCH_HEAD
+git merge --ff-only FETCH_HEAD
 if errorlevel 1 (
-    echo   [错误] 拉不到远程仓库,对号入座看是哪一种:
     echo.
-    echo          当前远程地址: !ORIGIN!
-    echo          1. 网络问题 - 这台机器访问不了 github.com
-    echo             先试: ping github.com
-    echo          2. 用的是 SSH 地址 (git@github.com:...) 但本机没有密钥
-    echo             要么把私钥放到 %USERPROFILE%\.ssh\,要么换成 https:
-    echo             git remote set-url origin https://github.com/c974q97qsd-eng/SPHGJ.git
-    echo          3. 仓库是私有的,https 需要 token - 换成上面的 SSH 方式即可
-    goto :fail
-)
-git pull --ff-only
-if errorlevel 1 (
+    echo   [错误] 没法直接快进到最新版,三种情况对号入座:
     echo.
-    echo   [错误] 更新被拒绝: 本地有文件被改过,和最新版冲突
-    echo          受影响文件如下:
-    git -c i18n.logOutputEncoding=gbk -c core.quotepath=false status --short
+    echo          A. 本机程序文件被改过,和最新版冲突。受影响文件:
+    git -c i18n.logOutputEncoding=gbk status --short
+    echo            处理: 想保留改动就先手工合并;不想要就 git stash 后重跑
     echo.
-    echo          处理办法(二选一):
-    echo            A. 想保留本地改动: 先手工合并,再执行 git pull
-    echo            B. 放弃本地改动: 执行 git stash 后重新双击本脚本
-    echo            C. 若提示 frontend\dist 里的文件将被覆盖
-    echo               旧版把前端产物当临时文件、没入库,直接删掉
-    echo               frontend\dist 整个目录再重跑本脚本,git 会自动还原
-    goto :fail
+    echo          B. 提示 frontend\dist 里文件将被覆盖 - 旧版没把前端产物入库
+    echo            处理: 删掉 frontend\dist 整个目录后重跑,git 会自动还原
+    echo.
+    echo          C. 本机版本和远端不是同一条历史 - 很早以前克隆的老仓库
+    echo            处理: 下面可以直接对齐到最新版。只替换程序文件,
+    echo                  data\ config.json profiles\ 一律不动,账号不会掉
+    echo.
+    set "ANS="
+    set /p "ANS=  要现在对齐到最新版吗? 输入 Y 回车确认,直接回车放弃: "
+    if /i not "!ANS!"=="Y" goto :fail
+    echo   正在对齐到最新版 ...
+    REM 输出静默: reset 会把 commit message 原样打到 UTF-8,936 控制台下是乱码
+    git reset --hard FETCH_HEAD >nul
+    if errorlevel 1 (
+        echo   [错误] 对齐失败,请把上面的报错截图给维护者
+        goto :fail
+    )
+    echo   [OK] 已对齐到最新版
 )
 for /f %%i in ('git rev-parse --short HEAD 2^>nul') do set "NEW=%%i"
 echo.
@@ -366,10 +413,11 @@ if "!OLD!"=="!NEW!" (
     goto :after_update
 )
 echo   本次更新 !OLD! 到 !NEW! :
-git -c i18n.logOutputEncoding=gbk -c core.quotepath=false --no-pager log --oneline "!OLD!..!NEW!"
+git -c i18n.logOutputEncoding=gbk --no-pager log --oneline "!OLD!..!NEW!"
 echo.
 echo   改动文件:
-git -c i18n.logOutputEncoding=gbk -c core.quotepath=false --no-pager diff --name-only "!OLD!" "!NEW!"
+git -c i18n.logOutputEncoding=gbk --no-pager diff --name-only "!OLD!" "!NEW!"
+echo   上面带 \346\201 这类编码的是中文文件名,在 936 控制台下正常显示就是这样
 echo.
 
 REM ==================== 3. 依赖按需重装 ====================
@@ -442,6 +490,17 @@ set /p "GO=是否现在启动 SPHGJ ? 直接回车=启动, 输入 N=不启动: "
 if /i "%GO%"=="N" goto :end
 call "%ROOT%启动-SPHGJ.bat"
 goto :end
+
+:try_mirror
+REM %1 = 镜像完整地址, %2 = 分支名
+echo   - 尝试 %~1
+git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 fetch "%~1" "%~2" --no-tags >nul 2>&1
+if errorlevel 1 (
+    echo     [失败] 这个通道不通
+    exit /b 1
+)
+echo     [成功]
+exit /b 0
 
 :fail
 echo.
@@ -610,7 +669,8 @@ def main():
 
     with open(os.path.join(ROOT, "一键更新.bat"), "rb") as f:
         b = f.read().decode("gbk")
-    for key in ["git fetch origin --prune", "git pull --ff-only", "status --short",
+    for key in ["fetch origin \"!BRANCH!\" --prune", "git merge --ff-only FETCH_HEAD",
+                ":try_mirror", "status --short",
                 "requirements", "frontend\\dist", "netstat -ano", ":8712",
                 "不会被覆盖"]:
         chk(key in b, f"一键更新.bat 含关键片段: {key}")
@@ -631,6 +691,15 @@ def main():
         bad = [ln for ln in txt.splitlines()
                if ln.strip().lower().startswith("echo") and ("(" in ln or ")" in ln)]
         chk(not bad, f"{name} 的 echo 行无半角括号" + ("" if not bad else f" -> {bad[:2]}"))
+
+    upd = io.open(os.path.join(ROOT, "一键更新.bat"), encoding="gbk").read()
+    chk("\n:fail\n" in upd and "\n::fail\n" not in upd,
+        "一键更新.bat 的 :fail 是标签不是注释")
+    chk("\n:try_mirror\n" in upd, "一键更新.bat 的 :try_mirror 标签正常")
+    chk("ghfast.top" in upd and "gh-proxy.com" in upd,
+        "一键更新.bat 含两个国内镜像回退通道")
+    chk(":try_mirror" in upd and "git reset --hard FETCH_HEAD" in upd,
+        "一键更新.bat 含镜像子过程与历史跑偏对齐")
 
     print("\nRESULT:", "ALL PASS" if ok else "HAS FAILURE")
     return 0 if ok else 1
