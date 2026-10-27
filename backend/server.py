@@ -38,6 +38,7 @@ from .post_fetcher import PostFetcher
 from .publish_queue import PublishQueue
 from .remote_view import RemoteRegistry
 from .browser import reap_profile_orphans
+from . import platforms                          # rev56: 平台维度抽象（wx / dy）
 from .douyin.manager import DouyinManager   # rev56: 抖音（platform=dy）
 from .local_window import local_windows, sweep_stale_view_profiles
 from . import restart as restart_mod
@@ -1561,6 +1562,33 @@ def _fid_of(account_id):
     return _resolve_finder(account_id) or ("acct:" + (account_id or "unknown"))
 
 
+def _comment_platform(comment_id, finder_id=None):
+    """这条评论属于哪个平台。**库里那一行最权威**（一条评论只属于一个作品、一个平台）。
+
+    查不到这一行（比如前端拿的是过期 id）才用 finder_id 反查；
+    再查不到按视频号处理 —— 保持改动前的老行为，不因为加了抖音就把老路径改坏。
+    """
+    row = storage.get_comment(comment_id) or {}
+    p = row.get("platform")
+    if p:
+        return platforms.normalize_platform(p), row
+    if finder_id:
+        p = storage.platform_of(finder_id)
+        if p:
+            return platforms.normalize_platform(p), row
+    return platforms.PLATFORM_WX, row
+
+
+def _dy_ready():
+    """抖音写通道就绪判定。没挂页面时必须明确报错，绝不能静默走视频号通道。"""
+    st = dy_manager.status()
+    if not st.get("configured"):
+        raise HTTPException(400, "抖音账号未配置（config 里没有 platform=dy 的账号）")
+    if not st.get("page_ready"):
+        raise HTTPException(400, "抖音页面未就绪：需要先挂载已登录的浏览器（/api/dy/attach）")
+    return st
+
+
 def _comment_worker(finder_id=None, account_id=None):
     """评论写操作通道:先按视频号找当前登录着它的卡片,再退回前端指定的卡片。
 
@@ -1831,6 +1859,31 @@ async def batch_delete_comments(body: schemas.BatchDeleteBody):
     for item in body.items:
         # 归属按视频号找登录卡片:评论行上的 account_id 可能已是被删掉的旧卡片
         fid = (getattr(item, "finder_id", None) or "").strip() or _fid_of(item.account_id)
+        # 抖音评论走抖音通道（同一条批量删除里可能混着两个平台的评论）
+        plat, crow = _comment_platform(item.comment_id, fid)
+        if plat == platforms.PLATFORM_DY:
+            try:
+                st = _dy_ready()
+                aweme_id = str(item.export_id or (crow or {}).get("export_id") or "")
+                env = await dy_manager.delete_comment(item.comment_id, aweme_id)
+                if not env.get("__ok"):
+                    failed.append({"comment_id": item.comment_id,
+                                   "error": "删除失败: %s" % (env.get("__msg") or env.get("__err"))})
+                    continue
+                cinfo = crow or {}
+                storage.delete_comment(item.comment_id)
+                storage.log_delete(cinfo.get("finder_id") or fid, item.comment_id,
+                                   cinfo.get("nickname"), cinfo.get("content"),
+                                   "手动删除", aweme_id, st.get("account_id") or "",
+                                   platform="dy")
+                await hub.emit("comment_deleted", {"comment_id": item.comment_id,
+                                                   "platform": "dy"})
+                deleted += 1
+            except HTTPException as e:
+                failed.append({"comment_id": item.comment_id, "error": str(e.detail)})
+            except Exception as e:
+                failed.append({"comment_id": item.comment_id, "error": str(e)})
+            continue
         w = _comment_worker(fid, item.account_id)
         if not w or not w.logged_in:
             failed.append({"comment_id": item.comment_id,
@@ -1869,6 +1922,18 @@ async def batch_delete_comments(body: schemas.BatchDeleteBody):
 @app.post("/api/comments/{comment_id}/reply")
 async def reply_comment(comment_id: str, body: schemas.ManualReply):
     fid = (body.finder_id or "").strip() or _fid_of(body.account_id)
+    plat, crow = _comment_platform(comment_id, fid)
+    if plat == platforms.PLATFORM_DY:
+        st = _dy_ready()
+        aweme_id = str((crow or {}).get("export_id") or "")
+        env = await dy_manager.reply(comment_id, aweme_id, body.content)
+        if not env.get("__ok"):
+            raise HTTPException(502, "回复失败: %s" % (env.get("__msg") or env.get("__err")))
+        await hub.emit("comment_replied", {"comment_id": comment_id,
+                                          "finder_id": (crow or {}).get("finder_id") or fid,
+                                          "account_id": st.get("account_id") or "",
+                                          "platform": "dy"})
+        return {"ok": True, "platform": "dy"}
     w = _comment_worker(fid, body.account_id)
     if not w or not w.logged_in:
         raise HTTPException(400, "该视频号没有已启动/已登录的账号卡片")
@@ -1907,6 +1972,20 @@ async def reply_comment(comment_id: str, body: schemas.ManualReply):
 @app.delete("/api/comments/{comment_id}")
 async def delete_comment(comment_id: str, body: schemas.DeleteCommentBody):
     fid = (body.finder_id or "").strip() or _fid_of(body.account_id)
+    plat, crow = _comment_platform(comment_id, fid)
+    if plat == platforms.PLATFORM_DY:
+        st = _dy_ready()
+        aweme_id = str(body.export_id or (crow or {}).get("export_id") or "")
+        env = await dy_manager.delete_comment(comment_id, aweme_id)
+        if not env.get("__ok"):
+            raise HTTPException(502, "删除失败: %s" % (env.get("__msg") or env.get("__err")))
+        cinfo = crow or {}
+        _fid = cinfo.get("finder_id") or fid
+        storage.delete_comment(comment_id)
+        storage.log_delete(_fid, comment_id, cinfo.get("nickname"), cinfo.get("content"),
+                           "手动删除", aweme_id, st.get("account_id") or "", platform="dy")
+        await hub.emit("comment_deleted", {"comment_id": comment_id, "platform": "dy"})
+        return {"ok": True, "platform": "dy"}
     w = _comment_worker(fid, body.account_id)
     if not w or not w.logged_in:
         raise HTTPException(400, "该视频号没有已启动/已登录的账号卡片")
@@ -1932,6 +2011,11 @@ async def delete_comment(comment_id: str, body: schemas.DeleteCommentBody):
 @app.post("/api/comments/{comment_id}/pin")
 async def pin_comment(comment_id: str, body: schemas.PinCommentBody):
     fid = (body.finder_id or "").strip() or _fid_of(body.account_id)
+    plat, _crow = _comment_platform(comment_id, fid)
+    if plat == platforms.PLATFORM_DY:
+        # 抖音评论置顶接口还没探明（作品置顶是另一条 item/top）。宁可明确报错，
+        # 也不能让它悄悄走视频号通道然后报「没有已登录的卡片」误导排查。
+        raise HTTPException(400, "抖音评论置顶接口尚未探明，暂不支持")
     w = _comment_worker(fid, body.account_id)
     if not w or not w.logged_in:
         raise HTTPException(400, "该视频号没有已启动/已登录的账号卡片")

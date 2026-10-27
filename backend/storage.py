@@ -665,12 +665,15 @@ class Storage:
         c = self._conn()
         try:
             r = c.execute(
-                "SELECT finder_id,account_id,export_id,nickname,content FROM comments WHERE comment_id=?",
+                "SELECT finder_id,account_id,export_id,nickname,content,platform "
+                "FROM comments WHERE comment_id=?",
                 (comment_id,)).fetchone()
             if not r:
                 return None
+            # platform 一定要回：评论写通道要靠它分流（抖音 / 视频号），
+            # 拿不到就会把抖音评论错发到视频号通道。
             return dict(finder_id=r[0] or "", account_id=r[1], export_id=r[2],
-                        nickname=r[3], content=r[4])
+                        nickname=r[3], content=r[4], platform=(r[5] or "wx"))
         finally:
             c.close()
 
@@ -746,14 +749,15 @@ class Storage:
         total = c.execute(f"SELECT COUNT(*) FROM comments{clause}", args).fetchone()[0]
         rows = c.execute(
             f"""SELECT finder_id,account_id,export_id,comment_id,nickname,content,head_url,
-                      create_time,like_count,replied,fetched_at
+                      create_time,like_count,replied,fetched_at,platform
                FROM comments{clause}
                ORDER BY create_time DESC LIMIT ? OFFSET ?""",
             args + [limit, offset]).fetchall()
         c.close()
         items = [dict(finder_id=r[0] or "", account_id=r[1], export_id=r[2], comment_id=r[3],
                       nickname=r[4], content=r[5], head_url=r[6], create_time=r[7], like_count=r[8],
-                      replied=bool(r[9]), fetched_at=r[10]) for r in rows]
+                      replied=bool(r[9]), fetched_at=r[10],
+                      platform=(r[11] or "wx")) for r in rows]
         return items, total
 
     def comment_finders(self):
@@ -843,15 +847,19 @@ class Storage:
 
     # ---------- 自动删除记录(关键字命中删除日志,供删除记录卡片展示) ----------
     def log_delete(self, finder_id, comment_id, nickname, content, keyword, export_id,
-                   account_id=None):
-        """写删除记录。归属 = finder_id(视频号),account_id 只记执行删除的卡片。"""
+                   account_id=None, platform="wx"):
+        """写删除记录。归属 = finder_id(视频号 / 抖音 sec_uid),account_id 只记执行删除的卡片。
+
+        platform 必须显式传：delete_logs 表 rev56 加了 platform 列，
+        但写入口一直默认 'wx'，抖音的删除记录会被错标成视频号。
+        """
         c = self._conn()
         try:
             c.execute("""INSERT INTO delete_logs
-                (finder_id,account_id,comment_id,export_id,nickname,content,keyword,deleted_at)
-                VALUES(?,?,?,?,?,?,?,?)""",
+                (finder_id,account_id,comment_id,export_id,nickname,content,keyword,deleted_at,platform)
+                VALUES(?,?,?,?,?,?,?,?,?)""",
                       (finder_id, account_id, comment_id, export_id, nickname, content, keyword,
-                       datetime.now().isoformat()))
+                       datetime.now().isoformat(), platform or "wx"))
             c.commit()
         finally:
             c.close()
