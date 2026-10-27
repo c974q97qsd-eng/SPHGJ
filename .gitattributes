@@ -1,0 +1,9 @@
+# Windows 批处理必须用 CRLF 换行。
+# cmd.exe 解析 goto 标签、多行 if ( ) 块时对纯 LF 不可靠（会报
+# 「系统找不到指定的批处理标签」或「此时不应有 ...」）。
+# 这里显式指定 eol=crlf：入库仍以 LF 存储，但检出到工作区一律转 CRLF，
+# 不受用户机器 core.autocrlf 设置影响。
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 运行期数据、登录态、本地配置一律不入库（详细规则见 .gitignore）

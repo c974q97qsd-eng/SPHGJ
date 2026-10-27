@@ -341,7 +341,7 @@ REM 直连 GitHub。30 秒内低于 1000 B/s 就主动放弃,免得卡着不动
 set "GOTFETCH="
 set "VIA=GitHub 直连"
 echo   正在连接 github.com ...
-git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 fetch origin "!BRANCH!" --prune >nul 2>&1
+git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 fetch origin "+refs/heads/!BRANCH!:refs/remotes/origin/!BRANCH!" >nul 2>&1
 if not errorlevel 1 set "GOTFETCH=1"
 if defined GOTFETCH goto :fetch_done
 
@@ -376,8 +376,27 @@ goto :fail
 echo   [OK] 已取到最新代码,通道: !VIA!
 echo.
 
-REM 镜像通道不会更新 origin\分支 这个本地引用,所以统一用 FETCH_HEAD
-git merge --ff-only FETCH_HEAD
+REM rev51: 不再直接引用 FETCH_HEAD —— 它只是个临时文件,fetch 被打断
+REM 或历史上从没成功 fetch 过时就根本不存在,git 会报
+REM   fatal: ambiguous argument 'FETCH_HEAD'
+REM 现在的做法: fetch 时已显式写到 refs\remotes\origin\分支,优先用它。
+set "TARGET=refs/remotes/origin/!BRANCH!"
+git rev-parse --verify "!TARGET!" >nul 2>&1
+if not errorlevel 1 goto :have_target
+REM 老版本 git 或不支持该 refspec 时的兜底:退回临时文件
+git rev-parse --verify FETCH_HEAD >nul 2>&1
+if errorlevel 1 (
+    echo.
+    echo   [错误] 已经连上了远程,但本地找不到要更新的版本引用
+    echo          这说明拉取过程被中途打断了。请重跑一次本脚本。
+    echo          如果反复出现: 从云盘下载最新 zip 包解压覆盖到本目录
+    echo.
+    goto :fail
+)
+set "TARGET=FETCH_HEAD"
+
+:have_target
+git merge --ff-only "!TARGET!"
 if errorlevel 1 (
     echo.
     echo   [错误] 没法直接快进到最新版,三种情况对号入座:
@@ -398,7 +417,7 @@ if errorlevel 1 (
     if /i not "!ANS!"=="Y" goto :fail
     echo   正在对齐到最新版 ...
     REM 输出静默: reset 会把 commit message 原样打到 UTF-8,936 控制台下是乱码
-    git reset --hard FETCH_HEAD >nul
+    git reset --hard "!TARGET!" >nul
     if errorlevel 1 (
         echo   [错误] 对齐失败,请把上面的报错截图给维护者
         goto :fail
@@ -494,7 +513,7 @@ goto :end
 :try_mirror
 REM %1 = 镜像完整地址, %2 = 分支名
 echo   - 尝试 %~1
-git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 fetch "%~1" "%~2" --no-tags >nul 2>&1
+git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 fetch "%~1" "+refs/heads/%~2:refs/remotes/origin/%~2" --no-tags >nul 2>&1
 if errorlevel 1 (
     echo     [失败] 这个通道不通
     exit /b 1
@@ -669,7 +688,8 @@ def main():
 
     with open(os.path.join(ROOT, "一键更新.bat"), "rb") as f:
         b = f.read().decode("gbk")
-    for key in ["fetch origin \"!BRANCH!\" --prune", "git merge --ff-only FETCH_HEAD",
+    for key in ["fetch origin \"+refs/heads/!BRANCH!:refs/remotes/origin/!BRANCH!\"",
+                "git merge --ff-only \"!TARGET!\"", ":have_target",
                 ":try_mirror", "status --short",
                 "requirements", "frontend\\dist", "netstat -ano", ":8712",
                 "不会被覆盖"]:
@@ -698,8 +718,18 @@ def main():
     chk("\n:try_mirror\n" in upd, "一键更新.bat 的 :try_mirror 标签正常")
     chk("ghfast.top" in upd and "gh-proxy.com" in upd,
         "一键更新.bat 含两个国内镜像回退通道")
-    chk(":try_mirror" in upd and "git reset --hard FETCH_HEAD" in upd,
+    chk(":try_mirror" in upd and "git reset --hard \"!TARGET!\"" in upd,
         "一键更新.bat 含镜像子过程与历史跑偏对齐")
+    # rev51 核心不变量: merge / reset 的实参不能再是裸 FETCH_HEAD
+    chk("merge --ff-only FETCH_HEAD" not in upd,
+        "一键更新.bat 的 merge 不再用裸 FETCH_HEAD")
+    chk("reset --hard FETCH_HEAD" not in upd,
+        "一键更新.bat 的 reset 不再用裸 FETCH_HEAD")
+    chk(":refs/remotes/origin/" in upd,
+        "一键更新.bat 的 fetch 显式落远端跟踪引用")
+    # rev51b: 显式 refspec 与 --prune 同用会把 ref 删掉（实测），必须组合禁用
+    chk("refs/remotes/origin/!BRANCH!\" --prune" not in upd,
+        "一键更新.bat 的显式 refspec 未与 --prune 混用")
 
     print("\nRESULT:", "ALL PASS" if ok else "HAS FAILURE")
     return 0 if ok else 1

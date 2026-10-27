@@ -260,7 +260,9 @@ class LiveFetcher:
             cached = _load_spec_cache(account_id)
             if cached:
                 self._learned = cached
-                logger.info(f"[live:{account_id}] 从磁盘缓存载入已学 API 规格: {sorted(cached)}")
+                # rev51: 每次 reconstruct 都会走这里(轻量探测每 120s × N 账号),
+                # 原来打 INFO 会淹掉真正有用的探测结果(实测 600 行日志里 109 条是这个)。
+                logger.debug(f"[live:{account_id}] 从磁盘缓存载入已学 API 规格: {sorted(cached)}")
         self._inherited = bool(self._learned)              # 规格是否来自继承/缓存(用于日志区分)
         self._learning = not self._learned                 # 已继承则无需再学
         self._learn_deadline = 0.0      # 学习超时阈值(>此时间未学到则回退 CDP)
