@@ -1,5 +1,6 @@
 playwright>=1.40
 fastapi>=0.110
+httpx>=0.27          # rev48: 直播探测纯 HTTP 直连(未装则自动退回标准库 urllib)
 uvicorn>=0.29
 websockets>=12
 pywebview>=5.0

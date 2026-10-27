@@ -20,6 +20,19 @@ export interface AccountStatus {
   logout_at?: string | null
   locked: boolean
   locked_name: string
+  /** rev48: 最近一次直播探测(纯 HTTP 或浏览器路径);从未探测过为 null */
+  probe?: {
+    ts: number | null
+    live: boolean | null
+    reason: string | null
+    status: number | null
+    /** http = 纯 HTTP 探测(没启浏览器) */
+    via: string | null
+    borrowed_spec?: boolean
+    started_browser: boolean
+    /** no_cookie / expired(300333) / badauth …;可用时为空串 */
+    why_unavailable: string
+  } | null
 }
 
 export interface EngineStatus {

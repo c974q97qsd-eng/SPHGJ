@@ -155,6 +155,20 @@ function AccountCard({ acc, onRefresh }: { acc: AccountStatus; onRefresh: () => 
             <div className="flex items-center gap-3 text-xs text-muted-foreground">
               {acc.wx_name && <span>微信: {acc.wx_name}</span>}
               <span className="font-mono">ID: {acc.id}</span>
+              {/* rev48: 直播探测走的是纯 HTTP 还是浏览器;登录态失效直接露在这里,
+                  不用再去翻日志才知道为什么探测不灵 */}
+              {acc.probe?.via === "http" && (
+                <span className="text-emerald-600"
+                  title={`纯 HTTP 探测(未启浏览器):status=${acc.probe.status ?? "-"},依据=${acc.probe.reason ?? "-"}`}>
+                  探测直连
+                </span>
+              )}
+              {acc.probe?.why_unavailable === "expired" && (
+                <span className="text-amber-600"
+                  title="纯 HTTP 探测返回 errCode=300333:登录态已失效,请重新扫码">
+                  需重新扫码
+                </span>
+              )}
             </div>
           </div>
           <div className="flex items-center gap-1">

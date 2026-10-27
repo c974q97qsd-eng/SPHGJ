@@ -18,6 +18,7 @@ from .comment_fetcher import CommentFetcher
 from .auto_reply import AutoReply
 from .auto_delete import AutoDelete
 from .live_fetcher import LiveFetcher, judge_live, _load_spec_cache
+from . import live_probe_http
 from .auto_comment import AutoCommenter
 from .login_capture import LoginSession, clear_login_state
 from .browser import launch_stealth, close_context_safely, reap_profile_orphans
@@ -111,6 +112,11 @@ class AccountWorker:
         # 锁内再确认一次 live_fetcher,避免并发探测(一个持 context 探测、另一个
         # 在同一 context 上新开 live_page,而后者不经过 _browser_lock)。
         self._probe_lock = asyncio.Lock()
+        # rev48: 纯 HTTP 探测的"暂停尝试"截止时间。cookie 没了 / sessionid 过期时,
+        # 3 分钟内不会自己恢复,没必要每轮都白等一次 8 秒超时后才回落浏览器路径。
+        self._http_block_until = 0.0
+        self._http_block_logged = ""
+        self._http_last_why = ""        # 最近一次 HTTP 探测不可用的原因(no_spec/no_cookie/expired…)
 
     async def start(self, playwright, headless=True):
         self._pw = playwright
@@ -487,13 +493,80 @@ class AccountWorker:
             lf = None
             txt = None
 
-    async def _probe_light(self):
-        """轻量探测:一次 HTTP,不开直播大屏页。返回判据 dict 或 None(不可用)。
+    async def _probe_via_http(self):
+        """rev48: L0 纯 HTTP 探测 —— 不碰浏览器、不拿 _browser_lock、不建 context。
 
-        L0 已有 context(正在抓评论/手动操作)-> 直接 ctx.request,约 0.3s,零新增开销;
-        L1 没有 context -> 只建 context 探完即关,约 3~5s(远小于开大屏页的 30~140s);
-        两条路都失败 -> 返回 None,调用方退回完整检测。
+        为什么这条能成立见 `backend/live_probe_http.py` 的文件头(2026-10-28 实测:
+        HTTP 201 / errCode=0 / 1.0s / wxNickname 与账号对得上)。一句话:
+        接口规格在 data/live_api_spec.json,登录态在 storage_state.cookies,两样凑齐
+        就能直发 check_live_status,不需要浏览器。
+
+        cookie 用 config 里的**最新**账号对象取(重新扫码后 storage_state 会被换掉),
+        拿不到才回退 self.account —— 否则扫码前的旧 worker 会一直以为没 cookie。
         """
+        if time.time() < self._http_block_until:
+            return None
+        acc = self.account
+        try:
+            for a in (self.config.get("accounts") or []):
+                if a.get("id") == self.account.get("id"):
+                    acc = a
+                    break
+        except Exception:
+            pass
+        diag = {}
+        try:
+            res = await live_probe_http.probe_http(acc, diag)
+        except Exception as e:
+            logger.debug(f"[{self.account['id']}] HTTP 探测异常: {e}")
+            return None
+        if res is not None:
+            self._http_block_until = 0.0
+            self._http_block_logged = ""
+            return res
+        why = diag.get("why") or ""
+        self._http_last_why = why
+        if why in ("no_cookie", "badauth", "expired"):
+            # 这两类 3 分钟内不会自己恢复:与其每轮白等一次超时,不如先暂停 HTTP,
+            # 直接走浏览器路径(那边有真会话,能判)。cookie 一被重新扫码写入,
+            # storage_state 变了,下一轮 build_cookie_header 就有值了 -> 自动恢复。
+            self._http_block_until = time.time() + 180
+            if self._http_block_logged != why:
+                self._http_block_logged = why
+                if why == "no_cookie":
+                    logger.warning(f"[{self.account['id']}] HTTP 探测不可用:该账号没有已保存的"
+                                   f"登录态(storage_state 无 cookie),改用浏览器路径探测"
+                                   f"(重新扫码后会自动恢复纯 HTTP 探测)")
+                elif why == "expired":
+                    logger.warning(f"[{self.account['id']}] HTTP 探测被拒 errCode=300333:"
+                                   f"登录态已失效(sessionid 过期),该账号需要重新扫码;"
+                                   f"本次先按未登录处理,不做浏览器探测")
+                else:
+                    logger.warning(f"[{self.account['id']}] HTTP 探测被拒(errCode={diag.get('code')}),"
+                                   f"改用浏览器路径探测")
+        elif why == "request_error":
+            logger.debug(f"[{self.account['id']}] HTTP 探测请求失败: {diag.get('err')}")
+        return None
+
+    async def _probe_light(self):
+        """轻量探测。返回判据 dict 或 None(不可用)。
+
+        L0 纯 HTTP(rev48):用 storage_state 的 cookie + 已学到的接口规格直发
+           check_live_status,实测 ~1s,**不启任何浏览器进程**。这是常态路径。
+        L1 已有 context(正在抓评论/手动操作)-> ctx.request 重放,约 0.3s,零新增开销;
+        L2 没有 context -> 只建 context 探完即关,约 3~6s(远小于开大屏页的 30~140s)。
+        L0~L2 全失败 -> 返回 None,调用方退回完整检测(开直播大屏页)。
+
+        L1/L2 不是冗余:L0 要求 storage_state 里有 cookie,没扫过码的账号没有;
+        而且 cookie 真失效时,只有真浏览器的现取会话还可能判得出来。
+        """
+        hit = await self._probe_via_http()
+        if hit is not None:
+            return hit
+        # 借不到任何规格、手上又没有现成 context:L1/L2 也发不出请求(重放同样要规格),
+        # 起一个 Chromium 纯属浪费 —— 直接交给完整检测去学规格(学完落盘,下轮 HTTP 就能用)
+        if self._http_last_why == "no_spec" and self.context is None:
+            return None
         try:
             async with self._browser_lock:
                 if self.context is not None:
@@ -504,7 +577,12 @@ class AccountWorker:
                     logger.debug(f"[{self.account['id']}] 轻量探测开浏览器失败: {e}")
                     return None
                 try:
-                    return await self._probe_via_context(ctx)
+                    res = await self._probe_via_context(ctx)
+                    if res is not None:
+                        # 标记"这一轮真的拉起了 Chromium" —— 节拍器据此降频,
+                        # 别让 cookie 失效的账号被高频探测反复开浏览器(母本 OOM 过)
+                        res["started_browser"] = True
+                    return res
                 finally:
                     try:
                         await close_context_safely(ctx, self.account.get("profile_dir"),
@@ -550,8 +628,8 @@ class AccountWorker:
             self._last_probe = probe
             self._probe_since_full += 1
             if probe["live"]:
-                logger.info(f"[{self.account['id']}] 轻量探测:在播(依据={probe['reason']}),"
-                            f"打开直播大屏页取流")
+                logger.info(f"[{self.account['id']}] 轻量探测:在播(依据={probe['reason']}, "
+                            f"via={probe.get('via')}),打开直播大屏页取流")
                 return await self._open_full()
             # 未播:轻量探测不开大屏页,直接收工。但每 N 次(默认 5)落一次完整检测,
             # 让 DOM 文本这条"接口不认、页面认"的兜底判据仍有出场机会。
@@ -564,7 +642,8 @@ class AccountWorker:
             # INFO 而非 DEBUG:轻量探测是 rev47 的核心链路,上线初期必须能在 run.log
             # 直接看到它的节拍(每账号默认 300s 一条),确认它在跑而不是在空转。
             logger.info(f"[{self.account['id']}] 轻量探测:未播(依据={probe['reason']},"
-                        f"status={probe.get('status')}, 第 {self._probe_since_full}/{full_every} 次)")
+                        f"status={probe.get('status')}, via={probe.get('via')}, "
+                        f"第 {self._probe_since_full}/{full_every} 次)")
             return False
         return await self._open_full()
 
@@ -865,11 +944,17 @@ class AccountWorker:
         """rev47: 全账号唯一的直播探测节拍器。
 
         频率解耦:评论抓取仍是 fetch_interval_sec(600s,夜间 ×3),直播探测走独立的
-        live_probe_interval_sec(默认 300s),【不再乘夜间倍率】—— 直播本来就集中在
+        live_probe_interval_sec(默认 120s),【不再乘夜间倍率】—— 直播本来就集中在
         夜里,原来的 ×3 让开播最坏 30 分钟才发现。
         在播期间本循环只是睡(交给 _live_loop),不参与任何探测。
+
+        rev48 快慢双档:纯 HTTP 探测约 1s、零浏览器,所以默认档位从 300s 提到 120s;
+        但如果上一轮是靠【新建 Chromium】(L2)才判出来的(典型:账号没有 storage_state
+        或 sessionid 过期),就退回 live_probe_slow_interval_sec(默认 300s),
+        避免高频开浏览器 —— 母本 OOM 过一次,这个代价必须让频率来背。
         """
-        interval = max(30, int(self.config.get("live_probe_interval_sec", 300)))
+        interval = max(30, int(self.config.get("live_probe_interval_sec", 120)))
+        slow_interval = max(interval, int(self.config.get("live_probe_slow_interval_sec", 300)))
         boost_interval = max(5, int(self.config.get("live_probe_boost_interval_sec", 20)))
         gap = float(self.config.get("live_probe_min_gap_sec", 60))
         await asyncio.sleep(random.uniform(0, 20))   # 多账号错峰,避免同时拉起浏览器
@@ -879,7 +964,8 @@ class AccountWorker:
                 self._probe_wake.clear()
                 if self.live_fetcher is None and self.logged_in:
                     boost = time.time() < self._probe_boost_until
-                    wait = boost_interval if boost else interval
+                    costly = bool((self._last_probe or {}).get("started_browser"))
+                    wait = boost_interval if boost else (slow_interval if costly else interval)
                     # 节流:抓取周期可能刚顺带探过,别立刻再探一次
                     if time.time() - (self._last_probe_ts or 0) >= gap:
                         await self._probe_and_maybe_open()
@@ -1876,6 +1962,27 @@ class AccountManager:
             "logout_at": acc.get("logout_at"),
             "locked": bool(acc.get("locked_finder_id") or acc.get("locked_name")),
             "locked_name": acc.get("locked_name", ""),
+            # rev48: 最近一次直播探测的结果。以前想知道"刚才到底探了没、走的哪条路"
+            # 只能翻母本 17MB 的 GBK 日志,现在卡片上就能看。
+            "probe": self._probe_view(w),
+        }
+
+    @staticmethod
+    def _probe_view(w):
+        """rev48: 探测状态视图。via=http 表示这轮是纯 HTTP(没起浏览器)。"""
+        p = (getattr(w, "_last_probe", None) or {}) if w else {}
+        why = (getattr(w, "_http_last_why", "") or "") if w else ""
+        if not p and not why:
+            return None
+        return {
+            "ts": p.get("ts"),
+            "live": p.get("live"),
+            "reason": p.get("reason"),
+            "status": p.get("status"),
+            "via": p.get("via"),
+            "borrowed_spec": p.get("borrowed_spec"),
+            "started_browser": bool(p.get("started_browser")),
+            "why_unavailable": why,
         }
 
     async def stop_all(self):

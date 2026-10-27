@@ -12,6 +12,8 @@
 # ---- 直接依赖 ----
 playwright==1.60.0
 fastapi==0.138.1
+httpx==0.28.1
+httpcore==1.0.9
 uvicorn==0.49.0
 websockets==16.0
 pywebview==6.2.1
