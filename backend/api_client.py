@@ -44,6 +44,13 @@ class WxApiClient:
 
     def __init__(self, page, account, config=None, storage=None):
         self.page = page
+        # rev53: 保留创建时的账号引用。_latest_account() 的兜底分支 return self.account,
+        # 但这个方法从 rev50 起就没人赋值过 —— config["accounts"] 里查不到该 id 时
+        # 直接抛 AttributeError(_post_via_http 里没有 try 兜),而 _post 的注释写的是
+        # 「任何 HTTP 侧异常一律回退浏览器」,实际会炸穿整轮抓取。
+        # 触发条件:account_id 为空(新卡片未绑定) / 账号被改名或删除 / 测试桩只传
+        # 局部 config。线上因为 config 里都能查到所以一直没暴露。
+        self.account = account or {}
         self.aid = account.get("_aid", "")
         self.finder_id = account.get("_log_finder_id", "")
         self.account_id = account.get("id", "")
@@ -248,12 +255,12 @@ class WxApiClient:
         读操作: 只认「成功」,任何异常都退浏览器重试(幂等)。
         写操作: 见 _http_give_up —— 除 no_cookie 外一律不重试,避免重复提交。
         """
-        acc = self._latest_account()
-        # _aid 每次登录都会变;URL 是早先拼的,这里按最新值纠正
-        aid = (acc.get("_aid") or "").strip()
-        if aid and aid != self.aid:
-            url = re.sub(r"_aid=[^&]+", "_aid=" + aid, url, count=1)
         try:
+            acc = self._latest_account()
+            # _aid 每次登录都会变;URL 是早先拼的,这里按最新值纠正
+            aid = (acc.get("_aid") or "").strip()
+            if aid and aid != self.aid:
+                url = re.sub(r"_aid=[^&]+", "_aid=" + aid, url, count=1)
             resp = await wx_http.post_json(acc, url, body, page_url=page_url, timeout=30)
         except Exception as e:
             return self._http_give_up("exception:" + repr(e)[:60], path,
