@@ -1068,8 +1068,8 @@ class AccountManager:
                 w.start_loop()
                 w.start_live_loop()
         await self._emit("engine_status", self.status_snapshot())
-        # 失效账号:后端自动依次弹 headed 扫码窗口,无需用户手动点启动。
-        # rev17: 软重启时传 auto_relogin=False —— 自动重启不应擅自弹扫码窗口打扰用户,
+        # 失效账号:后端自动依次推网页二维码,无需用户手动点启动。
+        # rev17: 软重启时传 auto_relogin=False —— 自动重启不应擅自开始扫码打扰用户,
         # 未登录账号保持原状,仍可由用户在界面上手动启动。
         if auto_relogin:
             for acc_id in expired:
@@ -1143,8 +1143,11 @@ class AccountManager:
         await self._emit("engine_status", self.status_snapshot())
         return w
 
-    async def start_relogin(self, account_id, auto=False, on_finished=None, headed=True):
-        """已存在账号重新扫码登录:复用原 profile_dir(headed),成功后更新原账号字段。
+    async def start_relogin(self, account_id, auto=False, on_finished=None, headed=False):
+        """已存在账号重新扫码登录:复用原 profile_dir,成功后更新原账号字段。
+
+        rev40: 默认 headless + 网页二维码推送(本机也不再弹窗口);
+        只有显式 headed=True(前端点「本机窗口」或配置 login_popup_window)才弹浏览器。
 
         auto=True 用于失效账号自动依次扫码:on_finished 在终态回调以推进队列。
         """
@@ -1174,7 +1177,7 @@ class AccountManager:
 
     # ---------- 失效账号自动依次扫码 ----------
     async def enqueue_auto_relogin(self, account_id):
-        """失效账号入队自动 relogin(headed 弹窗依次扫码);无活跃项时立即弹下一个。"""
+        """失效账号入队自动 relogin(网页二维码依次扫);无活跃项时立即开始下一个。"""
         if not account_id or account_id in self._relogin_queue or account_id == self._relogin_active_acc:
             return
         self._relogin_queue.append(account_id)

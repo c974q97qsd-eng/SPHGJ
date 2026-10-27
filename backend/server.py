@@ -1308,11 +1308,25 @@ def _client_is_local(request: Request) -> bool:
     return host in _local_ips()
 
 
+def _login_popup_window() -> bool:
+    """重新登录时是否弹本机浏览器窗口。
+
+    rev40: 默认 False —— 不管本机还是远程,统一走「二维码推到前端网页」这套 UI。
+    本机以前默认弹窗(能直接扫),但会抢焦点、盖住控制台,而且和远程是两套体验。
+    要恢复弹窗:config.json 里加 "login_popup_window": true;
+    单次想让本机弹窗:前端登录弹窗点「本机窗口」。
+    """
+    try:
+        return bool(config.get("login_popup_window", False))
+    except Exception:
+        return False
+
+
 @app.post("/api/accounts/login/start")
 async def login_start(request: Request, headed: Optional[bool] = Query(None)):
-    # 未显式指定 -> 按客户端是否本机自动决定模式
+    # 未显式指定 -> rev40 统一走网页二维码(默认不弹本机窗口)
     if headed is None:
-        headed = _client_is_local(request)
+        headed = _login_popup_window()
     sess = await manager.start_login(headed=headed)
     return {"sid": sess.sid, "status": sess.status, "headed": headed}
 
@@ -1443,10 +1457,10 @@ async def relogin_account(account_id: str, request: Request,
                           headed: Optional[bool] = Query(None)):
     """已存在账号重新扫码登录(离线时前端启动失败转此)。
 
-    headed 未指定时按客户端是否本机自动决定(远程走网页二维码)。
+    headed 未指定时走网页二维码(rev40 默认不弹本机窗口)。
     """
     if headed is None:
-        headed = _client_is_local(request)
+        headed = _login_popup_window()
     sess = await manager.start_relogin(account_id, headed=headed)
     if not sess:
         raise HTTPException(404, "账号不存在")

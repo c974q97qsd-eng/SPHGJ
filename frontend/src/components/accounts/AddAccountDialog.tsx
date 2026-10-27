@@ -56,8 +56,8 @@ export function AddAccountDialog({ open, onOpenChange, onDone, reloginAccountId,
     setSelectAccounts([]); setAutoSelectedName(null)
     if (scanMode) setMode(scanMode)
     try {
-      // 未指定模式 -> 不传 headed,由后端按客户端是否本机自动决定:
-      // 本机走浏览器窗口弹窗,远程(局域网其他主机)走 headless + 网页二维码
+      // 未指定模式 -> 不传 headed,由后端决定:rev40 起默认都是
+      // headless + 网页二维码(本机也不弹窗口),要弹窗需显式点「本机窗口」
       const headed = scanMode ? scanMode === "window" : undefined
       const r = reloginAccountId
         ? await api.reloginAccount(reloginAccountId, headed)
