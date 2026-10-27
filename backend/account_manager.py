@@ -513,6 +513,10 @@ class AccountWorker:
         self.page = None
         self.live_page = None
         self.live_fetcher = None
+        # rev55: 硬验结论跟着 context 一起作废。否则 context 关掉后还留着
+        # 上一轮的 _verify_result="no",下一轮会被当成「已有明确结论」直接判离线,
+        # 等于拿过期证据把账号踢出轮询。
+        self._verify_result = None
         # rev54c: page 已经死了,但 self.api 还握着它 —— 后面任何「这次 HTTP 走不通、
         # 回退页面 fetch」的请求都会拿着死 page 去 evaluate,报 Target closed,
         # 还会被记成一次失败触发 30s 退避。这里换回无浏览器客户端,等 _open_context 重建。
@@ -1107,6 +1111,13 @@ class AccountWorker:
             return None, False
         if self.auth_state == "offline":
             logger.info(f"[{self.account['id']}] 登录已失效(待扫码),本轮不发任何请求")
+            return None, False
+        # rev55: 状态已经准确的就别再打这一枪。
+        # context 还开着 + 刚做过 auth_data 硬验 + 硬验结论是「没登录身份」——
+        # 这就是最确定的掉线证据,不必再发一个 HTTP 包去撞一次 300333 才肯判。
+        # (context 为 None 时不走这条:那说明 _verify_result 是上一轮的残留,不作数)
+        if self.context is not None and self._verify_result == "no" and not self.logged_in:
+            await self.mark_offline("auth_data 硬验未通过(已有明确结论),本轮不发请求")
             return None, False
         # 1) 纯 HTTP:不需要任何 Chromium 进程
         http_ok = False
@@ -1757,6 +1768,23 @@ class AccountManager:
         self.workers[account["id"]] = worker
         return worker
 
+    async def _remember_offline(self, account_id, acc, reason):
+        """rev55: 只记账(落盘 + 通知前端),不排队扫码。
+
+        用于「启动时就发现未登录」这条路径:扫码由前端 logged_in=false 触发,
+        后台再排一个自动扫码会话会和它抢同一个 profile。
+        """
+        self._auth_offline[account_id] = {
+            "reason": reason or "",
+            "ts": time.time(),
+            "fp": auth_fingerprint(acc) if acc else "",
+        }
+        self._save_auth_offline()
+        try:
+            await self._emit("engine_status", self.status_snapshot())
+        except Exception:
+            pass
+
     async def _auth_offline_on_start(self, account_id, acc):
         """跳过启动时补记一次离线状态并排队扫码(rev54)。"""
         self._auth_offline[account_id] = {
@@ -1774,15 +1802,17 @@ class AccountManager:
         acc = next((a for a in self.config.get("accounts", []) if a["id"] == account_id), None)
         if not acc:
             return None
-        await self._ensure_playwright()
         if account_id in self.workers:
             return self.workers[account_id]
         # rev54: 上次已判掉线,并且登录态没变过 -> 别再开一次浏览器去验,直接排队扫码。
         # 扫码成功后 storage_state 会变,指纹不匹配,这条分支自然失效。
+        # rev55: 这条判定必须排在 _ensure_playwright() 之前 —— 那一步会拉起 Playwright
+        # 驱动(实测白花 ~3s),而「已知掉线」这条路径压根用不到浏览器。
         if self._is_known_offline(acc):
             logger.info(f"[{account_id}] 上次判定登录失效且登录态未更新,跳过启动,直接排队扫码")
             await self._auth_offline_on_start(account_id, acc)
             return None
+        await self._ensure_playwright()
         if self._fetch_lock is None:
             self._fetch_lock = asyncio.Lock()
         w = AccountWorker(acc, self.storage, self.config, self._emit)
@@ -1806,6 +1836,18 @@ class AccountManager:
             if w.live_fetcher is None:
                 w.start_live_probe()
         else:
+            # rev55: 启动时 auth_data 硬验就判「未登录」—— 这是确定性证据,必须记住。
+            # 原来这里只 w.stop():虽然也不发任何请求,但状态没落盘,于是
+            #   ① 用户每点一次「启动」都要白开一次 Chromium(8~15s)才被告知要扫码;
+            #   ② data/auth_state.json 永远是空的,_is_known_offline() 形同虚设;
+            #   ③ /api/accounts 里该账号永远 auth_state=unknown。
+            # 这里只做「记账 + 落盘」,【不】走 mark_offline 的自动排队 ——
+            # 前端拿到 logged_in=false 会自己弹扫码,别让同一账号被两个扫码会话同时拉起。
+            try:
+                await self._remember_offline(account_id, acc,
+                                             "启动时 auth_data 硬验未通过(未登录)")
+            except Exception as e:
+                logger.debug(f"[{account_id}] 启动未登录记账异常(忽略): {e}")
             # 未登录:关掉刚开的 context 释放进程(避免 chrome-headless-shell.exe 残留),
             # 不入 workers;前端据返回的 logged_in=false 自动转 relogin 扫码。
             await w.stop()
@@ -2343,11 +2385,22 @@ class AccountManager:
             "probe": self._probe_view(w),
             # rev54: 在网状态。offline = 已判登录失效,该账号不再发任何请求,
             # 前端可以据此把卡片标成"待扫码"而不是"已登录"。
-            "auth_state": getattr(w, "auth_state", "unknown") if w else "unknown",
-            "auth_reason": getattr(w, "auth_reason", "") if w else "",
+            "auth_state": self._auth_state_view(acc["id"], w),
+            "auth_reason": (getattr(w, "auth_reason", "") if w
+                            else ((self._auth_offline.get(acc["id"]) or {}).get("reason") or "")),
             "auth_offline_at": (getattr(w, "auth_ts", None)
                                 if w and getattr(w, "auth_state", "") == "offline" else None),
         }
+
+    def _auth_state_view(self, account_id, w):
+        """rev55: 在网状态视图。worker 不在时说真话 —— 已经落盘判过掉线的就报 offline。"""
+        if w is not None:
+            st = getattr(w, "auth_state", "") or "unknown"
+            if st != "unknown":
+                return st
+        if account_id in self._auth_offline:
+            return "offline"
+        return "unknown"
 
     @staticmethod
     def _probe_view(w):

@@ -1449,7 +1449,16 @@ async def logout_account(account_id: str):
 async def start_account(account_id: str):
     w = await manager.start_account(account_id)
     if not w:
-        raise HTTPException(404, "账号不存在")
+        # rev55: start_account 返回 None 有两种完全不同的情况,不能一律当 404:
+        #   ① 配置里真的没有这个账号      -> 404
+        #   ② 上次已判掉线且登录态没变过   -> 跳过启动(不白开浏览器),让前端转扫码
+        # 原来混成 404,前端会显示「账号不存在」,把用户引到错误的方向。
+        if not any(a.get("id") == account_id for a in config.get("accounts", [])):
+            raise HTTPException(404, "账号不存在")
+        logger.info(f"[{account_id}] 启动跳过:上次判定登录态已失效,请重新扫码")
+        return {"ok": True, "logged_in": False, "need_scan": True,
+                "auth_state": "offline",
+                "message": "登录态已失效,需要重新扫码"}
     return {"ok": True, "logged_in": w.logged_in}
 
 
