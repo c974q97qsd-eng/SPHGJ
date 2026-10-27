@@ -81,6 +81,11 @@ class WxApiClient:
         self._daily_writes = 0
         self._daily_writes_day = None
         self._daily_write_limit = int(rc.get("daily_write_limit", 100))
+        # rev54: 登录态被服务端【明确】判死(errCode 300333/300330)时置位。
+        # 与 _http_block_until 的区别:那个只是"先别试 180s",这个是"cookie 已经死了",
+        # 只有重新登录、或浏览器现取到新会话回填 storage_state 之后才清。
+        # 上层(AccountWorker)据此把账号判为掉线并退出轮询 —— 不再发包。
+        self.auth_fail = None
 
     async def _throttle(self, path):
         """防风控节流:退避期先等到结束,再按读/写随机间隔。"""
@@ -192,6 +197,9 @@ class WxApiClient:
         """
         if time.time() < self._http_block_until:
             return False
+        # rev54: 这一轮已经撞到 300333/300330(cookie 已死),后面别再逐个请求去撞
+        if not is_write and self.auth_fail:
+            return False
         if not is_write:
             return self._read_via == "http"
         if self._write_via == "http":
@@ -273,10 +281,16 @@ class WxApiClient:
             return self._http_give_up(err, path, is_write=is_write)
         code = self._err_code(resp)
         if code not in (0, None):
-            # 300333=会话失效,其它=风控/未知。读操作交回浏览器;写操作不重试
+            # 300333 = sessionid 无效 / 登录态过期;300330 = sessionid 无效。
+            # rev54: 这不是限流,是【登录态死了】—— 记下来给上层判掉线用。
+            if code in (300333, 300330):
+                self.auth_fail = {"code": code, "ts": time.time(), "path": path}
+            # 读操作交回浏览器;写操作不重试
             return self._http_give_up("errCode=%s" % code, path,
-                                      long_block=(code == 300333),
+                                      long_block=(code in (300333, 300330)),
                                       is_write=is_write)
+        # 有一次成功就说明会话是活的,清掉失效标记
+        self.auth_fail = None
         if not self._http_logged:
             self._http_logged = True
             kind = "写" if is_write else "读"
@@ -295,10 +309,18 @@ class WxApiClient:
         """
         if time.time() < self._http_block_until:
             return False
+        # rev54: cookie 已被服务端判死时,不要再拿它去发包白撞一次
+        if self.auth_fail:
+            return False
         try:
             return bool(wx_http.cookie_header_of(self._latest_account()))
         except Exception:
             return False
+
+    def clear_auth_fail(self):
+        """清除登录态失效标记(rev54)。重新登录 / 浏览器现取到新会话后调用。"""
+        self.auth_fail = None
+        self._http_block_until = 0.0
 
     async def _post_via_page(self, path, url, body):
         """原路径:页面内 fetch(同源、带真 cookie)。"""
