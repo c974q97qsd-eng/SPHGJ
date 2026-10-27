@@ -631,19 +631,25 @@ class AccountWorker:
                 logger.info(f"[{self.account['id']}] 轻量探测:在播(依据={probe['reason']}, "
                             f"via={probe.get('via')}),打开直播大屏页取流")
                 return await self._open_full()
-            # 未播:轻量探测不开大屏页,直接收工。但每 N 次(默认 5)落一次完整检测,
-            # 让 DOM 文本这条"接口不认、页面认"的兜底判据仍有出场机会。
-            full_every = max(1, int(self.config.get("live_probe_full_every", 5)))
-            if self._probe_since_full >= full_every:
+            # 未播:轻量探测不开大屏页,直接收工。
+            # rev49(2026-10-28 用户决策 live_probe_full_every 默认 0):**永不周期性落完整检测**。
+            # 原默认 5 + interval 120s = 每 10 分钟给每个账号开一次 Chromium + goto 大屏页 +
+            # 等 4 秒;8 个账号每小时 48 次浏览器启停,而这些账号全都不开播 —— 纯浪费(用户原话
+            # "收益是零")。关掉后未播时只有 1.1 秒的纯 HTTP 请求,浏览器一次都不开;
+            # 真开播时 probe["live"] 走上面的 _open_full(),大屏页照样打开,功能不减。
+            # 需要恢复 DOM 文本兜底判据时把它设成 >0(每 N 次未播落一次完整检测)。
+            full_every = int(self.config.get("live_probe_full_every", 0) or 0)
+            if full_every > 0 and self._probe_since_full >= full_every:
                 self._probe_since_full = 0
                 logger.info(f"[{self.account['id']}] 轻量探测连续 {full_every} 次未播"
                             f"(status={probe.get('status')}),做一次快速完整检测(含页面文本)")
                 return await self._open_full(fast=True)
-            # INFO 而非 DEBUG:轻量探测是 rev47 的核心链路,上线初期必须能在 run.log
-            # 直接看到它的节拍(每账号默认 300s 一条),确认它在跑而不是在空转。
+            # INFO 而非 DEBUG:轻量探测是 rev47 的核心链路,必须在 run.log 直接看到它的节拍,
+            # 确认它在跑而不是在空转。rev49: full_every=0 时不再显示无意义的 N/0 计数。
+            note = (f"第 {self._probe_since_full}/{full_every} 次"
+                    if full_every > 0 else "不做完整检测")
             logger.info(f"[{self.account['id']}] 轻量探测:未播(依据={probe['reason']},"
-                        f"status={probe.get('status')}, via={probe.get('via')}, "
-                        f"第 {self._probe_since_full}/{full_every} 次)")
+                        f"status={probe.get('status')}, via={probe.get('via')}, {note})")
             return False
         return await self._open_full()
 
