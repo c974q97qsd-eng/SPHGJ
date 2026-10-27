@@ -71,3 +71,6 @@ UP/
 
 # 运行主机标记(母本的代码走投递同步、不走 git,见 README「谁该用一键更新」)
 /.no_git_update
+
+# 抖音探测抓到的原始响应(含真实评论/昵称/会话线索,只留在本机)
+tools/dyprobe/_captured/
