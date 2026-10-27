@@ -454,7 +454,12 @@ export const api = {
     req<{ items: PublishTitle[]; stats: Record<string, { total: number; unused: number }> }>(
       `/publish/titles${finder_id !== undefined ? `?finder_id=${encodeURIComponent(finder_id)}` : ""}`),
   publishAddTitles: (finder_id: string, contents: string) =>
-    req<{ ok: boolean; added: number; titles_filled: number }>("/publish/titles", { method: "POST", body: JSON.stringify({ finder_id, contents }) }),
+    req<{ ok: boolean; added: number; titles_filled: number; parsed?: number; cleaned?: number; dropped?: number }>(
+      "/publish/titles", { method: "POST", body: JSON.stringify({ finder_id, contents }) }),
+  /** 粘贴预览:清理掉行首序号/引号/全角空格后的标题列表(不落库) */
+  publishPreviewTitles: (finder_id: string, contents: string) =>
+    req<{ ok: boolean; items: string[]; count: number; cleaned: number; dropped: number }>(
+      "/publish/titles/preview", { method: "POST", body: JSON.stringify({ finder_id, contents }) }),
   publishDeleteTitle: (id: number) => req<{ ok: boolean }>(`/publish/titles/${id}`, { method: "DELETE" }),
   // 作品播放:后端会校验 CDN 地址时效,过期就用当前登录态现取
   postPlay: (finder_id: string, object_id: string) =>

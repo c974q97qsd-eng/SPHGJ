@@ -28,6 +28,7 @@ logger = logging.getLogger("sphgj")
 
 from .storage import Storage
 from .account_manager import AccountManager
+from .title_clean import split_titles
 from .login_capture import LoginLockError
 from .log_hub import install as install_log_hub
 from . import schemas
@@ -2255,20 +2256,38 @@ async def publish_titles(finder_id: Optional[str] = None, include_used: bool = T
             "stats": storage.title_pool_stats()}
 
 
+@app.post("/api/publish/titles/preview")
+async def publish_preview_titles(body: dict):
+    """添加前预览:粘贴文本 -> 清理后的标题列表(不落库)。
+
+    前端据此显示「识别到 N 条 / 已自动清理 / 跳过重复空行」,
+    让用户加之前就知道序号、引号、全角空格那些格式会被去掉。
+    """
+    raw = body.get("contents")
+    if not isinstance(raw, (str, list)):
+        raise HTTPException(400, "contents 需要是数组或换行文本")
+    contents, stat = split_titles(raw)
+    return {"ok": True, "items": contents, "count": len(contents),
+            "cleaned": stat["cleaned"], "dropped": stat["empty"] + stat["dup"]}
+
+
 @app.post("/api/publish/titles")
 async def publish_add_titles(body: dict):
     finder_id = (body.get("finder_id") or "").strip()
     raw = body.get("contents")
-    if isinstance(raw, str):
-        contents = raw.splitlines()
-    elif isinstance(raw, list):
-        contents = [str(x) for x in raw]
-    else:
+    if not isinstance(raw, (str, list)):
         raise HTTPException(400, "contents 需要是数组或换行文本")
+    # rev41: 粘贴文本先清格式(行首序号 / 引号 / 全角空格 / 整段粘成一行),
+    # 只清格式不动文案,话题和标点原样保留
+    contents, stat = split_titles(raw)
+    if not contents:
+        raise HTTPException(400, "没识别到有效标题(粘贴的内容只有序号或空行?)")
     n = storage.add_titles(contents, finder_id=finder_id)
     filled = publish_queue.fill_missing_titles()
     await publish_queue._push()
-    return {"ok": True, "added": n, "titles_filled": filled}
+    return {"ok": True, "added": n, "titles_filled": filled,
+            "parsed": len(contents), "cleaned": stat["cleaned"],
+            "dropped": stat["empty"] + stat["dup"]}
 
 
 @app.delete("/api/publish/titles/{title_id}")
