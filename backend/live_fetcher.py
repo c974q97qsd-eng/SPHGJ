@@ -162,6 +162,63 @@ _SLIM_MEDIA_URLS = [
 _SLIM_FLV_URLS = ["*.flv*", "*.m3u8*", "*wxlivecdn*", "*trtc*"]
 
 
+# ======================== rev47: 全项目唯一的直播判据 ========================
+# 为什么要统一:rev43~46 期间"判定口径不一致"造成了三类连环误判 ——
+#   ① _wait_for_live_detection 拿 live_object_id 就提前返回,与判定(只认 live_stats)不一致
+#   ② _open_and_detect_live 把 stream_url 当在播信号,而 _live_loop 只认 live_stats
+#      -> 检测说"在播"、循环说"信号中断",白跑 3 次重试 + reload + 12s
+#   ③ 两处各自维护 fresh 窗口(30s / 90s),改一处忘另一处
+# 从 rev47 起:任何地方判"是否在播"都必须调 judge_live(),不要再就地写表达式。
+
+# DOM 关键词(保守集合)。2026-10-28 三个账号 check_live_status 完整响应 dump 确认:
+# 未开播时只有 status=0,没有 isLive/isLiving 这类布尔位,也没有播放地址;
+# 所以页面文本是最廉价、最不依赖接口字段的兜底判据。
+# 词表刻意保守:"拿不准一律 None",绝不用它下"未播"的结论(只作弱正向)。
+_DOM_NOT_LIVE_WORDS = ("未开播", "暂未开播", "当前未开播", "直播已结束", "已结束直播", "暂无直播")
+_DOM_LIVE_WORDS = ("正在直播", "直播中", "结束直播", "直播时长", "在线人数")
+
+
+def read_dom_state_from_text(txt):
+    """从直播大屏页文本推断状态。返回 (True=看起来在播 / False=看起来未播 / None=判断不了, 命中词)。"""
+    if not txt:
+        return None, ""
+    for w in _DOM_NOT_LIVE_WORDS:
+        if w in txt:
+            return False, w
+    for w in _DOM_LIVE_WORDS:
+        if w in txt:
+            return True, w
+    return None, ""
+
+
+def judge_live(live_stats=None, stats_fresh=True, stream_url=None,
+               allow_stream_url=True, dom_state=None, dom_fresh=True,
+               status=None, log_account=""):
+    """统一直播判据。返回 (is_live: bool, reason: str)。
+
+    优先级(按实测可靠度从高到低):
+      1. live_stats 新鲜        —— 最强,get_live_info / check_live_status 带 liveStats 才有
+      2. DOM 明确"在播"          —— rev47 兜底,不依赖接口字段
+      3. DOM 明确"未开播"        —— 同上,负向
+      4. stream_url(.flv/.m3u8) —— 检测阶段可用;长驻页面不要用,它是 sticky 的
+                                   (拿到一次就再也不会被清空,用它判活会永远判在播)
+      5. status == 0            —— check_live_status.status,0=未开播(三账号 dump 实证)
+
+    allow_stream_url=False 供 _live_loop 这类"长驻页面判信号是否还活着"的场景使用。
+    """
+    if live_stats and stats_fresh:
+        return True, "live_stats"
+    if dom_state is True and dom_fresh:
+        return True, "dom:在播"
+    if dom_state is False and dom_fresh:
+        return False, "dom:未开播"
+    if allow_stream_url and stream_url:
+        return True, "stream_url"
+    if status == 0:
+        return False, "status=0"
+    return False, "no_signal"
+
+
 class LiveFetcher:
     def __init__(self, page, account_id, learned=None):
         """learned: rev16 F4 —— 继承上一实例的 API 规格 {name: spec}。
@@ -209,6 +266,11 @@ class LiveFetcher:
         self._urls_seen = []            # rev44: 学习窗口内采样到的 live 相关请求 URL(限 5 条)
         self._status_body_dumped = False  # rev45: check_live_status 原始响应只 dump 一次
         self.live_flag = None           # rev46: check_live_status 里的布尔直播标志(True/False/未知)
+        # rev47: 统一判据所需的两个事实来源
+        self.status_num = None          # check_live_status.status(0=未开播,实测确认)
+        self.dom_state = None           # 直播大屏页文本推断(True/False/None)
+        self.dom_ts = 0.0               # dom_state 的采样时间
+        self._dom_dumped = False        # 页面文本只落盘一次(诊断用)
         # rev21: CDP 回退任务的并发闸与追踪(防 fire-and-forget 任务无限堆积)
         self._cdp_tasks = set()         # 在飞的回退任务引用(完成自动 discard,close 时全部 cancel)
         self._cdp_seen = deque(maxlen=_CDP_SEEN_MAX)   # 最近处理过的 requestId(有界去重)
@@ -636,6 +698,9 @@ class LiveFetcher:
                         f"liveObjectId={d.get('liveObjectId')}, liveId={d.get('liveId')}, "
                         f"coverImg={len(d.get('coverImgList') or [])}项, "
                         f"data_keys={sorted(d.keys())}")
+        # rev47: status 纳入统一判据(0=未开播,经三账号完整响应 dump 实证)
+        if d.get("status") is not None:
+            self.status_num = d.get("status")
         live_id = d.get("liveObjectId") or self._find_live_object_id(d)
         if live_id:
             if not self.live_object_id:
@@ -665,6 +730,90 @@ class LiveFetcher:
                     logger.info(f"[live:{self.account_id}] 拿到 .flv 流 URL(响应体扫描兜底): {url[:80]}...")
                 # 同样触发 stage2
                 await self._apply_slimming(2)
+
+    # ======================== rev47: 直播页文本判据 ========================
+
+    async def read_dom_state(self, dump=True):
+        """读直播大屏页(含 iframe)的可视文本,推断"是否在播"。返回 (state, matched)。
+
+        为什么要 iframe:直播控制台主体在 micro/live/liveBuild 里,wujie 微前端
+        常把内容渲染进 iframe,主文档 innerText 可能是空的(与 rev30 二维码同源问题)。
+        因此逐 frame 取样再拼起来,最多 4 个 frame、每个 2000 字,开销可控。
+
+        dump=True 时首次把全文落盘 data/live_probe/<账号>_dom.txt —— 关键词表目前
+        是"保守猜测"(现网未开播时的页面文案还没核对过),先观测一轮再收紧。
+        """
+        texts = []
+        try:
+            frames = list(self.page.frames)[:4] if self.page is not None else []
+        except Exception:
+            frames = []
+        # 取文本的三道处理(每一道都是踩过的坑):
+        #   ① 克隆 body 并删掉 style/script/noscript —— 直接 textContent 会把 <style>
+        #      里的 CSS 全吃进来(实测 3000 字配额被 CSS 占满,界面文案一个字没取到);
+        #   ② innerText 优先(反映可见文本),空则 textContent;
+        #   ③ 还空就递归 shadowRoot —— wujie 微前端(直播控制台/发布页)把正文放 Shadow DOM。
+        js = r"""() => {
+            const clean = (root) => {
+                try {
+                    const c = root.cloneNode(true);
+                    if (c.querySelectorAll) {
+                        c.querySelectorAll('style,script,noscript,template,link,meta').forEach(e => e.remove());
+                    }
+                    return c;
+                } catch (e) { return root; }
+            };
+            const grab = (root) => {
+                try {
+                    const c = clean(root);
+                    const t = c.innerText || c.textContent || '';
+                    return t.replace(/\s+/g, ' ').trim();
+                } catch (e) { return ''; }
+            };
+            const parts = [];
+            let t = grab(document.body || document.documentElement);
+            if (t) parts.push(t);
+            if (!parts.length) {
+                const walk = (root, depth) => {
+                    if (!root || depth > 6 || parts.length > 20) return;
+                    const x = grab(root);
+                    if (x) parts.push(x);
+                    let nodes = [];
+                    try { nodes = root.querySelectorAll ? root.querySelectorAll('*') : []; } catch (e) {}
+                    for (const el of nodes) {
+                        if (el.shadowRoot) walk(el.shadowRoot, depth + 1);
+                    }
+                };
+                walk(document, 0);
+            }
+            return parts.join(' || ').slice(0, 3000);
+        }"""
+        for fr in frames:
+            try:
+                r = await _with_timeout(fr.evaluate(js), 8)
+                if r:
+                    texts.append(r)
+            except Exception:
+                pass
+        txt = " || ".join(texts)
+        state, matched = read_dom_state_from_text(txt)
+        self.dom_state = state
+        self.dom_ts = time.time()
+        if dump and not self._dom_dumped:
+            self._dom_dumped = True
+            try:
+                _d = os.path.join(os.path.dirname(_SPEC_CACHE_PATH), "live_probe")
+                os.makedirs(_d, exist_ok=True)
+                with io_open(os.path.join(_d, f"{self.account_id}_dom.txt"), "w") as f:
+                    f.write(txt or "<EMPTY: 所有 frame 的文本都是空>")
+            except Exception:
+                pass
+            # 空文本也要打:以前是 if txt 才打,于是"取到空"和"根本没跑"在日志里分不清
+            logger.info(f"[live:{self.account_id}] 直播页文本采样({len(txt)}字,"
+                        f"frames={len(frames)}): 命中={matched or '无'} "
+                        f"状态={'在播' if state is True else ('未播' if state is False else '未知')} "
+                        f"| {(txt or '<空>')[:200]}")
+        return state, matched
 
     # ======================== rev11 回退: CDP 响应捕获(仅回退模式启用) ========================
 
@@ -1030,6 +1179,10 @@ class LiveFetcher:
             # rev43: 带上当前页面 URL —— 被判"未在直播"时能一眼看出是不是被弹回了 /platform
             "page_url": (self.page.url if self.page is not None else ""),
             "live_flag": self.live_flag,   # rev46: check_live_status 的布尔直播标志
+            # rev47: 统一判据的输入项
+            "status_num": self.status_num,
+            "dom_state": self.dom_state,
+            "dom_ts": self.dom_ts,
         }
 
     async def fetch(self):

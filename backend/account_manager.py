@@ -17,7 +17,7 @@ from .api_client import WxApiClient
 from .comment_fetcher import CommentFetcher
 from .auto_reply import AutoReply
 from .auto_delete import AutoDelete
-from .live_fetcher import LiveFetcher
+from .live_fetcher import LiveFetcher, judge_live, _load_spec_cache
 from .auto_comment import AutoCommenter
 from .login_capture import LoginSession, clear_login_state
 from .browser import launch_stealth, close_context_safely, reap_profile_orphans
@@ -95,6 +95,22 @@ class AccountWorker:
         self._live_last_reload_attempt = 0.0
         # rev16 F2: 判定信号丢失后原地重试 poll 的计数(信号恢复即清零)
         self._live_poll_retry = 0
+        # ======================== rev47: 统一直播探测器 ========================
+        # 原实现三个入口各管一段:_fetch_loop 里的 _cycle_live_check(跟 600s 抓取周期,
+        # 夜间 ×3 = 30 分钟)、_live_probe_loop(仅手动启动的 180s 窗口)、_live_loop(在播时)。
+        # 后果:① 开播最坏要等 30 分钟才发现;② 同一账号 90 秒内被检测两次
+        # (实测 4 号 01:47:12 与 01:48:58);③ 每次检测开一整个直播大屏 SPA,141 秒才收敛。
+        # rev47 起只留一个探测器:轻量探测(一次 HTTP)为主,周期性才落完整检测。
+        self._detect_task = None
+        self._probe_wake = asyncio.Event()
+        self._probe_boost_until = 0.0   # 手动启动后的高频探测窗口(原 _probe_window 语义)
+        self._last_probe_ts = 0.0       # 最近一次探测时间(探测器与抓取周期共用节流)
+        self._last_probe = {}           # 最近一次探测结果(诊断用)
+        self._probe_since_full = 0      # 距上次"完整检测"的轻量探测次数
+        # 探测互斥:三个触发源(常驻探测器/抓取周期/手动窗口)必须先抢这把锁,
+        # 锁内再确认一次 live_fetcher,避免并发探测(一个持 context 探测、另一个
+        # 在同一 context 上新开 live_page,而后者不经过 _browser_lock)。
+        self._probe_lock = asyncio.Lock()
 
     async def start(self, playwright, headless=True):
         self._pw = playwright
@@ -137,6 +153,8 @@ class AccountWorker:
         # 启动后做一次直播检测(仅检测:直播则保持,非直播则收回进程)
         if self.logged_in:
             await self._initial_live_check()
+        # rev47: 常驻探测器(统一节拍,取代原先"跟抓取周期 + 手动窗口"两套)
+        self.start_live_detect()
 
     # ======================== 按需浏览器生命周期(省内存) ========================
 
@@ -398,8 +416,165 @@ class AccountWorker:
             if self._browser_refs == 0 and self.live_fetcher is None and self.context is not None:
                 await self._close_context()
 
-    async def _open_and_detect_live(self):
+    # ======================== rev47: 轻量直播探测(不开大屏页) ========================
+
+    async def _open_context_light(self):
+        """只建 context(注入登录态),不导航评论页 —— 专供轻量直播探测。
+
+        与 _open_context 的区别:不 goto COMMENT_URL、不 wait 2.5s、不建 WxApiClient、
+        不做登录态硬验(那是评论抓取要用的)。探测只需 cookie 在场,一次
+        check_live_status 就够,省掉 3~5 秒页面加载和一个 renderer。
+        调用方必须持有 _browser_lock,用完自己 close(绝不写回 self.context)。
+        """
+        ctx = await launch_stealth(self._pw, self.account["profile_dir"], headless=self._headless)
+        try:
+            _ck = ((self.account.get("storage_state") or {}).get("cookies") or [])
+            if _ck:
+                await ctx.add_cookies(_ck)
+        except Exception as e:
+            logger.debug(f"[{self.account['id']}] 轻量探测注入登录态失败: {e}")
+        return ctx
+
+    async def _probe_via_context(self, ctx):
+        """用一次 check_live_status 请求探测直播状态。返回判据 dict 或 None。
+
+        走 APIRequestContext(ctx.request)而不是 page.evaluate:它共享同一个 cookie jar,
+        但完全不经过 renderer —— 没有页面加载、没有 SPA 水合、没有网络事件进 Python。
+        这是"把探测频率提到分钟级"的前提。
+
+        解析仍复用 LiveFetcher._parse_live_status(构造一个 page=None 的临时实例),
+        保证"轻量探测"和"大屏页探测"对同一份响应得出同样的结论 —— 不要再写第二份解析。
+        """
+        spec = (_load_spec_cache(self.account["id"]) or {}).get("live_status")
+        if not spec or not spec.get("url"):
+            return None
+        headers = {k: v for k, v in (spec.get("headers") or {}).items()
+                   if k.lower() not in ("cookie", "content-length", "host")}
+        body = spec.get("postData")
+        url = spec["url"]
+        try:
+            if (spec.get("method") or "POST").upper() == "GET":
+                r = await ctx.request.get(url, headers=headers, timeout=15000)
+            else:
+                r = await ctx.request.post(url, headers=headers, data=body or None, timeout=15000)
+            code = r.status
+            txt = await r.text()
+        except Exception as e:
+            logger.debug(f"[{self.account['id']}] 轻量探测请求失败: {e}")
+            return None
+        if not txt or code >= 400:
+            logger.debug(f"[{self.account['id']}] 轻量探测响应异常(status={code}, len={len(txt or '')})")
+            return None
+        lf = None
+        try:
+            lf = LiveFetcher(None, self.account["id"])
+            # 抑制"拿到 liveObjectId, dashboard 抓取启用"这类只对常驻实例有意义的日志
+            # 与首次落盘(轻量探测每几分钟一次,不该重复写文件)
+            lf.live_object_id = "-"
+            lf._status_body_dumped = True
+            await lf._parse_live_status(txt)
+            live, reason = judge_live(
+                live_stats=lf.live_stats, stats_fresh=True,
+                stream_url=lf.stream_url, allow_stream_url=True,
+                status=lf.status_num)
+            return {"ts": time.time(), "live": live, "reason": reason,
+                    "status": lf.status_num, "has_stream": bool(lf.stream_url),
+                    "has_stats": bool(lf.live_stats), "via": "light"}
+        except Exception as e:
+            logger.debug(f"[{self.account['id']}] 轻量探测解析失败: {e}")
+            return None
+        finally:
+            lf = None
+            txt = None
+
+    async def _probe_light(self):
+        """轻量探测:一次 HTTP,不开直播大屏页。返回判据 dict 或 None(不可用)。
+
+        L0 已有 context(正在抓评论/手动操作)-> 直接 ctx.request,约 0.3s,零新增开销;
+        L1 没有 context -> 只建 context 探完即关,约 3~5s(远小于开大屏页的 30~140s);
+        两条路都失败 -> 返回 None,调用方退回完整检测。
+        """
+        try:
+            async with self._browser_lock:
+                if self.context is not None:
+                    return await self._probe_via_context(self.context)
+                try:
+                    ctx = await self._open_context_light()
+                except Exception as e:
+                    logger.debug(f"[{self.account['id']}] 轻量探测开浏览器失败: {e}")
+                    return None
+                try:
+                    return await self._probe_via_context(ctx)
+                finally:
+                    try:
+                        await close_context_safely(ctx, self.account.get("profile_dir"),
+                                                   f"[{self.account['id']}] 轻量探测收回")
+                    except Exception:
+                        pass
+        except Exception as e:
+            logger.debug(f"[{self.account['id']}] 轻量探测异常: {e}")
+            return None
+
+    async def _probe_and_maybe_open(self):
+        """rev47: 唯一探测入口 —— 轻量判定,命中或周期性才开直播大屏页。返回 is_live。
+
+        探测器循环 / 评论抓取周期 / 手动启动窗口都走这里,共用 _last_probe_ts 节流。
+        """
+        if self.live_fetcher is not None:
+            return True
+        if not self.logged_in:
+            return False
+        async with self._probe_lock:
+            # 锁内二次确认:等锁期间可能已经有人探测完并把 live_page 开起来了
+            if self.live_fetcher is not None:
+                return True
+            self._last_probe_ts = time.time()
+            probe = await self._probe_light()
+            return await self._after_probe(probe)
+
+    async def _open_full(self, fast=False):
+        """完整检测(开直播大屏页)。探测器可能在没有浏览器时调用,这里负责补引用。"""
+        if self.context is not None:
+            return await self._open_and_detect_live(fast=fast)
+        if not await self.ensure_browser():
+            logger.debug(f"[{self.account['id']}] 完整检测跳过:开浏览器失败")
+            return False
+        try:
+            return await self._open_and_detect_live(fast=fast)
+        finally:
+            await self.release_idle_browser()
+
+    async def _after_probe(self, probe):
+        """轻量探测结果 -> 是否开直播大屏页。probe=None 表示轻量不可用,退回完整检测。"""
+        if probe is not None:
+            self._last_probe = probe
+            self._probe_since_full += 1
+            if probe["live"]:
+                logger.info(f"[{self.account['id']}] 轻量探测:在播(依据={probe['reason']}),"
+                            f"打开直播大屏页取流")
+                return await self._open_full()
+            # 未播:轻量探测不开大屏页,直接收工。但每 N 次(默认 5)落一次完整检测,
+            # 让 DOM 文本这条"接口不认、页面认"的兜底判据仍有出场机会。
+            full_every = max(1, int(self.config.get("live_probe_full_every", 5)))
+            if self._probe_since_full >= full_every:
+                self._probe_since_full = 0
+                logger.info(f"[{self.account['id']}] 轻量探测连续 {full_every} 次未播"
+                            f"(status={probe.get('status')}),做一次快速完整检测(含页面文本)")
+                return await self._open_full(fast=True)
+            # INFO 而非 DEBUG:轻量探测是 rev47 的核心链路,上线初期必须能在 run.log
+            # 直接看到它的节拍(每账号默认 300s 一条),确认它在跑而不是在空转。
+            logger.info(f"[{self.account['id']}] 轻量探测:未播(依据={probe['reason']},"
+                        f"status={probe.get('status')}, 第 {self._probe_since_full}/{full_every} 次)")
+            return False
+        return await self._open_full()
+
+    async def _open_and_detect_live(self, fast=False):
         """开 live_page 并导航,等待 check_live_status/get_live_info 响应后判定是否直播。
+
+        fast=True:轻量探测已明确"没信号"时的快速确认 —— 等 4 秒即可,不做 reload 重试。
+        依据:未开播时直播控制台会被 SPA 弹回 /platform/,页面不会请求 get_live_info,
+        再怎么等也等不到 liveStats(实测 02:03~02:05)。真在播时轻量探测会先命中,
+        根本走不到这里,所以不会有假阴性。
 
         关键修复: page.on('response') 是【被动】捕获,响应在 page 加载后由页面 JS 异步发出,
         goto 完成瞬间 check_live_status 尚未返回。若 goto 后只取一次就判定,会因 live_stats
@@ -420,19 +595,39 @@ class AccountWorker:
             await lf.goto_live()
             self._live_opened_ts = time.time()
             self._live_nosignal_reloads = 0
-            info = await self._wait_for_live_detection(lf, timeout=20.0)
+            # rev47: 接口层没有"在播"布尔位(未开播时只有 status=0),所以页面文本
+            # 是最廉价、最不依赖接口字段的兜底判据。但这里刚 goto 完(domcontentloaded),
+            # SPA 还没渲染,读到的多半是空 —— 只作预热,真正的采样在判定前做。
+            try:
+                await lf.read_dom_state(dump=False)
+            except Exception as e:
+                logger.debug(f"[{self.account['id']}] 预热读直播页文本失败: {e}")
+            info = await self._wait_for_live_detection(
+                lf, timeout=4.0 if fast else 20.0, allow_relearn=not fast)
+            # rev47: 判定前再采一次页面文本 —— 这时已经等过 20~32 秒,直播大屏页渲染完成,
+            # 这次的结果才进判据;诊断 dump 也只在这里做(每轮检测一份)。
+            try:
+                await lf.read_dom_state(dump=True)
+                info = await lf.snapshot()
+            except Exception as e:
+                logger.debug(f"[{self.account['id']}] 判定前读直播页文本失败: {e}")
             # 判定:有 live_stats(近期)即直播;stream_url(.flv 流)也视为直播(视频流必出)。
             # 【rev13 修复 flapping】live_object_id 单独【不再】作为直播信号:
             # 它可能来自上一场直播残留的 check_live_status 响应(账号已下播但接口仍返回旧
             # liveObjectId),若据此判直播会反复"开播→下播"开关浏览器(见某账号抖动案例)。
             # live_object_id 仅用于 dashboard 抓取,不参与 is_live 判定。
+            now_ts = time.time()
             last_ts = lf.updated_at_ts or 0
-            fresh = (time.time() - last_ts) < 30
-            is_live = bool(info.get("live_stats") and fresh)
-            if not is_live and lf.stream_url:
-                is_live = True
-                logger.info(f"[{self.account['id']}] 检测到直播信号(stream_url 已取到),开始流式推送")
+            # rev47: 统一判据(见 live_fetcher.judge_live)。检测窗口只有 30 秒,
+            # 不存在"上一场残留的 sticky 流地址",所以这里允许用 stream_url。
+            is_live, why = judge_live(
+                live_stats=info.get("live_stats"), stats_fresh=(now_ts - last_ts) < 30,
+                stream_url=lf.stream_url, allow_stream_url=True,
+                dom_state=info.get("dom_state"),
+                dom_fresh=(now_ts - (info.get("dom_ts") or 0)) < 120,
+                status=info.get("status_num"))
             if is_live:
+                logger.info(f"[{self.account['id']}] 检测到直播信号(依据={why}),开始流式推送")
                 self.start_live_loop()
                 logger.info(f"[{self.account['id']}] 检测到直播,开始流式推送"
                             f"(live_object_id={lf.live_object_id}, "
@@ -440,7 +635,8 @@ class AccountWorker:
                 return True
             # 非直播:关页回收(检测窗口内未拿到任何直播信号)
             logger.info(f"[{self.account['id']}] 直播检测:当前未在直播"
-                        f"(live_stats={info.get('live_stats') is not None}, "
+                        f"(依据={why}, live_stats={info.get('live_stats') is not None}, "
+                        f"status={info.get('status_num')}, dom={info.get('dom_state')}, "
                         f"live_object_id={lf.live_object_id}, "
                         f"learned={sorted(getattr(lf, '_learned', {}) or {})}, "
                         f"cdp_fallback={getattr(lf, '_cdp_fallback', None)}, "
@@ -467,7 +663,7 @@ class AccountWorker:
             self._live_closed_ts = time.time()
             return False
 
-    async def _wait_for_live_detection(self, lf, timeout=20.0):
+    async def _wait_for_live_detection(self, lf, timeout=20.0, allow_relearn=True):
         """goto 之后被动等待 check_live_status/get_live_info 响应到达(最多 timeout 秒)。
 
         用 snapshot()(不告警)轮询,避免检测阶段误触发"stream_url 为空"告警;
@@ -478,7 +674,16 @@ class AccountWorker:
         # 原实现拿 live_object_id 就提前 return,于是等不到 get_live_info 的 liveStats,
         # 明明在播也被判"未在直播"。
         def _hit(i):
-            return bool(i.get("live_stats") or lf.stream_url)
+            # rev47: 与 _open_and_detect_live 共用同一个判据函数。
+            # rev44 那次事故就是这里与判定各写一套(拿 live_object_id 就提前返回),
+            # 以后不许再就地写表达式。
+            ok, _ = judge_live(
+                live_stats=i.get("live_stats"), stats_fresh=True,
+                stream_url=lf.stream_url, allow_stream_url=True,
+                dom_state=i.get("dom_state"),
+                dom_fresh=(time.time() - (i.get("dom_ts") or 0)) < 120,
+                status=i.get("status_num"))
+            return ok
 
         async def _round(secs):
             deadline = time.time() + secs
@@ -498,6 +703,8 @@ class AccountWorker:
         # rev43: 首轮没信号【不再直接判下播】。学习超时点在第一轮尾声,剩下的几秒只够
         # CDP 被动监听空等(页面早已把 check_live_status 发完)-> 必然误判。重载一次直播页
         # 让请求重新发出,再给一轮时间。
+        if not allow_relearn:
+            return info or {}
         try:
             if await lf.relearn():
                 logger.info(f"[{self.account['id']}] 首轮未取到直播信号,重载直播页重试一轮")
@@ -527,7 +734,9 @@ class AccountWorker:
             return
         if self.live_fetcher is not None:
             return
-        await self._open_and_detect_live()
+        # rev47: 抓取结束时 context 还开着(L0),这次探测几乎零成本 —— 只是多一个
+        # check_live_status 请求,不再为此另开一个直播大屏页。
+        await self._probe_and_maybe_open()
 
     def start_loop(self):
         if self._loop_task is None or self._loop_task.done():
@@ -633,41 +842,59 @@ class AccountWorker:
             self._live_loop_task = asyncio.create_task(self._live_loop())
 
     def start_live_probe(self):
-        """手动启动后短期开播探测:高频查直播,尽快捕获"启动后开播"。
+        """手动启动后进入高频探测窗口,尽快捕获"启动后开播"。
 
-        仅手动 start_account 调用(用户主动操作,短期开进程可接受)。复用 _cycle_live_check
-        (已有的直播检测逻辑),窗口内每 ~24s 查一次,检测到直播则转 _live_loop 流式;
-        窗口结束仍未播则收回进程,交回 10 分钟抓取周期兜底。
+        rev47: 不再单独起一个 _live_probe_loop(原来要自己借 _fetch_lock、每 24s
+        重新开一次浏览器)。改为给统一探测器打一个 boost 标记并唤醒它 —— 窗口内
+        间隔降到 live_probe_boost_interval_sec(默认 20s),窗口结束自动回落。
         """
-        if self._live_probe_task is None or self._live_probe_task.done():
-            self._live_probe_task = asyncio.create_task(self._live_probe_loop())
-
-    async def _live_probe_loop(self):
-        probe_until = time.time() + self._probe_window
-        interval = self.config.get("live_check_interval_sec", 8)
-        ok = await self.ensure_browser()
-        if not ok:
-            return
+        self._probe_boost_until = time.time() + self._probe_window
         try:
-            while self._running and time.time() < probe_until:
-                if self.logged_in:
-                    # 借用全局抓取锁,避免与 10 分钟抓取并发拉起浏览器
-                    if self._fetch_lock is not None:
-                        await self._fetch_lock.acquire()
-                    try:
-                        await self._cycle_live_check()
-                    finally:
-                        if self._fetch_lock is not None:
-                            try: self._fetch_lock.release()
-                            except Exception: pass
-                    if self.live_fetcher is not None:
-                        logger.info(f"[{self.account['id']}] 开播探测窗口内检测到直播,转流式推送")
-                        return
-                await asyncio.sleep(interval * 3)
-        finally:
-            # 未播:收回进程(live_fetcher 为 None 时 release 会关 context);
-            # 已播:live_fetcher 非 None,release 提前返回不关,保持流式。
-            await self.release_idle_browser()
+            self._probe_wake.set()
+        except Exception:
+            pass
+        logger.info(f"[{self.account['id']}] 开播探测窗口 {int(self._probe_window)}s 内高频探测"
+                    f"(间隔 {int(self.config.get('live_probe_boost_interval_sec', 20))}s)")
+
+    def start_live_detect(self):
+        """rev47: 启动统一探测器(每个账号一个,常驻但绝大多数时间在睡)。"""
+        if self._detect_task is None or self._detect_task.done():
+            self._detect_task = asyncio.create_task(self._live_detect_loop())
+
+    async def _live_detect_loop(self):
+        """rev47: 全账号唯一的直播探测节拍器。
+
+        频率解耦:评论抓取仍是 fetch_interval_sec(600s,夜间 ×3),直播探测走独立的
+        live_probe_interval_sec(默认 300s),【不再乘夜间倍率】—— 直播本来就集中在
+        夜里,原来的 ×3 让开播最坏 30 分钟才发现。
+        在播期间本循环只是睡(交给 _live_loop),不参与任何探测。
+        """
+        interval = max(30, int(self.config.get("live_probe_interval_sec", 300)))
+        boost_interval = max(5, int(self.config.get("live_probe_boost_interval_sec", 20)))
+        gap = float(self.config.get("live_probe_min_gap_sec", 60))
+        await asyncio.sleep(random.uniform(0, 20))   # 多账号错峰,避免同时拉起浏览器
+        while self._running:
+            wait = interval
+            try:
+                self._probe_wake.clear()
+                if self.live_fetcher is None and self.logged_in:
+                    boost = time.time() < self._probe_boost_until
+                    wait = boost_interval if boost else interval
+                    # 节流:抓取周期可能刚顺带探过,别立刻再探一次
+                    if time.time() - (self._last_probe_ts or 0) >= gap:
+                        await self._probe_and_maybe_open()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(f"[{self.account['id']}] 直播探测循环异常: {e}")
+                wait = 60
+            try:
+                # 用 Event 等,start_live_probe / 手动检测可以立刻唤醒,不必等满 interval
+                await asyncio.wait_for(self._probe_wake.wait(), timeout=wait)
+            except asyncio.TimeoutError:
+                pass
+            except asyncio.CancelledError:
+                raise
 
     async def _live_loop(self):
         while self._running:
@@ -762,7 +989,26 @@ class AccountWorker:
                     # 代价远大于瞬断本身。放宽到 90s 可容忍连续多轮失败。
                     last_ts = lf.updated_at_ts or 0
                     signal_lost_sec = int(self.config.get("live_signal_lost_sec", 90))
-                    info["is_live"] = bool(info.get("live_stats") and (now - last_ts < signal_lost_sec))
+                    # rev47: 没有 live_stats 时补一次页面文本采样(最多每 30s 一次),
+                    # 这是"接口不认、页面认"的兜底判据 —— 长驻页面最容易遇到接口静默。
+                    if not info.get("live_stats") and now - (getattr(lf, "dom_ts", 0) or 0) > 30:
+                        try:
+                            await lf.read_dom_state(dump=False)
+                            info["dom_state"] = lf.dom_state
+                            info["dom_ts"] = lf.dom_ts
+                        except Exception:
+                            pass
+                    # rev47: 统一判据。长驻页面【禁止】用 stream_url 判活 —— 它是 sticky 的,
+                    # 拿到一次就再也不清空,用它判活会永远判"在播"、永远不回收页面。
+                    _sig, _why = judge_live(
+                        live_stats=info.get("live_stats"),
+                        stats_fresh=(now - last_ts) < signal_lost_sec,
+                        allow_stream_url=False,
+                        dom_state=info.get("dom_state"),
+                        dom_fresh=(now - (info.get("dom_ts") or 0)) < 90,
+                        status=info.get("status_num"))
+                    info["is_live"] = _sig
+                    info["live_reason"] = _why
                     if not info["is_live"]:
                         # rev16 F2: 判定信号丢失后,先原地快速重试 poll(不销毁重建)。
                         # 绝大多数瞬断在 1~2 轮重试内恢复;仅重试耗尽才走代价高昂的 reload/关页。
@@ -899,6 +1145,14 @@ class AccountWorker:
                 await self._live_loop_task
             except (asyncio.CancelledError, Exception):
                 pass
+        if self._detect_task:
+            self._detect_task.cancel()
+            try:
+                await self._detect_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._detect_task = None
+        # rev47: _live_probe_task 已被统一探测器取代,保留取消逻辑处理旧引用(升级/热重启)
         if self._live_probe_task:
             self._live_probe_task.cancel()
             try:
