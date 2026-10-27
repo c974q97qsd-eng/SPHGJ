@@ -12,6 +12,9 @@
     (从聊天框复制常是这样;不切就会变成一条巨长的标题)
 
 设计原则:**只清格式,不动文案**。话题(#xxx)、中文标点、emoji、英文全部原样保留。
+
+⚠️ 引号(rev42,用户 2026-10-28 明确要求):`"标题"` `“标题”` `「标题」` **一律保留**,
+   不做剥离 —— 别"顺手"加回来。行末尾同样只去空格,标点一个不剥。
 """
 import re
 
@@ -28,35 +31,8 @@ _RE_LINE_NO = re.compile(
 )
 # 行首标签:示例: / 范例: / 标题: / 文案: / 描述: / 第1条:
 _RE_LABEL = re.compile(r"^(?:示例|范例|标题|文案|描述|第\s*\d{1,3}\s*[条个])\s*[:：]\s*")
-# 整条被引号包起来
-_QUOTE_PAIRS = (('"', '"'), ("“", "”"), ("'", "'"), ("‘", "’"), ("「", "」"), ("『", "』"))
 # 行内序号(整段粘成一行时):空白后面跟 数字+.、) —— 零宽前瞻,便于 split
 _RE_INLINE_NO = re.compile(r"(?<=\s)(?=\d{1,2}\s*[\.、\)）](?!\d))")
-
-
-def _strip_quotes(s):
-    """去掉引号:整条被包住的、以及「开头引号…中间闭合」后面还跟话题的。
-
-    例:  “质感绝了！中帮老钱风休闲鞋” #软底休闲男鞋
-      ->  质感绝了！中帮老钱风休闲鞋 #软底休闲男鞋
-    """
-    changed = True
-    while changed and len(s) >= 2:
-        changed = False
-        for lq, rq in _QUOTE_PAIRS:
-            if s.startswith(lq):
-                i = s.find(rq, 1)
-                if i > 0:
-                    s = re.sub(r"\s+", " ", (s[1:i] + " " + s[i + 1:])).strip()
-                    changed = True
-                    break
-            if s.endswith(rq):
-                j = s.rfind(lq, 0, len(s) - 1)
-                if j >= 0:
-                    s = re.sub(r"\s+", " ", (s[:j] + " " + s[j + 1:-1])).strip()
-                    changed = True
-                    break
-    return s
 
 
 def _clean_one(line):
@@ -66,11 +42,11 @@ def _clean_one(line):
     s = s.replace("\u3000", " ").replace("\xa0", " ").strip()
     if not s:
         return ""
-    # 序号 / 标签 / 引号可能互相嵌套(「1. "标题"」),循环两遍足够
+    # 序号 / 标签可能互相嵌套(「示例:1. 标题」),循环两遍足够。
+    # 引号不处理(rev42 用户要求保留)
     for _ in range(2):
         s = _RE_LINE_NO.sub("", s, count=1).strip()
         s = _RE_LABEL.sub("", s, count=1).strip()
-        s = _strip_quotes(s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
 

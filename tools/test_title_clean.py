@@ -57,4 +57,12 @@ for name, text in CASES[:2]:
     titles, _ = split_titles(text)
     assert len(titles) == 9, f"{name} 应 9 条,实际 {len(titles)}"
     assert all(not t[0].isdigit() for t in titles), f"{name} 仍有行首数字"
-print("\nASSERT OK: 示范文本两种形态都是 9 条,无行首序号")
+# rev42: 引号必须原样保留
+q = split_titles('1. "质感绝了！中帮老钱风休闲鞋" #软底休闲男鞋')[0]
+assert q == ['"质感绝了！中帮老钱风休闲鞋" #软底休闲男鞋'], q
+q2 = split_titles("1. “老钱风精髓” #软底男鞋")[0]
+assert q2 == ["“老钱风精髓” #软底男鞋"], q2
+# 行尾标点一个不剥
+t3 = split_titles("1. 中帮老钱风｜")[0]
+assert t3 == ["中帮老钱风｜"], t3
+print("\nASSERT OK: 示范文本两种形态都是 9 条,无行首序号;引号与行尾标点保留")

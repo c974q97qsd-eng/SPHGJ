@@ -456,7 +456,7 @@ export const api = {
   publishAddTitles: (finder_id: string, contents: string) =>
     req<{ ok: boolean; added: number; titles_filled: number; parsed?: number; cleaned?: number; dropped?: number }>(
       "/publish/titles", { method: "POST", body: JSON.stringify({ finder_id, contents }) }),
-  /** 粘贴预览:清理掉行首序号/引号/全角空格后的标题列表(不落库) */
+  /** 粘贴预览:清理掉行首序号/全角空格后的标题列表(引号保留,不落库) */
   publishPreviewTitles: (finder_id: string, contents: string) =>
     req<{ ok: boolean; items: string[]; count: number; cleaned: number; dropped: number }>(
       "/publish/titles/preview", { method: "POST", body: JSON.stringify({ finder_id, contents }) }),

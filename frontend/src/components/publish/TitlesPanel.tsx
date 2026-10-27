@@ -19,7 +19,7 @@ export function TitlesPanel() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
-  // 粘贴预览:后端清理后的真实结果(序号/引号/全角空格已去掉)
+  // 粘贴预览:后端清理后的真实结果(序号/全角空格已去掉,引号和行尾标点保留)
   const [preview, setPreview] = useState<{ items: string[]; cleaned: number; dropped: number } | null>(null)
 
   const load = useCallback(async (p: string) => {
@@ -53,7 +53,7 @@ export function TitlesPanel() {
     try {
       const r = await api.publishAddTitles(pool, draft)
       const bits = [`添加 ${r.added} 条`]
-      if (r.cleaned) bits.push(`已自动清理 ${r.cleaned} 条的序号/引号等格式`)
+      if (r.cleaned) bits.push(`已自动清理 ${r.cleaned} 条的序号等格式`)
       if (r.dropped) bits.push(`跳过 ${r.dropped} 条空行/重复`)
       if (r.added < (r.parsed ?? r.added)) bits.push(`池内已有 ${(r.parsed ?? r.added) - r.added} 条相同标题`)
       if (r.titles_filled) bits.push(`已给 ${r.titles_filled} 条待发任务补上标题`)
@@ -115,7 +115,7 @@ export function TitlesPanel() {
             <Textarea
               value={draft}
               onChange={(e) => setDraft(e.target.value)}
-              placeholder={"直接粘贴即可,行首序号、引号、全角空格会自动清掉。例如:\n1. 秋冬新款男鞋 上脚真的很稳 #男鞋 #老爹鞋\n2. 这双鞋的配色比图片还好看 #穿搭"}
+              placeholder={"直接粘贴即可,行首序号、全角空格会自动清掉,引号和行尾标点保留。例如:\n1. 秋冬新款男鞋 上脚真的很稳 #男鞋 #老爹鞋\n2. 这双鞋的配色比图片还好看 #穿搭"}
               className="min-h-[92px] text-sm"
             />
             <Button className="h-auto gap-1 sm:w-28" onClick={add} disabled={saving}>
@@ -128,7 +128,7 @@ export function TitlesPanel() {
             <div className="rounded-md border bg-muted/20 px-3 py-2 text-xs">
               <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
                 <span className="font-medium">识别到 {preview.items.length} 条标题</span>
-                {preview.cleaned > 0 && <span className="text-muted-foreground">· 已自动清理 {preview.cleaned} 条的序号/引号/全角空格</span>}
+                {preview.cleaned > 0 && <span className="text-muted-foreground">· 已自动清理 {preview.cleaned} 条的序号/全角空格</span>}
                 {preview.dropped > 0 && <span className="text-muted-foreground">· 跳过 {preview.dropped} 条空行/重复</span>}
                 {!preview.items.length && <span className="text-destructive">· 没有有效内容</span>}
               </div>
