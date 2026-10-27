@@ -256,6 +256,11 @@ class AccountWorker:
             logger.warning(f"[{self.account['id']}] 当前登录身份与锁定微信不一致"
                            f"(登录={cur_fid[:12]}… 应={locked_fid[:12]}…),按未登录处理,需重新扫码")
             self.logged_in = False
+        # rev38: 登录态真实可用时补齐 login_at、清掉 logout_at。
+        # 必须放在锁定校验【之后】—— 上面身份不一致时会把 logged_in 置 False,
+        # 那种情况不能记登录时间。
+        if self.logged_in:
+            await self._sync_login_time()
         self.api = WxApiClient(self.page, self.account, self.config, self.storage)
         # 重绑:自动回复/评论/删除/抓取器都持有 api 引用,重开浏览器后统一指向新客户端
         if self.auto_reply is not None: self.auto_reply.api = self.api
@@ -268,6 +273,46 @@ class AccountWorker:
                 self.account["_wx_name"] = wxn
         except Exception as e:
             logger.warning(f"[{self.account['id']}] 取登录微信名失败: {e}")
+
+    async def _sync_login_time(self):
+        """登录态确实可用时,把 login_at 补齐、logout_at 清掉(rev38)。
+
+        为什么需要:login_at 原先只在扫码 finalize(login_capture.py)里写。而账号
+        自动恢复走的是「注入 storage_state」和「profile 磁盘 cookie」两条路,都不写
+        login_at;logout_at 一旦写过还会永久留在 config 里。于是出现
+        login_at=None + logout_at=旧值、但 logged_in=true 的组合。
+
+        后果有三个:
+          1. 前端 LoginCountdown 只认 login_at,`!loginAt && logoutAt` 直接打
+             「未登录」—— 用户看到的状态和后端完全相反
+          2. publish_queue._login_remain_sec() 靠 login_at 算 24h TTL,拿不到就
+             返回 0,于是 min_login_remain_sec 这道门槛被静默跳过
+          3. config 里 logout_at 永远留着,再也没人清
+        """
+        acc = self.account
+        changed = False
+        if not (acc.get("login_at") or "").strip():
+            acc["login_at"] = datetime.now().isoformat(timespec="seconds")
+            changed = True
+        if acc.get("logout_at"):
+            acc.pop("logout_at", None)
+            changed = True
+        if not changed:
+            return
+        # 先写临时文件再 replace:config.json 是这个程序唯一的配置文件,
+        # 直接覆盖写在写一半掉电时会整份坏掉。
+        try:
+            tmp = "config.json.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.config, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, "config.json")
+            logger.info(f"[{acc.get('id')}] 已补齐登录时间 login_at={acc['login_at']}"
+                        f"(自动恢复的登录没走过扫码流程)")
+        except Exception as e:
+            logger.warning(f"[{acc.get('id')}] 补齐 login_at 写盘失败: {e}")
+            return
+        await self._emit("accounts_updated",
+                         {"reason": "login_time_sync", "account_id": acc.get("id")})
 
     async def _close_context(self):
         """关 context 收回 Chromium 进程(兜底 kill 残留 chrome)。清所有页面引用。"""

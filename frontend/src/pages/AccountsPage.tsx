@@ -150,7 +150,7 @@ function AccountCard({ acc, onRefresh }: { acc: AccountStatus; onRefresh: () => 
                   <Lock className="h-3 w-3" />已锁定
                 </Badge>
               )}
-              <LoginCountdown loginAt={acc.login_at} logoutAt={acc.logout_at} />
+              <LoginCountdown loginAt={acc.login_at} logoutAt={acc.logout_at} loggedIn={acc.logged_in} />
             </CardTitle>
             <div className="flex items-center gap-3 text-xs text-muted-foreground">
               {acc.wx_name && <span>微信: {acc.wx_name}</span>}
@@ -285,13 +285,24 @@ function fmtRemain(ms: number): string {
 
 /** 登录态 24h 超时倒计时。锚点 = 登录成功时间 login_at(backend/login_capture.py 落盘),
  *  覆盖手动登录 / 重新登录 / 自动 relogin 三条路径。 */
-function LoginCountdown({ loginAt, logoutAt }: { loginAt: string | null; logoutAt?: string | null }) {
+function LoginCountdown({ loginAt, logoutAt, loggedIn }: { loginAt: string | null; logoutAt?: string | null; loggedIn?: boolean }) {
   const [, forceTick] = useState(0)
   useEffect(() => {
     const timer = setInterval(() => forceTick((v) => v + 1), 1000)
     return () => clearInterval(timer)
   }, [])
 
+  // rev38:后端已确认真实登录态 —— 绝不显示「未登录」。
+  // login_at 只在扫码时写过,自动恢复(storage_state 注入 / profile 磁盘 cookie)
+  // 这两条路不写,而 logout_at 会永久留着,于是「没时间戳 + 有退出记录」这个组合
+  // 并不代表未登录。以 acc.logged_in 为准,时间未知就老实说时间未知。
+  if (!loginAt && loggedIn) {
+    return (
+      <Badge variant="outline" className="gap-1 border-emerald-500/40 text-emerald-600" title="当前登录态有效;登录时间未知(自动恢复的登录,没走过扫码流程)">
+        <Clock className="h-3 w-3" />已登录
+      </Badge>
+    )
+  }
   // 手动退出过登录态:明确显示「未登录」,而不是含糊的「计时未知」
   if (!loginAt && logoutAt) {
     return (

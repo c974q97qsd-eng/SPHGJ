@@ -3,9 +3,13 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { LoadingState, ErrorState, EmptyState } from "@/components/common/states"
+import { Pager } from "@/components/common/Pager"
 import { api, type PublishTask, type PublishTaskStatus } from "@/lib/api"
 import { toast } from "sonner"
 import { Send, SkipForward, RotateCcw, Trash2, Pencil, Check, X, Inbox, History } from "lucide-react"
+
+/** 每页条数。列表必须分页：一次渲染几百行会明显卡，后端本来就支持 offset。 */
+const PAGE_SIZE = 20
 
 const STATUS_META: Record<PublishTaskStatus, { label: string; variant: "secondary" | "success" | "destructive" | "warning" | "default" }> = {
   pending: { label: "等待发布", variant: "secondary" },
@@ -40,21 +44,24 @@ export function TaskTable({ mode }: { mode: "queue" | "history" }) {
   const [busyId, setBusyId] = useState<number | null>(null)
   const [editId, setEditId] = useState<number | null>(null)
   const [editText, setEditText] = useState("")
+  const [offset, setOffset] = useState(0)
+  const [total, setTotal] = useState(0)
 
   const statusParam = mode === "queue" ? "pending,running,need_review" : "success,failed,skipped"
 
   const load = useCallback(async (silent = false) => {
     if (!silent) setLoading(true)
     try {
-      const r = await api.publishTasks({ status: statusParam, limit: 200 })
+      const r = await api.publishTasks({ status: statusParam, limit: PAGE_SIZE, offset })
       setRows(r.items)
+      setTotal(r.total || 0)
       setError(null)
     } catch (e) {
       if (!silent) setError((e as Error).message)
     } finally {
       if (!silent) setLoading(false)
     }
-  }, [statusParam])
+  }, [statusParam, offset])
 
   useEffect(() => { load() }, [load])
   // 发布是长任务(上传/转码),用轮询看进度
@@ -62,6 +69,13 @@ export function TaskTable({ mode }: { mode: "queue" | "history" }) {
     const t = setInterval(() => load(true), 6000)
     return () => clearInterval(t)
   }, [load])
+
+  // 把当前页删空时自动回退一页，否则会停在一张空表格上
+  useEffect(() => {
+    if (!loading && offset > 0 && rows.length === 0 && total > 0) {
+      setOffset(Math.max(0, offset - PAGE_SIZE))
+    }
+  }, [loading, rows.length, offset, total])
 
   const act = async (id: number, fn: () => Promise<unknown>, okMsg: string) => {
     setBusyId(id)
@@ -86,6 +100,7 @@ export function TaskTable({ mode }: { mode: "queue" | "history" }) {
   }
 
   return (
+    <div className="space-y-2">
     <div className="overflow-x-auto rounded-md border">
       <table className="w-full text-sm">
         <thead className="bg-muted/50 text-xs text-muted-foreground">
@@ -182,6 +197,9 @@ export function TaskTable({ mode }: { mode: "queue" | "history" }) {
           })}
         </tbody>
       </table>
+    </div>
+    <Pager offset={offset} limit={PAGE_SIZE} total={total} onChange={setOffset}
+      unit={mode === "queue" ? "条待发布" : "条记录"} />
     </div>
   )
 }
