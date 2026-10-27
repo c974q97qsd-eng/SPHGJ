@@ -43,6 +43,7 @@ get_live_info 响应体含 liveStats。本版据此实现,不再依赖猜测的�
 """
 import asyncio
 import json
+import os
 import re
 import time
 import logging
@@ -50,6 +51,59 @@ from collections import deque
 from datetime import datetime
 from .selectors import LIVE_URL
 from .metrics import extract_all, shrink_conv
+
+# ======================== rev43: 已学 API 规格持久化 ========================
+# 现象:学到的 get_live_info/check_live_status 规格只活在内存。live_page 一重建
+# (定期释放 renderer / 省内存关浏览器后重开)就得从零重学,而学习依赖页面自发请求,
+# 时机过了就学不到 -> 误判"未在直播"。落到磁盘后重建即继承,首轮 poll 就能出数。
+_SPEC_CACHE_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "live_api_spec.json")
+
+
+def _load_spec_cache(account_id):
+    """读该账号已学到的 API 规格(文件不存在/损坏一律返回 {})。"""
+    try:
+        with io_open(_SPEC_CACHE_PATH) as f:
+            data = json.load(f)
+        spec = data.get(account_id) or {}
+        # 只认结构完整的条目,防止半截文件把轮询带进死循环
+        return {k: v for k, v in spec.items()
+                if isinstance(v, dict) and v.get("url")}
+    except Exception:
+        return {}
+
+
+def _save_spec_cache(account_id, learned):
+    """写回该账号的 API 规格(tmp -> os.replace 原子写;失败静默,不影响抓取)。"""
+    try:
+        os.makedirs(os.path.dirname(_SPEC_CACHE_PATH), exist_ok=True)
+        try:
+            with io_open(_SPEC_CACHE_PATH) as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+        clean = {}
+        for k, v in (learned or {}).items():
+            if not isinstance(v, dict) or not v.get("url"):
+                continue
+            headers = {hk: hv for hk, hv in (v.get("headers") or {}).items()
+                       if hk.lower() != "cookie"}   # cookie 绝不落盘
+            clean[k] = {"url": v["url"], "method": v.get("method", "POST"),
+                        "headers": headers, "postData": v.get("postData")}
+        if not clean:
+            return
+        data[account_id] = clean
+        tmp = _SPEC_CACHE_PATH + ".tmp"
+        with io_open(tmp, "w") as f:
+            json.dump(data, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, _SPEC_CACHE_PATH)
+    except Exception:
+        pass
+
+
+def io_open(path, mode="r"):
+    """小工具:统一 utf-8 打开(读写都走这里,避免各处编码不一致)。"""
+    return open(path, mode, encoding="utf-8")
 
 logger = logging.getLogger("sphgj")
 
@@ -139,11 +193,22 @@ class LiveFetcher:
         # rev13: 主动轮询相关
         # rev16 F4: learned 非空时视为"已学会",跳过 requestWillBeSent 监听直接 poll
         self._learned = dict(learned) if learned else {}   # {"live_info": spec, "live_status": spec}
-        self._inherited = bool(learned)                    # 规格是否来自继承(用于日志区分)
+        # rev43: 内存没继承到 -> 读磁盘缓存(data/live_api_spec.json),避免每次重建都从零学
+        if not self._learned:
+            cached = _load_spec_cache(account_id)
+            if cached:
+                self._learned = cached
+                logger.info(f"[live:{account_id}] 从磁盘缓存载入已学 API 规格: {sorted(cached)}")
+        self._inherited = bool(self._learned)              # 规格是否来自继承/缓存(用于日志区分)
         self._learning = not self._learned                 # 已继承则无需再学
         self._learn_deadline = 0.0      # 学习超时阈值(>此时间未学到则回退 CDP)
         self._poll_fail_streak = 0      # 主动轮询连续失败计数
         self._cdp_fallback = False      # 主动轮询不可用回退到 CDP 响应捕获
+        self._replay_tick = 0           # rev43: 回退 CDP 后的主动重放节流计数
+        self._reload_nudged = False     # rev43: 学习超时只自动 reload 一次,防抖
+        self._urls_seen = []            # rev44: 学习窗口内采样到的 live 相关请求 URL(限 5 条)
+        self._status_body_dumped = False  # rev45: check_live_status 原始响应只 dump 一次
+        self.live_flag = None           # rev46: check_live_status 里的布尔直播标志(True/False/未知)
         # rev21: CDP 回退任务的并发闸与追踪(防 fire-and-forget 任务无限堆积)
         self._cdp_tasks = set()         # 在飞的回退任务引用(完成自动 discard,close 时全部 cancel)
         self._cdp_seen = deque(maxlen=_CDP_SEEN_MAX)   # 最近处理过的 requestId(有界去重)
@@ -169,6 +234,15 @@ class LiveFetcher:
                 self._cdp.on("Network.requestWillBeSent", self._on_req_learn)
                 self._learn_deadline = time.time() + 15  # 15s 内学不到则回退 CDP
                 logger.debug(f"[live:{self.account_id}] CDP session 已建(Network 域已启用,启动 API 学习)")
+            elif "live_info" not in self._learned:
+                # rev44: 继承到 live_status 却缺 live_info —— 这样拿不到 liveStats,
+                # 而 liveStats 是 is_live 的唯一硬判据,等于永远判"未在直播"。
+                # 重开一个 15s 学习窗口专补 live_info(poll 照常用已有规格主动轮询,不等它)。
+                self._cdp.on("Network.requestWillBeSent", self._on_req_learn)
+                self._learning = True
+                self._learn_deadline = time.time() + 15
+                logger.info(f"[live:{self.account_id}] 继承规格缺 live_info,"
+                            f"重开 15s 学习窗口补学(已有: {sorted(self._learned)})")
             else:
                 # rev16 F4: 继承到规格,不注册学习监听 —— 零事件 churn,首轮 poll 即可出数
                 logger.info(f"[live:{self.account_id}] 继承已学 API 规格(跳过学习监听),"
@@ -282,12 +356,25 @@ class LiveFetcher:
         try:
             req = (event.get("request") or {})
             url = req.get("url", "")
+            # rev45: 只采样 cgi-bin 的 API 请求(静态 js/页面 URL 不是接口),限 5 条
+            if "live_info" not in self._learned and len(self._urls_seen) < 5 \
+                    and "cgi-bin" in url and "live" in url.lower() \
+                    and url not in self._urls_seen:
+                self._urls_seen.append(url)
+                logger.info(f"[live:{self.account_id}] live API 采样"
+                            f"({len(self._urls_seen)}/5): {url[:150]}")
+            learned_before = len(self._learned)
             if "get_live_info" in url:
                 self._learned["live_info"] = self._capture_req(req)
                 logger.debug(f"[live:{self.account_id}] 学到 live_info API: {url[:90]}")
             elif "check_live_status" in url:
                 self._learned["live_status"] = self._capture_req(req)
                 logger.debug(f"[live:{self.account_id}] 学到 live_status API: {url[:90]}")
+            if len(self._learned) > learned_before:
+                # rev43: 学到【一个】就立即剔除 cookie 并落盘。原实现要等两个都学到才处理,
+                # 于是"只学到 live_status"的实例既用不上也不留档,下次重建还得重学。
+                self._strip_cookie_headers()
+                _save_spec_cache(self.account_id, self._learned)
             if "live_info" in self._learned and "live_status" in self._learned:
                 # 两个都学到 -> 关闭常驻监听,消除事件 churn
                 try:
@@ -335,14 +422,24 @@ class LiveFetcher:
             cookie)拉取最新数据,Python 侧仅产生一次 fetch 往返的少量对象。
           - 主动重放连续 3 次失败(接口要求一次性 token 等):回退 CDP 响应捕获(功能不退化)。
         """
-        # 学习未完成:等学到;超时则回退 CDP
-        if self._learning and not self._cdp_fallback:
-            if time.time() > self._learn_deadline:
+        # rev43: 只要学到【任一】接口就主动重放,不再要求两个都学到。
+        # 原逻辑 _learning 是"全有或全无"开关:15s 内只学到 live_status(缺 live_info)
+        # 就完全不主动轮询,直接掉进 CDP 被动捕获 —— 而此刻页面早已把 check_live_status
+        # 发完,被动监听永远等不到新响应 -> 误判"未在直播"(2026-10-28 2 号事故)。
+        if not self._learned:
+            # 一个都没学到:等学习窗口;超时则回退 CDP(回退时自动 reload 重触发请求)
+            if self._learning and not self._cdp_fallback and time.time() > self._learn_deadline:
                 await self._enable_cdp_fallback()
             return await self.snapshot()
-        # 已回退 CDP: 数据由 responseReceived 被动填充,这里仅返回快照
+        # rev44: 已有一份规格但学习窗口到期 -> 摘监听,别留常驻事件 churn
+        if self._learning and time.time() > self._learn_deadline:
+            self._end_learning("学习窗口结束")
+        # 已回退 CDP:以被动捕获为主,但仍每 3 轮主动重放一次
+        # (直播间不刷新时,页面可能长时间不再发 check_live_status,纯被动会饿死)
         if self._cdp_fallback:
-            return await self.snapshot()
+            self._replay_tick = (self._replay_tick + 1) % 3
+            if self._replay_tick != 0:
+                return await self.snapshot()
         # 主动重放两个 API
         try:
             spec_info = self._learned.get("live_info")
@@ -362,6 +459,67 @@ class LiveFetcher:
             if self._poll_fail_streak >= 3:
                 await self._enable_cdp_fallback()
         return await self.snapshot()
+
+    def _end_learning(self, reason: str):
+        """rev44: 结束学习窗口(摘监听),不影响已有规格的主动轮询。"""
+        self._learning = False
+        try:
+            if self._cdp is not None:
+                self._cdp.remove_listener("Network.requestWillBeSent", self._on_req_learn)
+        except Exception:
+            pass
+        logger.info(f"[live:{self.account_id}] {reason},未学到 live_info;"
+                    f"继续按已有规格轮询: {sorted(self._learned)}")
+
+    def _schedule_reload(self, reason: str):
+        """rev43: 后台 reload 一次直播页,逼 SPA 重新发出 check_live_status/get_live_info。
+
+        只做一次(同一实例不重复),任务进 _cdp_tasks 追踪,close() 时会被 cancel。
+        这是 CDP 回退能起作用的【前提】:被动捕获看不到已经发生过的请求。
+        """
+        if self._reload_nudged or self.page is None:
+            return
+        self._reload_nudged = True
+
+        async def _do():
+            try:
+                if self.page is None:
+                    return
+                await _with_timeout(self.page.reload(wait_until="domcontentloaded"), 25)
+                logger.info(f"[live:{self.account_id}] 已重载直播页({reason}),等页面重新发出检测请求")
+            except Exception as e:
+                logger.debug(f"[live:{self.account_id}] 重载直播页失败: {e}")
+
+        try:
+            t = asyncio.create_task(_do())
+            self._cdp_tasks.add(t)
+            t.add_done_callback(self._cdp_tasks.discard)
+        except Exception:
+            pass
+
+    async def relearn(self):
+        """rev43: 检测阶段第二轮用 —— 重载直播页,并(在仍无规格时)重开学习窗口。
+
+        返回是否真的重载了(页面已关/重载失败返回 False)。
+        """
+        if self.page is None:
+            return False
+        self.updated_at_ts = 0.0
+        r = await _with_timeout(self.page.reload(wait_until="domcontentloaded"), 25)
+        if r is None and getattr(self.page, "is_closed", lambda: False)():
+            return False
+        if not self._learned and self._cdp is not None:
+            # 仍无规格:重新 arm 学习监听(10s 窗口),页面重载后请求会重新发出
+            try:
+                self._learning = True
+                self._learn_deadline = time.time() + 10
+                self._cdp.on("Network.requestWillBeSent", self._on_req_learn)
+                logger.info(f"[live:{self.account_id}] 重载后重新开始学习直播检测 API(10s 窗口)")
+            except Exception:
+                pass
+        # 已回退 CDP 的实例:reload 后被动捕获自然重新工作,清一下节流计数
+        self._replay_tick = 0
+        return True
 
     async def _fetch_replay(self, spec):
         """同源重放学到的请求(fetch,credentials:include 自动带 cookie)。返回响应体文本。"""
@@ -392,6 +550,10 @@ class LiveFetcher:
                 self._cdp.on("Network.responseReceived", self._on_cdp_response)
                 self._cdp_fallback = True
                 logger.warning(f"[live:{self.account_id}] 直播检测回退到 CDP 响应捕获(主动轮询不可用)")
+                # rev43: 被动监听只能看到【之后】发出的响应,而 check_live_status 通常在
+                # 页面初始化时就发完了。不 reload 的话这段监听就是空等,必然误判下播。
+                if not self._learned:
+                    self._schedule_reload("学习超时")
         except Exception as e:
             logger.debug(f"[live:{self.account_id}] 启用 CDP 回退失败: {e}")
 
@@ -438,6 +600,42 @@ class LiveFetcher:
         except Exception:
             return
         d = data.get("data") or {}
+        # rev45: 现网没有 get_live_info 接口(URL 采样确认),liveStats 只能指望这里。
+        # 若响应里自带 liveStats(直接字段或嵌套在 liveInfo 下),直接采用。
+        stats = d.get("liveStats") or (d.get("liveInfo") or {}).get("liveStats")
+        if isinstance(stats, dict) and stats:
+            self.live_stats = stats
+            self.updated_at = datetime.now().isoformat()
+            self.updated_at_ts = time.time()
+            logger.info(f"[live:{self.account_id}] 从 check_live_status 取到 liveStats"
+                        f"(字段数={len(stats)}),is_live 判定可用")
+        # rev46: 响应里若有明确的布尔直播标志,记为判据(供上层在无 liveStats 时使用)
+        for _k in ("isLive", "isLiving", "isLivingNow"):
+            _v = d.get(_k)
+            if isinstance(_v, bool):
+                if self.live_flag is not _v:
+                    logger.info(f"[live:{self.account_id}] check_live_status.{_k}={_v}")
+                self.live_flag = _v
+                self.updated_at = datetime.now().isoformat()
+                self.updated_at_ts = time.time()
+                break
+        # rev46: 首次把【完整】响应落盘 + 打关键字段摘要(现网没有 get_live_info,
+        # 是否在播的判据只能从这里的字段里找)
+        if not self._status_body_dumped:
+            self._status_body_dumped = True
+            try:
+                _dump_dir = os.path.join(os.path.dirname(_SPEC_CACHE_PATH), "live_probe")
+                os.makedirs(_dump_dir, exist_ok=True)
+                with io_open(os.path.join(_dump_dir, f"{self.account_id}.json"), "w") as f:
+                    f.write(txt)
+            except Exception:
+                pass
+            flag_vals = {k: d.get(k) for k in
+                         ("status", "isLive", "isLiving", "isLivingNow", "liveStatus")}
+            logger.info(f"[live:{self.account_id}] check_live_status 摘要: {flag_vals}, "
+                        f"liveObjectId={d.get('liveObjectId')}, liveId={d.get('liveId')}, "
+                        f"coverImg={len(d.get('coverImgList') or [])}项, "
+                        f"data_keys={sorted(d.keys())}")
         live_id = d.get("liveObjectId") or self._find_live_object_id(d)
         if live_id:
             if not self.live_object_id:
@@ -483,7 +681,9 @@ class LiveFetcher:
         # 三道闸: ① requestId 有界去重 ② 在飞任务数上限 ③ 任务套超时并可取消。
         try:
             url = (event.get("response") or {}).get("url", "")
-            if "channels.weixin.qq.com" not in url:
+            # rev44: 直播页实测跑在 ls.weixin.qq.com 域下,原判断只认 channels.weixin.qq.com
+            # -> 该域下的 check_live_status/get_live_info 响应全被丢弃,回退等于没开。
+            if "weixin.qq.com" not in url:
                 return
             if "get_live_info" in url:
                 target = self._capture_cdp
@@ -827,6 +1027,9 @@ class LiveFetcher:
             "stream_url": self.stream_url,
             "updated_at": self.updated_at,
             "metrics": self._dashboard_cache or {},
+            # rev43: 带上当前页面 URL —— 被判"未在直播"时能一眼看出是不是被弹回了 /platform
+            "page_url": (self.page.url if self.page is not None else ""),
+            "live_flag": self.live_flag,   # rev46: check_live_status 的布尔直播标志
         }
 
     async def fetch(self):

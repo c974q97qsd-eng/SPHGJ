@@ -441,7 +441,10 @@ class AccountWorker:
             # 非直播:关页回收(检测窗口内未拿到任何直播信号)
             logger.info(f"[{self.account['id']}] 直播检测:当前未在直播"
                         f"(live_stats={info.get('live_stats') is not None}, "
-                        f"live_object_id={lf.live_object_id})")
+                        f"live_object_id={lf.live_object_id}, "
+                        f"learned={sorted(getattr(lf, '_learned', {}) or {})}, "
+                        f"cdp_fallback={getattr(lf, '_cdp_fallback', None)}, "
+                        f"url={(info.get('page_url') or '')[-40:]})")
             try: await lf.close()
             except Exception: pass
             try: await self.live_page.close()
@@ -470,15 +473,37 @@ class AccountWorker:
         用 snapshot()(不告警)轮询,避免检测阶段误触发"stream_url 为空"告警;
         一旦取到 live_stats / live_object_id / stream_url 任意一项即认为响应已到,立即返回。
         """
-        deadline = time.time() + timeout
-        info = None
-        while time.time() < deadline:
-            # rev13: 主动轮询(替代被动等响应)——页面加载后由 fetcher 主动拉取直播数据
-            await lf.poll()
-            info = await lf.snapshot()
-            if info.get("live_stats") or lf.live_object_id or lf.stream_url:
-                return info
-            await asyncio.sleep(2)
+        # rev44: 提前返回条件必须与 _open_and_detect_live 的判定口径一致 ——
+        # 判定只认 live_stats / stream_url,live_object_id 不参与(可能是上一场残留)。
+        # 原实现拿 live_object_id 就提前 return,于是等不到 get_live_info 的 liveStats,
+        # 明明在播也被判"未在直播"。
+        def _hit(i):
+            return bool(i.get("live_stats") or lf.stream_url)
+
+        async def _round(secs):
+            deadline = time.time() + secs
+            info = {}
+            while time.time() < deadline:
+                # rev13: 主动轮询(替代被动等响应)——页面加载后由 fetcher 主动拉取直播数据
+                await lf.poll()
+                info = await lf.snapshot()
+                if _hit(info):
+                    return info
+                await asyncio.sleep(2)
+            return info or {}
+
+        info = await _round(timeout)
+        if _hit(info):
+            return info
+        # rev43: 首轮没信号【不再直接判下播】。学习超时点在第一轮尾声,剩下的几秒只够
+        # CDP 被动监听空等(页面早已把 check_live_status 发完)-> 必然误判。重载一次直播页
+        # 让请求重新发出,再给一轮时间。
+        try:
+            if await lf.relearn():
+                logger.info(f"[{self.account['id']}] 首轮未取到直播信号,重载直播页重试一轮")
+                info = await _round(12.0)
+        except Exception as e:
+            logger.debug(f"[{self.account['id']}] 重载重试失败: {e}")
         return info or {}
 
     async def _initial_live_check(self):
@@ -745,8 +770,9 @@ class AccountWorker:
                         retry_gap = int(self.config.get("live_poll_retry_gap_sec", 8))
                         if (self._live_poll_retry or 0) < max_retry:
                             self._live_poll_retry = (self._live_poll_retry or 0) + 1
+                            _gap = "从未取到信号" if not last_ts else f"距今{int(now - last_ts)}s"
                             logger.info(f"[{self.account['id']}] 直播信号中断"
-                                        f"(距今{int(now - last_ts)}s),原地重试 poll "
+                                        f"({_gap}),原地重试 poll "
                                         f"(第{self._live_poll_retry}次/最多{max_retry}次)")
                             await asyncio.sleep(retry_gap)
                             continue
