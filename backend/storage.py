@@ -1792,16 +1792,23 @@ class Storage:
 
     def reset_running_tasks(self):
         """启动时收尾:上次进程死在 running 的任务不能自动重发(怕实际已发出去),
-        统一转 need_review 等人工确认。返回受影响条数。"""
+        统一转 need_review 等人工确认。返回受影响条数。
+        rev40: 只更新 running 的 id。旧版 UPDATE 没有 WHERE,只要启动时存在 1 条 running,
+        就会把全表(含已 success / failed 的历史记录)统统刷成 need_review,
+        导致「已发布」被误判成「待核对」,成功统计失真。"""
         c = self._conn()
         try:
-            n = c.execute("SELECT COUNT(*) FROM publish_tasks WHERE status='running'").fetchone()[0]
-            if n:
-                c.execute("""UPDATE publish_tasks SET status='need_review',
-                             last_error=COALESCE(NULLIF(last_error,''),
-                               '进程中断,不确定是否已发出,请到视频号后台核对后再决定重试')""")
+            ids = [r[0] for r in
+                   c.execute("SELECT id FROM publish_tasks WHERE status='running'").fetchall()]
+            if not ids:
+                return 0
+            marks = ",".join("?" * len(ids))
+            c.execute(f"""UPDATE publish_tasks SET status='need_review',
+                          last_error=COALESCE(NULLIF(last_error,''),
+                            '进程中断,不确定是否已发出,请到视频号后台核对后再决定重试')
+                          WHERE id IN ({marks})""", ids)
             c.commit()
-            return n
+            return len(ids)
         finally:
             c.close()
 
