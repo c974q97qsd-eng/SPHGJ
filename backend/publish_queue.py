@@ -50,7 +50,8 @@ DEFAULTS = {
     "min_login_remain_sec": 7200,  # 登录态剩余不足 2h 不发(避免发一半掉登录)
     "tick_interval_sec": 30,
     "refresh_posts_after_sec": 180,  # 发完多久触发一次作品列表刷新
-    # 发布成功后把素材重命名为 "发布日期"发布-"标题"-原文件名(归档到 _done/)
+    # 发布成功后把素材重命名为 "发布日期"发布-"标题"-原文件名
+    # (rev41:归档到 <店铺目录>/_done/,不再一律塞 inbox/_done/)
     "rename_after_publish": True,
 }
 
@@ -489,32 +490,77 @@ class PublishQueue:
                     pass
             await self._push()
 
+    def _archive_subdir(self, src, ok=True):
+        """算出 src 该归档到哪个目录 —— 跟着**源文件所在的店铺目录**走。
+
+        rev41:旧行为一律丢进 inbox/_done/(inbox 根下一级),而 scan_inbox 是把
+        inbox/<目录名>/ 当店铺目录的,于是归档后素材不再按店铺区分,人工翻 _done
+        看不出是哪家店发的。现在归到 <店铺目录>/_done/。
+
+        返回 (目标目录, 是否贴合店铺目录)。退回 inbox/<_done|_failed> 的情形:
+          * src 为空 / 不在当前 inbox 之下(改过 inbox_dir、历史别处的路径、跨盘)
+            —— 绝不能因为源文件在别处就往用户别处建 _done 目录
+          * src 直接在 inbox 根(不是店铺目录)
+        src 已经在 _done/_failed/_unknown 里时返回其父目录本身(原地,视为已归档)。
+        """
+        root = os.path.abspath(self.inbox_dir)
+        fallback = os.path.join(root, SUB_DONE if ok else SUB_FAILED)
+        if not src:
+            return fallback, False
+        parent = os.path.dirname(os.path.abspath(src))
+        try:
+            inside = (os.path.normcase(os.path.commonpath([root, parent]))
+                      == os.path.normcase(root))
+        except ValueError:      # 不同盘符/UNC 不同共享 -> commonpath 抛 ValueError
+            inside = False
+        if not inside or os.path.normcase(parent) == os.path.normcase(root):
+            return fallback, False
+        name = os.path.basename(parent)
+        if not name:
+            return fallback, False
+        if name.startswith("_") or name.startswith("."):
+            # 已经在 _done/_failed/_unknown 等辅助目录里:原地即归档结果
+            return parent, False
+        return os.path.join(parent, SUB_DONE if ok else SUB_FAILED), True
+
     def _archive(self, task, ok=True):
-        """成功后把源文件移进 _done/。返回归档后的文件名(失败返回 "")。
+        """把源文件移进 <店铺目录>/_done/。返回归档后的文件名(失败返回 "")。
 
         rev26:开启 rename_after_publish 时按用户要求的格式重命名:
             "发布日期"发布-"使用的标题"-原文件名
         例:2026-10-20发布-厚底老爹鞋视觉增高 比例一下就出来了-2月28日 (58).mp4
+        rev41:归档目录跟着源文件所在店铺走(inbox/<店名>/_done/),不再一律塞
+            inbox/_done/。店铺目录里没视频可扫时 scan_inbox 会跳过它,不影响认领。
         """
         src = task.get("src_path") or ""
         if not src or not os.path.isfile(src):
             return ""
-        root = self.inbox_dir
-        sub = os.path.join(root, SUB_DONE if ok else SUB_FAILED)  # 目前只有成功路径会调用
+        sub, in_shop = self._archive_subdir(src, ok)
+        # 源文件已经在目标目录里(重复归档 / 已归档过) -> 原地就是结果,不再搬
+        if os.path.normcase(os.path.dirname(os.path.abspath(src))) == os.path.normcase(sub):
+            return os.path.basename(src)
         try:
             os.makedirs(sub, exist_ok=True)
             name = os.path.basename(src)
             if ok and self._cfg_get("rename_after_publish"):
-                name = self._published_name(task, src)
+                name = self._published_name(task, src, sub)
             dst = _unique_path(os.path.join(sub, name))
             shutil.move(src, dst)
+            if not in_shop:
+                # 退回到 inbox 根:源文件不在店铺目录下,留线索便于排查
+                logger.warning(f"[publish] 归档退回到 inbox 根(源文件不在店铺目录下) "
+                               f"{src} -> {dst}")
             return os.path.basename(dst)
         except Exception as e:
             logger.warning(f"[publish] 归档文件失败 {src}: {e}")
             return ""
 
-    def _published_name(self, task, src):
-        """拼 "日期发布-标题-原文件名"。标题清洗为合法文件名,整体长度受控。"""
+    def _published_name(self, task, src, dest_dir=None):
+        """拼 "日期发布-标题-原文件名"。标题清洗为合法文件名,整体长度受控。
+
+        rev41:dest_dir 是实际归档目录(含店铺名)。260 路径上限要按它算,
+        否则目标目录多一级店名后,长标题会拼出超长路径导致归档失败。
+        """
         stem, ext = os.path.splitext(os.path.basename(src))
         # 原文件名一般合法,但外部拷入/网络来源可能带非法字符,一并清掉
         stem = _safe_name(stem) or "video"
@@ -528,7 +574,7 @@ class PublishQueue:
         else:
             name = f"{date}发布-{stem}{ext}"
         # Windows 路径上限 260:超长时截断标题而不是截断原文件名(原名是溯源关键)
-        room = 250 - len(os.path.join(self.inbox_dir, SUB_DONE))
+        room = 250 - len(dest_dir or os.path.join(self.inbox_dir, SUB_DONE))
         if len(name) > room:
             over = len(name) - room
             keep = max(8, len(title) - over - 1)
