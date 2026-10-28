@@ -36,10 +36,13 @@ from .metrics import metric_dictionary, validate_card_fields, DEFAULT_CARD_FIELD
 from .memtrim import trim_now
 from .post_fetcher import PostFetcher
 from .publish_queue import PublishQueue
+from .publish_fixups import fix_mislabeled_need_review   # rev40: 历史误标回滚
 from .remote_view import RemoteRegistry
 from .browser import reap_profile_orphans
 from . import platforms                          # rev56: 平台维度抽象（wx / dy）
 from .douyin.manager import DouyinManager   # rev56: 抖音（platform=dy）
+from .douyin.login import DyLoginSession     # rev56j: 抖音扫码登录
+from .douyin.worker import DouyinWorker      # rev56j: 抖音浏览器生命周期
 from .local_window import local_windows, sweep_stale_view_profiles
 from . import restart as restart_mod
 
@@ -121,6 +124,8 @@ manager = AccountManager(config, storage, emit=hub.emit)
 # 页面通过 set_page 注入（见 /api/dy/attach），没注入时所有网络方法都返回未就绪。
 dy_manager = DouyinManager(config, storage, emit=hub.emit, save_config=save_config)
 _dy_cdp = {}   # {pw, browser} —— 挂载的外部浏览器句柄，别让 GC 收掉
+_dy_login_sessions = {}   # sid -> DyLoginSession
+_dy_workers = {}          # account_id -> DouyinWorker
 # rev25: 自动发作品调度器(inbox 扫描 + 队列 + UI 发布)
 publish_queue = PublishQueue(manager, storage, config, emit=hub.emit, save_config=save_config)
 # rev27: 远程同步浏览(CDP 串流),「打开」按钮走这里,5 分钟无操作自动断开
@@ -133,6 +138,18 @@ try:
         logger.warning(f"[publish] {_nr} 条任务上次运行中断,已转「待核对」(不会自动重发)")
 except Exception as _e:
     logger.warning(f"[publish] 收尾 running 任务失败(不影响启动): {_e}")
+
+# rev40: 旧版 reset_running_tasks() 的 UPDATE 漏了 WHERE —— 只要启动时存在 1 条
+# running，全表(含已 success / failed)都会被刷成 need_review。代码已修，
+# 历史脏数据在这里一次性回滚：只回滚有「已发布」硬证据的，其余保留人工核对。
+# 幂等、写审计(data/rev40_fix_audit.json)、异常不影响启动。
+try:
+    _fx = fix_mislabeled_need_review(storage.db_path, publish_queue.inbox_dir, logger)
+    if _fx.get("recover") and not _fx.get("skipped"):
+        logger.warning(f"[publish] rev40 历史误标修复: {_fx['recover']} 条 need_review 已确认为"
+                       f"「实际已发布」并转回 success（仍保留待核对 {_fx.get('kept', 0)} 条）")
+except Exception as _e:
+    logger.warning(f"[publish] rev40 历史误标修复跳过(不影响启动): {_e}")
 
 app = FastAPI(title="视频号评论区管理")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -172,6 +189,25 @@ async def _capture_loop():
     asyncio.create_task(_auto_restore_loop())
     # rev25: 自动发作品调度器(等自动恢复账号跑完再开始,见 PublishQueue._loop 的 20s 延迟)
     publish_queue.start()
+    # rev56j: 自动拉起抖音账号（有 platform=dy 的账号才动；没有就完全无操作）
+    async def _dy_auto_start():
+        await asyncio.sleep(25)
+        if config.get("dy_auto_start", True) is False:
+            logger.info("[dy] dy_auto_start=false，跳过自动启动")
+            return
+        accs = [a for a in config.get("accounts", []) if platforms.is_douyin(a)]
+        if not accs:
+            return
+        for acc in accs:
+            try:
+                w = _dy_worker(acc.get("id"))
+                if w is None:
+                    continue
+                res = await w.start(playwright=await _dy_pw())
+                logger.info("[dy:%s] 自动启动: %s" % (acc.get("id"), res))
+            except Exception as e:
+                logger.warning("[dy:%s] 自动启动异常: %r" % (acc.get("id"), e))
+    asyncio.create_task(_dy_auto_start())
     # rev31: 清掉上次进程遗留的本机窗口临时 profile(_view_*)
     try:
         sweep_stale_view_profiles()
@@ -1554,6 +1590,155 @@ async def live_screen_status():
             "metrics": info.get("metrics") if info else None,
         })
     return {"items": items, "card_fields": config.get("card_fields") or DEFAULT_CARD_FIELDS}
+
+
+# ===================== 抖音：扫码登录 / 浏览器生命周期 =====================
+async def _dy_emit(event, payload):
+    try:
+        await hub.emit(event, payload)
+    except Exception as e:
+        logger.debug("抖音事件推送失败 %s: %r" % (event, e))
+
+
+async def _dy_pw():
+    """复用 AccountManager 的 playwright 实例。
+
+    同一个 playwright 进程能跑多个浏览器 context，没必要再起一套（省一份内存，
+    也让「服务停止时一起收尾」只有一处逻辑）。
+    """
+    return await manager._ensure_playwright()
+
+
+def _dy_accounts():
+    return [a for a in config.get("accounts", []) if platforms.is_douyin(a)]
+
+
+def _dy_account(account_id=None):
+    accs = _dy_accounts()
+    if account_id:
+        return next((a for a in accs if a.get("id") == account_id), None)
+    return accs[0] if accs else None
+
+
+async def _dy_after_login(acc):
+    """登录成功落盘后自动把该账号跑起来（开浏览器 + 起轮询）。
+
+    放在后台任务里：扫码会话此刻正在收尾，别让开浏览器（几秒）卡住它。
+    """
+    aid = (acc or {}).get("id") or ""
+    if not aid:
+        return
+
+    async def _run():
+        try:
+            w = _dy_worker(aid)
+            if w is None:
+                return
+            res = await w.start(playwright=await _dy_pw(), force=True)
+            logger.info("[dy:%s] 登录后自动启动: %s" % (aid, res))
+        except Exception as e:
+            logger.warning("[dy:%s] 登录后自动启动异常: %r" % (aid, e))
+
+    asyncio.create_task(_run())
+
+
+def _dy_worker(account_id=None):
+    """取（或建）该账号的 worker。没有该账号返回 None。"""
+    acc = _dy_account(account_id)
+    if not acc:
+        return None
+    aid = acc.get("id") or ""
+    w = _dy_workers.get(aid)
+    if w is None:
+        w = DouyinWorker(acc, config, storage, dy_manager, emit=_dy_emit)
+        _dy_workers[aid] = w
+    return w
+
+
+@app.post("/api/dy/login/start")
+async def dy_login_start(headed: Optional[bool] = Query(None),
+                         account_id: Optional[str] = Query(None)):
+    """开始抖音扫码登录。返回 sid，二维码通过 qr_update 事件推送（也可轮询本接口）。
+
+    account_id 有值 = 给已有账号**重新登录**（沿用它的 id 与 profile 目录）。
+    重新登录前必须先停掉该账号的 worker —— 否则 profile 被运行中的 context 独占，
+    新 context 根本起不来（这也是视频号那边反复踩过的坑）。
+    """
+    if headed is None:
+        headed = _login_popup_window()
+    acc = None
+    if account_id:
+        acc = _dy_account(account_id)
+        if not acc:
+            raise HTTPException(404, "抖音账号不存在")
+        w = _dy_workers.get(account_id)
+        if w and w.status().get("running"):
+            await w.stop()
+            logger.info("[dy:%s] 重新登录前已停止运行中的 worker" % account_id)
+    pw = await _dy_pw()
+    sess = DyLoginSession(pw, config, _dy_emit, account=acc,
+                          save_config=save_config, on_finalized=_dy_after_login)
+    _dy_login_sessions[sess.sid] = sess
+    await sess.start(headed=headed)
+    return {"sid": sess.sid, "status": sess.status, "headed": headed,
+            "platform": "dy", "account_id": sess.acc_id}
+
+
+@app.get("/api/dy/login/{sid}")
+async def dy_login_state(sid: str):
+    """登录会话快照。image 字段给「不订阅 WS 也想拿二维码」的调用方用。"""
+    s = _dy_login_sessions.get(sid)
+    if not s:
+        raise HTTPException(404, "抖音登录会话不存在")
+    d = s.snapshot()
+    if s.qr_image:
+        d["image"] = s.qr_image
+    if s.status in ("captured", "failed", "cancelled"):
+        _dy_login_sessions.pop(sid, None)
+    return d
+
+
+@app.post("/api/dy/login/{sid}/cancel")
+async def dy_login_cancel(sid: str):
+    s = _dy_login_sessions.pop(sid, None)
+    if not s:
+        raise HTTPException(404, "抖音登录会话不存在")
+    await s.cancel()
+    return {"ok": True}
+
+
+@app.get("/api/dy/workers")
+async def dy_worker_list():
+    return {"workers": [w.status() for w in _dy_workers.values()],
+            "accounts": [platforms.account_brief(a) for a in _dy_accounts()]}
+
+
+@app.post("/api/dy/accounts/{account_id}/start")
+async def dy_account_start(account_id: str, force: bool = Query(False)):
+    """启动抖音账号（开浏览器 + 硬验 + 起轮询）。
+
+    未登录时返回 need_scan=True，前端据此走扫码流程 —— 这与视频号 rev55 的教训一致：
+    「账号不存在」和「已判掉线跳过启动」是两种语义，混成 404 会误导前端。
+    """
+    acc = _dy_account(account_id)
+    if not acc:
+        raise HTTPException(404, "抖音账号不存在")
+    w = _dy_worker(account_id)
+    res = await w.start(playwright=await _dy_pw(), force=force)
+    if not res.get("ok"):
+        return {"ok": False, "need_scan": bool(res.get("need_scan")),
+                "offline": bool(res.get("offline")),
+                "msg": res.get("msg") or res.get("error") or "", "worker": w.status()}
+    return {"ok": True, "worker": w.status()}
+
+
+@app.post("/api/dy/accounts/{account_id}/stop")
+async def dy_account_stop(account_id: str):
+    w = _dy_workers.get(account_id)
+    if not w:
+        return {"ok": True, "msg": "该账号本来就未运行"}
+    await w.stop()
+    return {"ok": True, "worker": w.status()}
 
 
 # ===================== 评论(归属 = 视频号 finder_id,不是登录卡片) =====================
