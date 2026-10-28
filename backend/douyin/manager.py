@@ -141,6 +141,37 @@ class DouyinManager:
         self._identity = ident
         return ident
 
+    async def verify_login(self):
+        """硬验登录态。返回 {"ok": bool, "reason": str, "identity": dict}。
+
+        🚨 判据只有一条：work_list 真的打通了（api.judge 通过 = 响应里有 extra）。
+        **不能**拿 refresh_identity() 当判定 —— 它对「登录成功但零作品」的新号
+        返回 {}，和「未登录」完全同形，用它判离线会把新号直接踢掉。
+
+        失败时区分三种 reason，上层据此决定要不要判离线：
+          · status_code=8 -> api.ERR_NOT_LOGGED_IN（**确定未登录**，可以判离线）
+          · 其它（超时 / -1 / 页面死）-> 只算「没验成」，一律不判离线
+        """
+        client, why = self._need_client()
+        if client is None:
+            return {"ok": False, "reason": "not_ready", "identity": {}}
+        env = await client.fetch_work_page(max_cursor=0, count=1)
+        if not env.get("__ok"):
+            return {"ok": False, "reason": env.get("__err") or "fail", "identity": {},
+                    "status_code": env.get("status_code")}
+        ident = {}
+        for w in (env.get("works") or []):
+            a = w.get("author") or {}
+            if a.get("uid") or a.get("sec_uid"):
+                ident = {"uid": str(a.get("uid") or ""),
+                         "sec_uid": str(a.get("sec_uid") or ""),
+                         "unique_id": str(a.get("unique_id") or ""),
+                         "nickname": a.get("nickname") or ""}
+                break
+        if ident:
+            self._identity = ident
+        return {"ok": True, "reason": "", "identity": ident}
+
     # ---------------- 抓取 ----------------
     async def fetch_now(self, max_works=None):
         client, why = self._need_client()
