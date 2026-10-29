@@ -17,6 +17,7 @@ from typing import Optional
 import socket
 import time
 import random
+import threading
 import urllib.request
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query, Request
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
@@ -257,26 +258,124 @@ async def _mem_monitor():
             logger.info(f"[mem] 主进程 RSS={mb:.0f}MB (账号={n_total}, 直播中={n_live})")
 
 
-def graceful_shutdown(timeout: float = 15.0):
-    """主线程(pywebview 窗口关闭后)调用:停 manager + playwright。
+# ---------------- rev59: 停机链路 ----------------
+# 历史问题:cleanup 从工作线程用 run_coroutine_threadsafe 往 uvicorn 的循环里排,
+# 每次重启都打
+#     WARNING graceful_shutdown 异常: Event loop is closed
+#     RuntimeWarning: coroutine 'AccountManager.stop_all' was never awaited
+# 结果【清理一次都没跑成】:浏览器没关、profile 锁没释放,main.py 直接 os._exit,
+# Chromium 被硬砍(残留孤儿进程 + cookie 可能未落盘)。
+#
+# 现在把清理的【唯一所有者】交给 FastAPI 的 lifespan shutdown:它在事件循环内部、
+# 循环关闭之前执行,任何退出路径(关窗口 / 远程重启 / Ctrl+C / uvicorn 自己退出)
+# 都会走到。graceful_shutdown 只负责「触发 + 等」,所以可以重复调用(幂等)。
+_shutdown = {
+    "started": False,      # 清理已开始(含正在跑)
+    "done": False,         # 清理已结束(含异常结束)
+    "started_at": 0.0,
+    "elapsed": 0.0,
+    "path": "",            # 触发来源:lifespan / thread
+    "error": "",
+}
+_shutdown_done = threading.Event()
 
-    超时放宽到 15s:多账号各自带直播 FLV 页,context.close 需要时间,
-    原 5s 易超时;超时/异常时取消后台协程,避免进程退出时它仍往已断管道
-    写事件触发驱动 EPIPE 崩溃。
-    """
-    if _LOOP is None:
-        return
-    fut = None
+
+def _loop_alive() -> bool:
+    """uvicorn 的事件循环是否还可用。关闭后往里排协程只会拿到 RuntimeError。"""
     try:
-        fut = asyncio.run_coroutine_threadsafe(manager.stop_all(), _LOOP)
-        fut.result(timeout=timeout)
+        return _LOOP is not None and not _LOOP.is_closed()
+    except Exception:
+        return False
+
+
+_stop_task = None          # 清理任务:全局共享,所有调用方都等它(见 _stop_everything)
+
+
+async def _do_cleanup():
+    """真正干活的那一次:停 manager + 登录会话 + playwright + 手动开的浏览器。"""
+    t0 = time.time()
+    logger.info(f"[shutdown] 开始清理({_shutdown['path']}):账号进程 "
+                f"{len(getattr(manager, 'workers', None) or {})} 个")
+    try:
+        await manager.stop_all()
+    except asyncio.CancelledError:
+        # 走到这里说明有人不等我们(强制退出),别谎报成功
+        _shutdown["error"] = "cleanup cancelled"
+        logger.warning("[shutdown] 清理被取消(进程被强制退出),浏览器可能残留")
+        raise
     except Exception as e:
-        logger.warning(f"graceful_shutdown 异常: {e}")
-        if fut is not None:
-            try:
-                fut.cancel()
-            except Exception:
-                pass
+        _shutdown["error"] = f"{type(e).__name__}: {e}"
+        logger.warning(f"[shutdown] 清理异常(继续退出): {e}")
+    finally:
+        _shutdown.update(done=True, elapsed=round(time.time() - t0, 2))
+        _shutdown_done.set()
+        try:
+            left = len(asyncio.all_tasks()) - 1     # 减掉自己
+        except Exception:
+            left = -1
+        logger.info(f"[shutdown] 清理完成,用时 {_shutdown['elapsed']}s,"
+                    f"仍有 {left} 个后台任务(uvicorn 收尾时统一取消)")
+
+
+async def _stop_everything(path: str = "lifespan"):
+    """停后台一切;只跑一次,并发调用者【一起等同一个 task】。
+
+    关键点(踩过):这里不能"已开始就直接 return"。uvicorn 的 lifespan shutdown
+    会调本函数,如果它立刻返回,uvicorn 认为应用已经关完 -> Runner 关闭事件循环
+    -> asyncio 把还在跑的清理任务一并取消 -> stop_all 被砍在中间,浏览器只关了
+    一半,而日志还写着「清理完成」。改成共享 task 并 await,循环就必须等它跑完。
+    """
+    global _stop_task
+    if _stop_task is None:
+        _shutdown.update(started=True, started_at=time.time(), path=path)
+        _stop_task = asyncio.get_running_loop().create_task(_do_cleanup())
+    task = _stop_task
+    try:
+        await asyncio.shield(task)      # shield:调用方被取消也不影响清理本身
+    except asyncio.CancelledError:
+        if not _shutdown["done"]:
+            raise
+    except Exception:
+        pass
+
+
+@app.on_event("shutdown")
+async def _on_lifespan_shutdown():
+    """所有退出路径的清理入口(窗口关闭 / 远程重启 / Ctrl+C / 服务自己退出)。"""
+    await _stop_everything("lifespan")
+
+
+def graceful_shutdown(timeout: float = 20.0) -> bool:
+    """确保后台清理完成,最多等 timeout 秒。返回 True = 已清理完成。
+
+    幂等:清理由 lifespan shutdown 拥有,这里只「触发 + 等」。
+    超时放宽到 20s:多账号各带直播 FLV 页,context.close 本来就慢。
+    """
+    if _shutdown_done.is_set():
+        return True
+    if not _shutdown["started"] and _loop_alive():
+        # 先建协程再排;排失败必须 close(),否则 GC 时抛
+        # "coroutine 'AccountManager.stop_all' was never awaited"。
+        coro = _stop_everything("thread")
+        try:
+            asyncio.run_coroutine_threadsafe(coro, _LOOP)
+        except Exception as e:
+            coro.close()
+            logger.warning(f"[shutdown] 无法把清理排进事件循环: {e}")
+    elif not _loop_alive():
+        # 循环已结束 = uvicorn 已经走到 lifespan shutdown,清理由它完成,这里只等
+        logger.info("[shutdown] 事件循环已结束,清理交由 lifespan shutdown 完成")
+    return _shutdown_done.wait(max(0.5, float(timeout)))
+
+
+def wait_shutdown(timeout: float = 20.0) -> bool:
+    """只等不触发(给 main.py 已经 poke 过 should_exit 之后用)。"""
+    return _shutdown_done.wait(max(0.0, float(timeout)))
+
+
+def shutdown_state() -> dict:
+    """停机状态快照,挂到 /api/system/info 供远程排障。"""
+    return {**_shutdown, "loop_alive": _loop_alive()}
 
 
 # ===================== 配置 =====================
@@ -823,7 +922,8 @@ async def system_info():
     """
     return {"ok": True, **restart_mod.runtime_info(),
             "restart": restart_mod.read_restart_status(),
-            "restart_wait": dict(_restart_wait)}   # rev58: 是否在等发布任务结束
+            "restart_wait": dict(_restart_wait),   # rev58: 是否在等发布任务结束
+            "shutdown": shutdown_state()}          # rev59: 停机链路状态
 
 
 @app.post("/api/publish/probe")
@@ -1135,7 +1235,10 @@ async def system_restart(delay: float = Query(3.0, ge=1, le=60),
                     logger.warning(f"[restart] 等了 {waited:.0f}s 发布仍未结束,"
                                    f"按 max_wait 强制重启;该任务重启后会被标成待核对")
                 logger.info(f"[restart] 发布任务已结束(等了 {waited:.0f}s),开始重启")
-                restart_mod.restart(delay)
+                info = restart_mod.restart(delay)
+                if info.get("already"):
+                    logger.info(f"[restart] 已经安排过重启(helper_pid="
+                                f"{info.get('helper_pid')}),本次不重复拉起")
             except Exception:
                 logger.exception("[restart] 延迟重启失败")
             finally:
@@ -1151,6 +1254,12 @@ async def system_restart(delay: float = Query(3.0, ge=1, le=60),
     except Exception as e:
         logger.exception("[restart] 启动重启失败")
         raise HTTPException(500, f"重启失败: {e}")
+    if info.get("already"):
+        # rev59: 同一进程 120s 内只允许安排一次重启(否则会拉起多个 helper,
+        # 极端情况出现两个新实例抢同一批 profile)
+        return {"ok": True, "state": "already", **info,
+                "hint": f"{info.get('since', 0):.0f} 秒前已经安排过一次重启,"
+                        f"本次不再重复拉起;继续等 pid 变化即可"}
     logger.info(f"[restart] 收到远程重启请求,{delay}s 后退出 "
                 f"(helper_pid={info['helper_pid']}, wait_task={int(bool(wait_task))})")
     return {"ok": True, "state": "restarting", **info,

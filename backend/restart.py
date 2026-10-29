@@ -201,10 +201,28 @@ def spawn_helper(delay=3.0, ports=None):
     return p.pid
 
 
+# rev59: 同一个进程只允许安排一次重启。
+# 2 分钟内连点 3 次会起 3 个 helper,每个都"等旧进程死 -> 拉新实例",
+# 极端情况下同时出现两个新实例(一个占 8712、一个退到 8713),互相抢 profile 锁。
+_inflight = {"at": 0.0, "helper_pid": 0}
+INFLIGHT_WINDOW = 120.0
+
+
 def restart(delay=3.0, ports=None):
-    """安排一次重启:先起 helper,再让本进程优雅退出。"""
+    """安排一次重启:先起 helper,再让本进程优雅退出。
+
+    若 INFLIGHT_WINDOW 秒内已经安排过一次,返回 {"already": True, ...} 且不起新 helper
+    (重复点重启不该变成"重启两次")。
+    """
     delay = max(1.0, min(float(delay), 60.0))
+    since = time.time() - _inflight["at"]
+    if _inflight["at"] and since < INFLIGHT_WINDOW:
+        logger.info(f"[restart] {since:.0f}s 前已安排过重启"
+                    f"(helper_pid={_inflight['helper_pid']}),忽略重复请求")
+        return {"old_pid": os.getpid(), "helper_pid": _inflight["helper_pid"],
+                "delay": delay, "already": True, "since": round(since, 1)}
     helper_pid = spawn_helper(delay, ports=ports)
+    _inflight.update(at=time.time(), helper_pid=helper_pid)
     _atomic_json(STATUS_PATH, {
         "at": datetime.now().isoformat(timespec="seconds"),
         "ok": None, "phase": "pending",
@@ -296,6 +314,29 @@ def write_status(req, **kw):
         pass
 
 
+def running_pid(ports):
+    """探一遍端口,返回 (端口, pid):第一个能上报 /api/system/info 的实例。
+
+    拉新实例之前必须先问一句 —— 并发重启或用户手动双击启动时,
+    外面可能已经有一个新实例在跑,再拉一个就是两个实例抢同一批 profile。
+    """
+    import urllib.request
+    for p in ports:
+        if not port_open(p):
+            continue
+        try:
+            with urllib.request.urlopen(
+                    "http://127.0.0.1:%d/api/system/info" % int(p), timeout=2) as r:
+                if r.status != 200:
+                    continue
+                d = json.loads(r.read().decode("utf-8", "replace"))
+                if d.get("pid"):
+                    return int(p), int(d["pid"])
+        except Exception:
+            pass
+    return 0, 0
+
+
 def wait_api(ports, timeout, old_pid):
     """等【新实例】就绪,返回端口(0 = 超时)。
 
@@ -330,14 +371,24 @@ def main():
 
     time.sleep(float(req.get("delay", 3)))
 
-    # 1) 等旧进程自然退出(主程序会优雅关闭浏览器,可能要几秒)
-    deadline = time.time() + 45
+    # 1) 等旧进程自然退出(主程序会优雅关闭浏览器,可能要十几秒)
+    # rev59: 旧进程现在会「排空连接(<=8s)+ 关浏览器(<=20s)」才退出,45s 太紧,
+    # 紧到会误杀正在收尾的进程 —— 那就又变成硬砍 Chromium 了。
+    deadline = time.time() + 75
     while time.time() < deadline and pid_alive(old_pid):
         time.sleep(0.5)
     if pid_alive(old_pid):
         log(req, "旧进程 %s 仍在,强制结束" % old_pid)
         kill_pid(old_pid)
         time.sleep(1.0)
+
+    # 1.5) 已经有别的新实例在跑?认领它,别再造一个(rev59)
+    port0, pid0 = running_pid(ports)
+    if pid0 and pid0 != old_pid:
+        log(req, "已有实例在跑(pid=%s, 端口 %s),跳过拉起" % (pid0, port0))
+        write_status(req, ok=True, phase="done", old_pid=old_pid,
+                     new_pid=pid0, port=port0, error="")
+        return 0
 
     # 2) 等端口释放
     deadline = time.time() + 20

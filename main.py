@@ -28,6 +28,24 @@ for _k in ("CHROME_CRASHPAD_PIPE_NAME", "ELECTRON_RUN_AS_NODE"):
 # 软件版本(与 git tag revXX 对应)。rev12=CDP 捕获基线;rev13=主动轮询替代常驻响应监听 + 修复直播信号抖动;rev14=内存优化(browser headless 参数 + flv.js 缓冲上限)
 VERSION = "14.0"
 
+# rev59: 退出/重启时的时间预算(秒)
+#   DRAIN: uvicorn 等现有连接自己断开的耐心。拖太久就永远走不到 lifespan shutdown,
+#          清理又白费;窗口已经先关掉了,WS 会立刻断,8s 足够。
+#   GRACEFUL: 等「关浏览器 / 释放 profile 锁 / 关 playwright」完成的上限。
+#          4 个带直播页的账号大约 3~8s,20s 是安全余量。
+DRAIN_TIMEOUT_SEC = 8.0
+GRACEFUL_TIMEOUT = 20.0
+
+
+def _p(msg: str):
+    """带时间戳的 print。
+
+    pythonw 启动时 stdout/stderr 都被重定向进 run.log,而 logging 输出的每行自带
+    时间戳、print 的没有 —— 混在一起时看不出先后。重启期间多进程交错写日志,
+    没有时间戳的那几行很容易被误判成"乱序"。
+    """
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}")
+
 # exe 内置浏览器定位(打包模式)
 if getattr(sys, "frozen", False):
     base = os.path.dirname(sys.executable)
@@ -86,7 +104,7 @@ def _is_windows() -> bool:
 
 def _fatal(msg: str):
     """桌面窗口无法创建时,弹原生消息框提示并退出(不回退浏览器)。"""
-    print(f"[ERROR] {msg}")
+    _p(f"[ERROR] {msg}")
     try:
         if _is_windows():
             import ctypes
@@ -147,11 +165,11 @@ def _ensure_window_shown(title: str, wait: float = 25.0):
                     if not u32.IsWindowVisible(h):
                         u32.ShowWindow(h, 5)          # SW_SHOW
                         u32.SetForegroundWindow(h)
-                        print(f"[兜底] 窗口处于隐藏状态,已强制显示 (hwnd={h})")
+                        _p(f"[兜底] 窗口处于隐藏状态,已强制显示 (hwnd={h})")
                     return                            # 已可见或已处理
                 time.sleep(0.5)
         except Exception as e:
-            print(f"[兜底] 窗口可见性检查失败: {e}")
+            _p(f"[兜底] 窗口可见性检查失败: {e}")
 
     threading.Thread(target=_worker, daemon=True).start()
 
@@ -168,7 +186,7 @@ def main():
     from backend import server
     from backend import restart as restart_mod
 
-    print(f"[启动] 视频号工具 v{VERSION}" + (" (headless)" if headless else ""))
+    _p(f"[启动] 视频号工具 v{VERSION}" + (" (headless)" if headless else ""))
 
     try:
         sys.stdout.reconfigure(line_buffering=True)
@@ -178,7 +196,10 @@ def main():
     port = _free_port()
     # 绑 0.0.0.0:桌面窗口仍走 127.0.0.1 本机访问,同时允许内网浏览器访问
     config = uvicorn.Config(server.app, host="0.0.0.0", port=port,
-                            log_level="warning", access_log=False)
+                            log_level="warning", access_log=False,
+                            # rev59: 给"等连接断开"设上限。无限等 => 走不到
+                            # lifespan shutdown => 浏览器永远关不掉。
+                            timeout_graceful_shutdown=DRAIN_TIMEOUT_SEC)
     srv = uvicorn.Server(config)
 
     # 后台线程跑 uvicorn
@@ -198,25 +219,45 @@ def main():
     restart_mod.write_launch_info()
     _win = {"obj": None}
 
+    def _stop_backend(timeout: float = GRACEFUL_TIMEOUT) -> bool:
+        """让后端停机,并等后台清理【真的】完成。返回 True = 清理完成。
+
+        rev59: 清理由 server 侧 FastAPI 的 lifespan shutdown 执行(在事件循环
+        内部、循环关闭之前),这里只负责 poke + 等。以前是从工作线程往事件循环
+        排 stop_all,循环一关就抛 RuntimeError,清理一次都没跑成。
+        """
+        try:
+            srv.should_exit = True
+        except Exception:
+            pass
+        try:
+            return bool(server.graceful_shutdown(timeout=timeout))
+        except Exception as e:
+            _p(f"[退出] 等待清理异常: {e}")
+            return False
+
     def _shutdown_hook(delay: float):
         def _worker():
             time.sleep(float(delay))
-            print("[重启] 收到重启指令,正在优雅退出…")
-            try:
-                server.graceful_shutdown()
-            except Exception as e:
-                print(f"[重启] graceful_shutdown 异常: {e}")
-            try:
-                srv.should_exit = True
-            except Exception:
-                pass
+            _p("[重启] 收到重启指令,正在优雅退出…")
+            # 1) 停后端并等清理(关浏览器 / 释放 profile 锁 / 关 playwright)。
+            #    uvicorn 停机会先给前端 WS 发关闭帧再走 lifespan shutdown,
+            #    所以窗口不必提前销毁 —— 让它留着,用户看到的是"窗口短暂无响应",
+            #    而不是"窗口突然消失"(后者像崩溃)。
+            ok = _stop_backend()
+            if ok:
+                _p("[重启] 清理完成,退出")
+            else:
+                _p(f"[重启] {GRACEFUL_TIMEOUT:.0f}s 内清理未完成,强制退出"
+                   f"(浏览器可能残留,下次启动会自动清孤儿)")
+            # 2) 关窗口让 webview.start() 返回(清理超时也要关,否则进程退出更难看)
             try:
                 if _win["obj"] is not None:
-                    _win["obj"].destroy()      # 让 webview.start() 返回
-            except Exception:
-                pass
-            time.sleep(4.0)                 # 给 uvicorn / 浏览器清理留时间
-            os._exit(0)                     # 兜底:确保进程真的退出
+                    _win["obj"].destroy()
+            except Exception as e:
+                _p(f"[重启] 关闭窗口失败(忽略): {e}")
+            time.sleep(0.5)                        # 让 run.log 落盘
+            os._exit(0 if ok else 3)
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -224,39 +265,36 @@ def main():
 
     url = f"http://127.0.0.1:{port}/"
     if headless:
-        print(f"[OK] headless 模式:后端已就绪 {url},Ctrl+C 或进程终止即退出")
+        _p(f"[OK] headless 模式:后端已就绪 {url},Ctrl+C 或进程终止即退出")
         try:
             while True:
                 time.sleep(1)
         except KeyboardInterrupt:
             pass
         finally:
-            server.graceful_shutdown()
-            srv.should_exit = True
+            _stop_backend()
         return
 
-    print("[OK] 正在打开桌面窗口…")
+    _p("[OK] 正在打开桌面窗口…")
 
     # 仅无图形服务器开发调试时允许回退浏览器(显式开关,默认关闭)
     force_browser = os.environ.get("PINLUN_FORCE_BROWSER") == "1"
 
     if force_browser:
-        print(f"[DEV] PINLUN_FORCE_BROWSER=1,用浏览器打开: {url}")
-        print("[DEV] 关闭此窗口或按 Ctrl+C 退出")
+        _p(f"[DEV] PINLUN_FORCE_BROWSER=1,用浏览器打开: {url}")
+        _p("[DEV] 关闭此窗口或按 Ctrl+C 退出")
         try:
             while True:
                 time.sleep(1)
         except KeyboardInterrupt:
-            server.graceful_shutdown()
-            srv.should_exit = True
+            _stop_backend()
         return
 
     # 始终使用桌面窗口;Windows 强制 WebView2 原生窗口
     try:
         import webview
     except ImportError:
-        server.graceful_shutdown()
-        srv.should_exit = True
+        _stop_backend()
         _fatal(
             "缺少桌面窗口依赖 pywebview,无法打开窗口。\n\n"
             "请先双击 setup.bat 安装依赖,或手动执行:\n"
@@ -271,12 +309,12 @@ def main():
                                             height=820, min_size=(900, 600))
         _ensure_window_shown("视频号工具")
         webview.start(gui=gui)
-        # 窗口关闭 -> 优雅停止
-        server.graceful_shutdown()
-        srv.should_exit = True
+        # 窗口关闭(用户点 X,或重启钩子先 destroy 了窗口)-> 优雅停止
+        # rev59: 这里必须等到清理完成才 return —— main() 一返回解释器就开始收尾,
+        # daemon 线程会被直接掐掉,清理一半等于没清理。
+        _stop_backend()
     except Exception as e:
-        server.graceful_shutdown()
-        srv.should_exit = True
+        _stop_backend()
         tip = (
             "无法创建桌面窗口。\n\n"
             f"原因: {e}\n\n"

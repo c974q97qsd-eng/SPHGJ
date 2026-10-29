@@ -56,6 +56,8 @@ function EngineControls() {
     try {
       const r = await api.systemRestart({ waitTask: true, delay: 3 })
       if (r.state === "waiting") toast.info(r.hint || "有作品正在发布,发完再重启")
+      // rev59: 120s 内重复点不会起第二个 helper,如实提示,避免"点了两次以为重启两次"
+      else if (r.state === "already") toast.info(r.hint || "已经在重启中,继续等它完成")
       else toast.info("正在重启,完成后页面会自动刷新")
     } catch (e) {
       toast.error("重启失败:" + (e as Error).message)

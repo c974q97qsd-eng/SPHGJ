@@ -371,7 +371,7 @@ export const api = {
     if (params.delay !== undefined) q.set("delay", String(params.delay))
     if (params.waitTask) q.set("wait_task", "1")
     if (params.maxWaitSec !== undefined) q.set("max_wait", String(params.maxWaitSec))
-    return req<{ ok: boolean; state: "waiting" | "restarting"; hint?: string; already?: boolean; max_wait?: number }>(
+    return req<{ ok: boolean; state: "waiting" | "restarting" | "already"; hint?: string; already?: boolean; max_wait?: number }>(
       `/system/restart?${q.toString()}`, { method: "POST" })
   },
   getLocalWindows: () =>
