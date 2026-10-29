@@ -120,6 +120,34 @@ class PublishQueue:
         self._current = None                # 正在发的任务 id
         self._unbound = []                  # 认不出归属的目录(引导用户绑定)
 
+    # ---------------- 重启前等待(rev58) ----------------
+    def busy_now(self):
+        """是否有作品正在发布:队列忙碌标志 + 库里 running 状态,两者取或。
+
+        只认其中一个会漏:刚接到任务时标志先立、状态后写;异常退出后进程重启,
+        标志归位但库里还留着 running。
+        """
+        if self._busy:
+            return True
+        try:
+            return bool(self.storage.query_tasks(status="running", limit=1)[1])
+        except Exception:
+            return False
+
+    async def wait_idle(self, max_wait=180.0, sleep=2.0):
+        """等「当前这一条」发完再返回,返回实际等待秒数。
+
+        为什么只等一条:发布本来就是全局串行的,进度都落在库里,重启后能接着发,
+        排队中的任务不会丢。等到 max_wait 仍未结束也返回(由调用方决定强走)。
+        """
+        waited = 0.0
+        while waited < max_wait:
+            await asyncio.sleep(sleep)
+            waited += sleep
+            if not self.busy_now():
+                break
+        return waited
+
     # ---------------- 配置 ----------------
     @property
     def cfg(self):

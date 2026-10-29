@@ -37,7 +37,7 @@ function fmtTime(s: string | null) {
 }
 
 /** 发布任务表。「待发布」与「发布记录」共用,只是筛的状态不同。 */
-export function TaskTable({ mode }: { mode: "queue" | "history" }) {
+export function TaskTable({ mode, finderId = "" }: { mode: "queue" | "history"; finderId?: string }) {
   const [rows, setRows] = useState<PublishTask[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -52,7 +52,12 @@ export function TaskTable({ mode }: { mode: "queue" | "history" }) {
   const load = useCallback(async (silent = false) => {
     if (!silent) setLoading(true)
     try {
-      const r = await api.publishTasks({ status: statusParam, limit: PAGE_SIZE, offset })
+      // order 交给后端:界面要「最新的在最上面」,而内部调度仍按「老任务先发」取,
+      // 两边共用一条 SQL 会打架,所以排序口径由调用方指定(见 storage.query_tasks)。
+      const r = await api.publishTasks({
+        status: statusParam, finder_id: finderId, order: mode,
+        limit: PAGE_SIZE, offset,
+      })
       setRows(r.items)
       setTotal(r.total || 0)
       setError(null)
@@ -61,7 +66,7 @@ export function TaskTable({ mode }: { mode: "queue" | "history" }) {
     } finally {
       if (!silent) setLoading(false)
     }
-  }, [statusParam, offset])
+  }, [statusParam, offset, finderId, mode])
 
   useEffect(() => { load() }, [load])
   // 发布是长任务(上传/转码),用轮询看进度
@@ -69,6 +74,9 @@ export function TaskTable({ mode }: { mode: "queue" | "history" }) {
     const t = setInterval(() => load(true), 6000)
     return () => clearInterval(t)
   }, [load])
+
+  // 切账号要回到第一页:否则带着上一个账号的 offset,大概率落在空页上
+  useEffect(() => { setOffset(0) }, [finderId])
 
   // 把当前页删空时自动回退一页，否则会停在一张空表格上
   useEffect(() => {
@@ -88,10 +96,13 @@ export function TaskTable({ mode }: { mode: "queue" | "history" }) {
   if (error) return <ErrorState message={error} onRetry={() => load()} />
 
   if (!rows.length) {
+    const scoped = !!finderId          // 已按账号筛选:空态要说清是「这个账号没有」
     return (
       <EmptyState
         icon={mode === "queue" ? <Inbox className="h-5 w-5" /> : <History className="h-5 w-5" />}
-        title={mode === "queue" ? "没有待发布的作品" : "还没有发布记录"}
+        title={mode === "queue"
+          ? (scoped ? "这个账号没有待发布的作品" : "没有待发布的作品")
+          : (scoped ? "这个账号还没有发布记录" : "还没有发布记录")}
         description={mode === "queue"
           ? "把视频丢进「视频号」子目录,系统会自动认领归属并从标题池取一条标题"
           : "发布成功或失败后会在这里留档,可核对错误原因"}

@@ -5,9 +5,11 @@ import { Badge } from "@/components/ui/badge"
 import { Switch } from "@/components/ui/switch"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { TaskTable } from "@/components/publish/TaskTable"
+import { AccountPicker } from "@/components/publish/AccountPicker"
+import { pendingCountOf } from "@/hooks/usePublishFinders"
 import { api, type PublishFinder, type PublishStatus } from "@/lib/api"
 import { toast } from "sonner"
-import { FolderOpen, RefreshCw, AlertTriangle, Send, CheckCircle2, Clock } from "lucide-react"
+import { FolderOpen, RefreshCw, AlertTriangle, Send, CheckCircle2, Clock, Users, CircleUser } from "lucide-react"
 
 /** 待发布:状态概览 + inbox 认领 + 队列表。 */
 export function QueuePanel() {
@@ -15,6 +17,8 @@ export function QueuePanel() {
   const [finders, setFinders] = useState<PublishFinder[]>([])
   const [scanning, setScanning] = useState(false)
   const [bindDir, setBindDir] = useState<Record<string, string>>({})
+  // rev58: 账号筛选。"" 不安全(Radix Tabs 要非空 value),用哨兵表示「全部」
+  const [finder, setFinder] = useState("__all__")
 
   const load = useCallback(async () => {
     try {
@@ -135,7 +139,32 @@ export function QueuePanel() {
         </CardContent>
       </Card>
 
-      <TaskTable mode="queue" />
+      {/* 账号选项卡片:同款页签胶囊,选中哪个账号下面表格就只看哪个 */}
+      <div className="flex flex-wrap items-center gap-2">
+        <AccountPicker
+          value={finder}
+          onChange={setFinder}
+          ariaLabel="按账号筛选待发布"
+          options={[
+            {
+              value: "__all__", label: "全部", icon: <Users className="h-3.5 w-3.5" />,
+              count: finders.reduce((a, f) => a + pendingCountOf(f), 0),
+              hint: "所有视频号的待发布合计",
+            },
+            ...finders.map((f) => ({
+              value: f.finder_id,
+              label: f.name,
+              icon: <CircleUser className="h-3.5 w-3.5" />,
+              count: pendingCountOf(f),
+              hint: `${f.name} · 待发 ${pendingCountOf(f)} 条` +
+                (f.today_success ? ` · 今日已发 ${f.today_success} 条` : "") +
+                (f.running ? " · 账号运行中" : " · 账号未运行"),
+            })),
+          ]}
+        />
+      </div>
+
+      <TaskTable mode="queue" finderId={finder === "__all__" ? "" : finder} />
     </div>
   )
 }

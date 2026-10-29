@@ -3,11 +3,11 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { Textarea } from "@/components/ui/textarea"
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+import { AccountPicker } from "@/components/publish/AccountPicker"
 import { LoadingState, ErrorState, EmptyState } from "@/components/common/states"
 import { api, type PublishFinder, type PublishTitle } from "@/lib/api"
 import { toast } from "sonner"
-import { Plus, Trash2, ListChecks, Eraser } from "lucide-react"
+import { Plus, Trash2, ListChecks, Eraser, Layers, CircleUser } from "lucide-react"
 
 /** 标题池:一条视频配一条标题,用过即作废(用完即弃)。 */
 export function TitlesPanel() {
@@ -89,17 +89,27 @@ export function TitlesPanel() {
         </CardHeader>
         <CardContent className="space-y-3">
           <div className="flex flex-wrap items-center gap-2">
-            <Select value={pool || "__generic__"} onValueChange={(v) => setPool(v === "__generic__" ? "" : v)}>
-              <SelectTrigger className="h-8 w-56 text-xs"><SelectValue /></SelectTrigger>
-              <SelectContent>
-                <SelectItem value="__generic__">通用池(所有视频号兜底) · 剩 {generic.unused}/{generic.total}</SelectItem>
-                {finders.map((f) => (
-                  <SelectItem key={f.finder_id} value={f.finder_id}>
-                    {f.name} · 剩 {f.titles_unused}/{f.titles_total}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+            {/* rev58: 下拉换成账号卡片(pool="" 是通用池,不能用空值当 Tabs value) */}
+            <AccountPicker
+              value={pool || "__generic__"}
+              onChange={(v) => setPool(v === "__generic__" ? "" : v)}
+              ariaLabel="按账号筛选标题池"
+              options={[
+                {
+                  value: "__generic__", label: "通用池", icon: <Layers className="h-3.5 w-3.5" />,
+                  count: generic.unused,
+                  hint: `通用池(所有视频号兜底) · 剩 ${generic.unused}/${generic.total}`,
+                },
+                ...finders.map((f) => ({
+                  value: f.finder_id,
+                  label: f.name,
+                  icon: <CircleUser className="h-3.5 w-3.5" />,
+                  count: f.titles_unused,
+                  hint: `${f.name} · 剩 ${f.titles_unused}/${f.titles_total}` +
+                    (f.today_success ? ` · 今日已发 ${f.today_success} 条` : ""),
+                })),
+              ]}
+            />
             <Badge variant={unused > 0 ? "success" : "destructive"} className="font-normal">
               未用 {unused} / 共 {items.length}
             </Badge>

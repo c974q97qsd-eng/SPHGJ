@@ -1599,7 +1599,7 @@ class Storage:
             clause = (" WHERE " + " AND ".join(where)) if where else ""
             rows = c.execute(
                 f"""SELECT id,finder_id,content,enabled,used_count,used_task_id,last_used_at,created_at
-                    FROM publish_titles{clause} ORDER BY used_count ASC, id ASC LIMIT ?""",
+                    FROM publish_titles{clause} ORDER BY used_count ASC, id DESC LIMIT ?""",
                 args + [limit]).fetchall()
             cols = ("id", "finder_id", "content", "enabled", "used_count",
                     "used_task_id", "last_used_at", "created_at")
@@ -1724,8 +1724,23 @@ class Storage:
         finally:
             c.close()
 
-    def query_tasks(self, status=None, finder_id=None, limit=200, offset=0):
-        """查发布队列,返回 (rows, total)。status 可传 'pending,running' 这种逗号串。"""
+    def query_tasks(self, status=None, finder_id=None, limit=200, offset=0, order=None):
+        """查发布队列,返回 (rows, total)。status 可传 'pending,running' 这种逗号串。
+
+        order 是【界面】的排序口径,只认白名单:
+            "queue"   发布中固定置顶,其余按入队 id 倒序(新的在前)
+            "history" 按完成/开始/入队时间倒序(最新的在前),同一秒的按 id 倒序
+            其它/不传 保持旧序(运行中 > 待发 > 其余,组内 id 升序)
+
+        为什么不直接把默认序改成倒序:内部调度 _tick()/fill_missing_titles() 都用
+        不带 order 的调用,它们依赖「旧任务先发」。界面想看到最新的在最上面,
+        调度却必须从最老的开始,两种需求共用一条 SQL 会互相打架。
+        """
+        order_sql = {
+            "queue": "CASE status WHEN 'running' THEN 0 ELSE 1 END, id DESC",
+            "history": "COALESCE(finished_at, started_at, queued_at) DESC, id DESC",
+        }.get(str(order or "").strip(),
+              "CASE status WHEN 'running' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END, id ASC")
         c = self._conn()
         try:
             where, args = [], []
@@ -1740,10 +1755,27 @@ class Storage:
             total = c.execute(f"SELECT COUNT(*) FROM publish_tasks{clause}", args).fetchone()[0]
             rows = c.execute(
                 f"""SELECT * FROM publish_tasks{clause}
-                    ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END,
-                             id ASC LIMIT ? OFFSET ?""", args + [limit, offset]).fetchall()
+                    ORDER BY {order_sql} LIMIT ? OFFSET ?""", args + [limit, offset]).fetchall()
             cols = [d[0] for d in c.execute("SELECT * FROM publish_tasks LIMIT 0").description]
             return [dict(zip(cols, r)) for r in rows], total
+        finally:
+            c.close()
+
+    def task_counts_by_finder(self):
+        """各视频号的任务数:{"<finder_id>": {"pending": n, "success": n, ...}}。
+
+        发布管理页的「账号选项卡片」要在每个账号上显示条数(待发 N / 已发 M),
+        一条 GROUP BY 就能拿到全部,不用前端按账号逐个请求。
+        没有任何任务的视频号不出现在返回里。
+        """
+        c = self._conn()
+        try:
+            out = {}
+            for fid, st, n in c.execute(
+                    "SELECT finder_id, status, COUNT(*) FROM publish_tasks "
+                    "GROUP BY finder_id, status"):
+                out.setdefault(fid or "", {})[st] = n
+            return out
         finally:
             c.close()
 

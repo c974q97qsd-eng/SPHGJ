@@ -2,7 +2,7 @@ import { useEffect, useState, type ReactNode } from "react"
 import { NavLink, useLocation } from "react-router-dom"
 import {
   LayoutDashboard, Users, MessageSquare, Moon, Sun,
-  Play, Square, RefreshCw, Loader2, Monitor, Type, Clapperboard, Send,
+  Play, Square, RefreshCw, Loader2, Monitor, Type, Clapperboard, Send, Power,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -45,6 +45,38 @@ function EngineControls() {
 
   const start = async () => { setActing(true); try { await api.engineStart(); toast.success("引擎已启动") } catch (e) { toast.error("启动失败:" + (e as Error).message) } finally { setActing(false); refresh() } }
   const stop = async () => { setActing(true); try { await api.engineStop(); toast.success("引擎已停止") } catch (e) { toast.error("停止失败:" + (e as Error).message) } finally { setActing(false); refresh() } }
+  /**
+   * 重启软件。waitTask=true:有作品正在发布时后端会等它发完再退,
+   * 接口立刻返回 state="waiting",这里只管轮询 pid,变了就刷新页面。
+   */
+  const restart = async () => {
+    setActing(true)
+    let oldPid: number | null = null
+    try { oldPid = (await api.systemInfo()).pid ?? null } catch { /* 拿不到就靠状态断 */ }
+    try {
+      const r = await api.systemRestart({ waitTask: true, delay: 3 })
+      if (r.state === "waiting") toast.info(r.hint || "有作品正在发布,发完再重启")
+      else toast.info("正在重启,完成后页面会自动刷新")
+    } catch (e) {
+      toast.error("重启失败:" + (e as Error).message)
+      setActing(false)
+      return
+    }
+    const deadline = Date.now() + 5 * 60 * 1000
+    while (Date.now() < deadline) {
+      await new Promise((res) => setTimeout(res, 2000))
+      try {
+        const info = await api.systemInfo()
+        if (info.pid && info.pid !== oldPid) {
+          toast.success("已重启,正在刷新")
+          setTimeout(() => location.reload(), 700)
+          return
+        }
+      } catch { /* 重启中连不上是正常的,继续等 */ }
+    }
+    toast.error("等重启超时了,请手动刷新页面")
+    setActing(false)
+  }
   const fetchNow = async () => { setActing(true); try { await api.engineFetchNow(); toast.success("已触发立即抓取") } catch (e) { toast.error((e as Error).message) } finally { setActing(false) } }
   const saveInterval = async () => {
     const v = parseInt(interval, 10)
@@ -63,6 +95,17 @@ function EngineControls() {
           {acting ? <Loader2 className="animate-spin" /> : <Play />}启动
         </Button>
       )}
+      {/* rev58: 重启系统。有作品在发就先发完(后端 wait_task),队列里其余任务不受影响 */}
+      <TooltipProvider>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button size="sm" variant="outline" onClick={restart} disabled={acting}>
+              {acting ? <Loader2 className="animate-spin" /> : <Power />}重启
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>重启软件(改代码/配置后生效)。正在发布的作品会先发完再重启,排队中的任务不受影响</TooltipContent>
+        </Tooltip>
+      </TooltipProvider>
       <TooltipProvider>
         <Tooltip>
           <TooltipTrigger asChild>

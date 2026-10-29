@@ -277,6 +277,8 @@ export interface PublishFinder {
   titles_unused: number
   last_success_at: string
   fail_streak: number
+  /** rev58: 各状态任务数 {"pending":n,"success":n,...},卡片上的数字由它求和 */
+  counts: Record<string, number>
 }
 
 export interface PublishStatus {
@@ -356,6 +358,22 @@ export const api = {
       `/accounts/${id}/close-window`, { method: "POST" }),
   // rev33: 当前访问者是否「运行程序的这台机器」(决定是否显示「打开」按钮)
   whoami: () => req<{ local: boolean; client: string }>("/system/whoami"),
+  systemInfo: () =>
+    req<{ ok: boolean; pid: number; version: string; started_at?: string;
+          restart_wait?: { waiting: boolean; since: number; max_wait: number } }>("/system/info"),
+  /**
+   * 重启软件(改代码/配置后生效)。
+   * waitTask=true:若有作品正在发布,后端等它发完才退出(最多 maxWaitSec 秒),
+   * 返回 state="waiting";否则立刻退,state="restarting"。
+   */
+  systemRestart: (params: { waitTask?: boolean; delay?: number; maxWaitSec?: number } = {}) => {
+    const q = new URLSearchParams()
+    if (params.delay !== undefined) q.set("delay", String(params.delay))
+    if (params.waitTask) q.set("wait_task", "1")
+    if (params.maxWaitSec !== undefined) q.set("max_wait", String(params.maxWaitSec))
+    return req<{ ok: boolean; state: "waiting" | "restarting"; hint?: string; already?: boolean; max_wait?: number }>(
+      `/system/restart?${q.toString()}`, { method: "POST" })
+  },
   getLocalWindows: () =>
     req<{ items: { account_id: string; name: string; opened_sec: number; idle_sec: number; temp_profile: boolean; injected: boolean }[] }>(
       "/local-windows"),
@@ -451,7 +469,7 @@ export const api = {
   // ==================== 自动发作品 ====================
   publishStatus: () => req<PublishStatus>("/publish/status"),
   publishFinders: () => req<{ items: PublishFinder[]; generic_titles: { total: number; unused: number }; mappings: Record<string, string> }>("/publish/finders"),
-  publishTasks: (params: { status?: string; finder_id?: string; limit?: number; offset?: number } = {}) => {
+  publishTasks: (params: { status?: string; finder_id?: string; limit?: number; offset?: number; order?: "queue" | "history" } = {}) => {
     const q = new URLSearchParams()
     Object.entries(params).forEach(([k, v]) => v !== undefined && v !== "" && q.set(k, String(v)))
     return req<{ items: PublishTask[]; total: number }>(`/publish/tasks?${q.toString()}`)

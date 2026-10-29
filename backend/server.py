@@ -822,7 +822,8 @@ async def system_info():
     该接口刻意保持极轻量:重启助手在等待新实例就绪时会高频轮询它。
     """
     return {"ok": True, **restart_mod.runtime_info(),
-            "restart": restart_mod.read_restart_status()}
+            "restart": restart_mod.read_restart_status(),
+            "restart_wait": dict(_restart_wait)}   # rev58: 是否在等发布任务结束
 
 
 @app.post("/api/publish/probe")
@@ -1095,25 +1096,64 @@ async def system_reap_orphans(account: str = Query("")):
     return {"items": items}
 
 
+# rev58: 等待发布任务结束再重启的状态(前端据此提示,避免重启把正在发的作品打断)
+_restart_wait = {"waiting": False, "since": 0.0, "max_wait": 0.0}
+
+
 @app.post("/api/system/restart")
-async def system_restart(delay: float = Query(3.0, ge=1, le=60)):
+async def system_restart(delay: float = Query(3.0, ge=1, le=60),
+                         wait_task: bool = False,
+                         max_wait: float = Query(180, ge=0, le=1800)):
     """远程重启:优雅退出 + 按原方式重新拉起(见 backend/restart.py)。
 
     用法(内网任意机器,无需登录):
         curl -X POST "http://<运行机>:8712/api/system/restart?delay=3"
+        curl -X POST "http://<运行机>:8712/api/system/restart?delay=3&wait_task=1"
+
+    wait_task=1:若此刻有作品正在发布/上传,本接口【立刻返回】{"state":"waiting"},
+    后台每 2 秒看一次,任务结束(或到 max_wait)后才真正退出。
+    发布本来就是全局串行的、进度都落在库里,重启后能接着发,所以只等「当前这一条」,
+    队列里其余任务不受影响。
 
     调用后【立刻返回】,真正退出发生在 delay 秒之后。客户端应轮询
     /api/system/info:pid 变了且服务可访问 = 重启成功;
     若长时间 pid 不变,看返回的 restart 字段里的 error。
     """
+    if wait_task and publish_queue.busy_now():
+        if _restart_wait["waiting"]:
+            return {"ok": True, "state": "waiting", "already": True,
+                    "waited_sec": round(time.time() - _restart_wait["since"], 1),
+                    "max_wait": _restart_wait["max_wait"],
+                    "hint": "已经在等当前这一条发完,不用重复点"}
+        _restart_wait.update({"waiting": True, "since": time.time(),
+                              "max_wait": max_wait})
+
+        async def _restart_after_task():
+            try:
+                waited = await publish_queue.wait_idle(max_wait=max_wait, sleep=2.0)
+                if publish_queue.busy_now():
+                    logger.warning(f"[restart] 等了 {waited:.0f}s 发布仍未结束,"
+                                   f"按 max_wait 强制重启;该任务重启后会被标成待核对")
+                logger.info(f"[restart] 发布任务已结束(等了 {waited:.0f}s),开始重启")
+                restart_mod.restart(delay)
+            except Exception:
+                logger.exception("[restart] 延迟重启失败")
+            finally:
+                _restart_wait["waiting"] = False
+
+        asyncio.create_task(_restart_after_task())
+        logger.info(f"[restart] 有作品正在发布,等它发完再重启(最多 {max_wait:.0f}s)")
+        return {"ok": True, "state": "waiting", "waited_sec": 0.0,
+                "max_wait": max_wait,
+                "hint": f"有作品正在发布,发完才重启(最多等 {max_wait:.0f} 秒)"}
     try:
         info = restart_mod.restart(delay)
     except Exception as e:
         logger.exception("[restart] 启动重启失败")
         raise HTTPException(500, f"重启失败: {e}")
     logger.info(f"[restart] 收到远程重启请求,{delay}s 后退出 "
-                f"(helper_pid={info['helper_pid']})")
-    return {"ok": True, **info,
+                f"(helper_pid={info['helper_pid']}, wait_task={int(bool(wait_task))})")
+    return {"ok": True, "state": "restarting", **info,
             "hint": "本进程将在 delay 秒后退出,请轮询 /api/system/info 确认新 pid"}
 
 
@@ -2558,6 +2598,7 @@ async def publish_status():
 async def publish_finders():
     """可发布视频号列表:带承载卡片、今日已发、标题余量、绑定状态。"""
     pool = storage.title_pool_stats()
+    counts = storage.task_counts_by_finder()      # rev58: 账号卡片上的条数
     today = datetime.now().strftime("%Y-%m-%d")
     out = []
     for acc in config.get("accounts") or []:
@@ -2579,6 +2620,8 @@ async def publish_finders():
             "titles_unused": ps.get("unused", 0),
             "last_success_at": storage.last_success_at(fid),
             "fail_streak": publish_queue._fail_streak.get(fid, 0),
+            # rev58: {"pending":n, "success":n, ...},前端按页签口径求和显示
+            "counts": counts.get(fid) or {},
         })
     generic = pool.get("") or {}
     return {"items": out, "generic_titles": {"total": generic.get("total", 0),
@@ -2587,9 +2630,13 @@ async def publish_finders():
 
 
 @app.get("/api/publish/tasks")
-async def publish_tasks(status: str = "", finder_id: str = "", limit: int = 100, offset: int = 0):
+async def publish_tasks(status: str = "", finder_id: str = "", limit: int = 100,
+                         offset: int = 0, order: str = ""):
+    """查发布任务。order=queue/history 是【界面】排序(新的在前),
+    不传则保持内部调度依赖的旧序(老任务先发),见 storage.query_tasks。"""
     rows, total = storage.query_tasks(status=status or None, finder_id=finder_id or None,
-                                      limit=min(limit, 500), offset=max(0, offset))
+                                      limit=min(limit, 500), offset=max(0, offset),
+                                      order=order or None)
     for r in rows:
         r["finder_name"] = publish_queue.finder_label(r.get("finder_id") or "")
     return {"items": rows, "total": total}
