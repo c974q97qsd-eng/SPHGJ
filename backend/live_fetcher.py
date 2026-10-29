@@ -281,6 +281,9 @@ class LiveFetcher:
         # rev57: 看板字段缺失定位用
         self.live_start_ts = None       # check_live_status.createTime(开播时刻,Unix 秒)
         self._empty_info_warn_ts = 0.0  # get_live_info 返回空 data 的告警限流(秒)
+        # rev57b: 「场次 ID 已刷新」日志的幂等标记。缓存模板里的旧 ID 是固定的,
+        # 不去重就会每轮重放都打一条 INFO(4 账号约 1800 条/小时),把 run.log 淹掉。
+        self._oid_logged = None         # 上次已打日志的 (旧ID, 新ID) 组合
         # rev21: CDP 回退任务的并发闸与追踪(防 fire-and-forget 任务无限堆积)
         self._cdp_tasks = set()         # 在飞的回退任务引用(完成自动 discard,close 时全部 cancel)
         self._cdp_seen = deque(maxlen=_CDP_SEEN_MAX)   # 最近处理过的 requestId(有界去重)
@@ -641,8 +644,13 @@ class LiveFetcher:
         if not oid:
             return None
         old = obj.get("liveObjectId") or ""
+        # rev57b: 同一 (旧, 新) 组合只打一次 —— 否则模板里那个固定的旧 ID 会让每轮
+        # 重放都打一条 INFO。换场后 oid 变了,组合跟着变,会重新打一条。
         if old and str(old) != str(oid):
-            logger.info(f"[live:{self.account_id}] 重放场次 ID 已刷新: {old} -> {oid}")
+            _pair = (str(old), str(oid))
+            if self._oid_logged != _pair:
+                self._oid_logged = _pair
+                logger.info(f"[live:{self.account_id}] 重放场次 ID 已刷新: {old} -> {oid}")
         obj["liveObjectId"] = str(oid)
         if "timestamp" in obj:
             obj["timestamp"] = str(int(time.time() * 1000))

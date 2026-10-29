@@ -242,6 +242,27 @@ lg.removeHandler(h3)
 ck(not any("重放场次 ID 已刷新" in m for m in h3.lines),
    "旧值为空串时不打「已刷新」(避免每轮刷屏)")
 
+# rev57b: 同一 (旧,新) 组合只打一次 —— 否则模板里固定的旧 ID 会让每轮重放都打
+h4 = Cap()
+lg.addHandler(h4)
+lg.setLevel(logging.DEBUG)
+for _ in range(5):
+    lf._fresh_post_data({"postData": INFO_POST})
+lg.removeHandler(h4)
+ck(not any("重放场次 ID 已刷新" in m for m in h4.lines),
+   "同一 ID 组合重复 5 次重放 -> 一条都不再打(不刷屏)", h4.lines)
+
+lf.live_object_id = "15000000000000000009"
+h5 = Cap()
+lg.addHandler(h5)
+lg.setLevel(logging.DEBUG)
+lf._fresh_post_data({"postData": INFO_POST})
+lg.removeHandler(h5)
+ck(any("重放场次 ID 已刷新" in m and "15000000000000000009" in m for m in h5.lines),
+   "换场(新 oid)-> 重新打一条,修好一处能看到一处", h5.lines)
+lf.live_object_id = LIVE_OID
+
+
 # ==================== 3. _fetch_replay ====================
 print("\n[3] _fetch_replay:缺本场 ID 时零发包")
 
