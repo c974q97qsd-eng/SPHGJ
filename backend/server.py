@@ -294,8 +294,11 @@ _stop_task = None          # 清理任务:全局共享,所有调用方都等它(
 async def _do_cleanup():
     """真正干活的那一次:停 manager + 登录会话 + playwright + 手动开的浏览器。"""
     t0 = time.time()
+    # rev60: 以前只报 workers(常是 0 个),看不出「还在恢复过程中」这件事,
+    # 于是「清理完成,账号进程 0 个」看起来像没问题,实际有账号正启动到一半被砍。
     logger.info(f"[shutdown] 开始清理({_shutdown['path']}):账号进程 "
-                f"{len(getattr(manager, 'workers', None) or {})} 个")
+                f"{len(getattr(manager, 'workers', None) or {})} 个,"
+                f"启动中 {len(getattr(manager, '_starting', None) or {})} 个")
     try:
         await manager.stop_all()
     except asyncio.CancelledError:

@@ -102,6 +102,10 @@ class AccountWorker:
         self.on_auth_change = None        # async (account_id, state, reason) -> None
         # 最近一次 auth_data 硬验的结论:"ok"/"no"/None(没验过/验不出)。判离线只认 "no"
         self._verify_result = None
+        # rev60: 浏览器启动失败的原因。以前 _open_context() 抛的异常被 start() 吞成
+        # 一行 ERROR 就完事,调用方拿不到任何信号 —— 只能看 logged_in=False,于是把
+        # 「停机把浏览器砍了」当成「未登录」,把好账号落盘成 offline。
+        self._start_error = None
         self.last_scan_at = None
         self.new_count = 0
         self._new_count_date = None  # 当日新增计数日期(跨天重置 new_count)
@@ -195,6 +199,12 @@ class AccountWorker:
             await self._open_context()
         except Exception as e:
             logger.error(f"[{self.account['id']}] 启动开浏览器失败: {e}")
+            # rev60: 记下来给调用方判断。注意这【不是】登录失效:launch / goto /
+            # wait_for_timeout 任何一步抛异常时 _verify_result 都会停在 None
+            # (rev54 约定:只认 "no",None = 没验成)。
+            self._start_error = f"{type(e).__name__}: {str(e).splitlines()[0][:140]}"
+        else:
+            self._start_error = None
         self._running = True
         # 启动后做一次直播检测(仅检测:直播则保持,非直播则收回进程)
         if self.logged_in:
@@ -1572,6 +1582,16 @@ class AccountManager:
         self.login_sessions = {}   # sid -> LoginSession
         self._playwright = None
         self._running = False
+        # rev60: 停机中标志。stop_all() 一开始就置 True,之后:
+        #   · start_account / restore_running_accounts 立刻停手(不再拉新的 Chromium)
+        #   · _remember_offline 拒绝落盘(停机时写的"未登录"几乎必然是假的)
+        #   · 运行意图一个字都不许动(用户「让它跑」的意愿不能被一次重启吞掉)
+        self._shutting_down = False
+        # rev60: 正在 start 过程中、还没进 self.workers 的 worker。
+        # 以前这类 worker 完全没人管:stop_all 只看 workers(那时是空的),
+        # 却照样 playwright.stop() 一刀切,把它们正在做的 goto 砍成
+        # 「Target page…closed」,再被误判成未登录。
+        self._starting = {}              # account_id -> AccountWorker
         self._fetch_lock = None          # 评论抓取全局串行锁(间隔排队)
         self._relogin_queue = []         # 待自动 relogin 的 account_id
         self._relogin_active_acc = None  # 当前正在 auto-relogin 的 account_id
@@ -1698,6 +1718,9 @@ class AccountManager:
     # ---------- 引擎 ----------
     async def start(self, headless=True, auto_relogin=True):
         await self._ensure_playwright()
+        # rev60: 引擎被重新拉起时复位停机标志(进程内 stop_all 之后就退出了,
+        # 这条主要用于测试与「停机后又有人 start」的极端情况,避免永久卡死)
+        self._shutting_down = False
         self._running = True
         # rev15 P0: 启动定时内存归还(独立于账号,引擎运行期间常驻)
         self._memtrim.start()
@@ -1783,6 +1806,11 @@ class AccountManager:
         用于「启动时就发现未登录」这条路径:扫码由前端 logged_in=false 触发,
         后台再排一个自动扫码会话会和它抢同一个 profile。
         """
+        # rev60: 停机期间写的"未登录"几乎必然是假证据(浏览器是被我们自己关的),
+        # 落盘只会污染 auth_state.json,让下次启动白白跳过这个好账号。
+        if self._shutting_down:
+            logger.info(f"[{account_id}] 正在停机,跳过离线记账({reason})")
+            return
         self._auth_offline[account_id] = {
             "reason": reason or "",
             "ts": time.time(),
@@ -1813,6 +1841,11 @@ class AccountManager:
             return None
         if account_id in self.workers:
             return self.workers[account_id]
+        # rev60: 正在停机就别再开新浏览器了 —— 开了也会被下面 stop_all 砍掉,
+        # 砍掉还会被误判成未登录。这条路径只在「停机与恢复/自动发布撞车」时触发。
+        if self._shutting_down:
+            logger.info(f"[{account_id}] 正在停机,跳过启动(运行意图保留)")
+            return None
         # rev54: 上次已判掉线,并且登录态没变过 -> 别再开一次浏览器去验,直接排队扫码。
         # 扫码成功后 storage_state 会变,指纹不匹配,这条分支自然失效。
         # rev55: 这条判定必须排在 _ensure_playwright() 之前 —— 那一步会拉起 Playwright
@@ -1831,7 +1864,22 @@ class AccountManager:
         total = max(1, len(self.config.get("accounts", [])))
         w._fetch_lock = self._fetch_lock
         w._cycle_offset = idx * self.config.get("fetch_interval_sec", 600) / total
-        await w.start(self._playwright, headless=True)
+        # rev60: 登记「启动中」,让 stop_all 能一起收拾它(见 B 段注释)
+        self._starting[account_id] = w
+        try:
+            await w.start(self._playwright, headless=True)
+        finally:
+            self._starting.pop(account_id, None)
+        # rev60: 启动过程中撞上停机 —— 浏览器已被 stop_all 关掉,w.start() 剩下的
+        # 流程却会继续跑(_running=True、start_live_detect 再起一个 task)。
+        # 这里直接收干净并当"没启动",运行意图原样保留。
+        if self._shutting_down:
+            logger.info(f"[{account_id}] 启动过程中进入停机,放弃本次启动(运行意图保留)")
+            try:
+                await w.stop()
+            except Exception as e:
+                logger.debug(f"[{account_id}] 放弃启动时清理异常(忽略): {e}")
+            return None
         if w.logged_in:
             w.start_loop()
             w.start_live_loop()
@@ -1844,6 +1892,20 @@ class AccountManager:
             # 尽快捕获"启动后开播"——解决非直播账号开播检测跟随 10 分钟抓取周期的延迟问题。
             if w.live_fetcher is None:
                 w.start_live_probe()
+        elif w._verify_result != "no":
+            # rev60: ★ 关键分支。走到这里说明 logged_in=False,但【没验成】:
+            # launch / goto / wait_for_timeout 抛了异常(典型:重启把浏览器砍了,
+            # profile 锁被占,网络不通),_verify_result 停在 None。
+            # 旧代码不看这个,一律 _remember_offline 落盘 offline —— 后果是
+            #   ① data/auth_state.json 把好账号记成掉线,下次启动直接跳过、排队扫码;
+            #   ② restore_running_accounts 见 aid 不在 workers,把运行意图也扔掉。
+            # 一个"重启撞上正在恢复"就白丢一个账号,用户看到的是"好号突然要重扫码"。
+            logger.warning(f"[{account_id}] 启动未完成({w._start_error or '浏览器未就绪'}),"
+                           f"这不是登录失效,不记账、保留运行意图,下次再试")
+            try:
+                await w.stop()
+            except Exception as e:
+                logger.debug(f"[{account_id}] 清理未完成的 worker 异常(忽略): {e}")
         else:
             # rev55: 启动时 auth_data 硬验就判「未登录」—— 这是确定性证据,必须记住。
             # 原来这里只 w.stop():虽然也不发任何请求,但状态没落盘,于是
@@ -2161,15 +2223,45 @@ class AccountManager:
             return
         logger.info(f"[恢复] 重启后自动恢复 {len(todo)} 个关闭前在跑的账号: {todo}")
         for i, aid in enumerate(todo):
+            # rev60: 一发现要停机就立刻收手,并把「还剩几个没恢复」写清楚。
+            # 运行意图一个都不动 —— 下次启动接着恢复(以前是在这里把账号扔掉的)。
+            if self._shutting_down:
+                logger.warning(f"[恢复] 正在停机,中止自动恢复(已跳过 {len(todo) - i} 个,"
+                               f"运行意图保留,下次启动继续)")
+                return
             if i:
-                await asyncio.sleep(gap_sec)
+                # 停机时不能傻睡 gap_sec:分段等,保证能及时收手
+                _left = float(gap_sec)
+                while _left > 0 and not self._shutting_down:
+                    _step = min(0.2, _left)
+                    await asyncio.sleep(_step)
+                    _left -= _step
+                if self._shutting_down:
+                    logger.warning(f"[恢复] 正在停机,中止自动恢复(已跳过 {len(todo) - i} 个,"
+                                   f"运行意图保留,下次启动继续)")
+                    return
             try:
-                await self.start_account(aid)
-                if aid not in self.workers:
-                    # 未登录/启动失败:移出 intent,避免下次重启再空试
+                w = await self.start_account(aid)
+                if aid in self.workers:
+                    continue
+                if self._shutting_down:
+                    # 启动途中开始停机:不算失败,不算未登录,直接收手
+                    logger.warning(f"[恢复] 正在停机,中止自动恢复(已跳过 {len(todo) - i} 个,"
+                                   f"运行意图保留,下次启动继续)")
+                    return
+                # rev60: 只有「auth_data 硬验明确说不」才算未登录、才踢出恢复列表。
+                # 以前只要 aid 不在 workers 就 discard —— 「浏览器没开起来」(停机打断/
+                # profile 锁/网络)也被当成未登录,把好账号的运行意图一起扔掉。
+                if w is not None and getattr(w, "_verify_result", None) == "no":
                     self._run_intent.discard(aid)
                     self._save_run_intent()
-                    logger.warning(f"[恢复] {aid} 未登录或启动失败,已移出恢复列表")
+                    logger.warning(f"[恢复] {aid} 确认未登录,已移出恢复列表(需重新扫码)")
+                else:
+                    _why = getattr(w, "_start_error", None) or "浏览器未就绪"
+                    logger.warning(f"[恢复] {aid} 本次没启动成功({_why}),"
+                                   f"保留运行意图,下次启动再试")
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.warning(f"[恢复] {aid} 启动异常(保留 intent,下次重启再试): {e}")
         logger.info("[恢复] 自动恢复流程结束")
@@ -2435,6 +2527,19 @@ class AccountManager:
         每一步都吞异常:任一环节失败不能阻断后续清理,否则残留的活浏览器
         在进程退出时仍推事件 -> 驱动 EPIPE 崩溃。
         """
+        # rev60: 先立停机标志 —— 之后任何 start_account / _remember_offline /
+        # 恢复循环都会立刻收手,不会再产生「被砍掉的开浏览器」和假的未登录记录。
+        self._shutting_down = True
+        self._running = False
+        # rev60: 把「正在启动中」(还没进 self.workers)的 worker 也关掉。
+        # 以前这批人完全没人管:stop_all 只看到 workers(常是空的)就报「账号进程 0 个」,
+        # 紧接着 playwright.stop() 一刀切,把它们进行中的 goto/wait 砍成
+        # 「Target page…closed」-> 被误判未登录 -> 踢出恢复列表。
+        starting = [w for w in list(self._starting.values()) if w is not None]
+        if starting:
+            logger.info(f"[shutdown] 关闭 {len(starting)} 个正在启动中的账号进程")
+            await asyncio.gather(*(w.stop() for w in starting), return_exceptions=True)
+        self._starting.clear()
         await self.stop()
         for s in list(self.login_sessions.values()):
             try:
