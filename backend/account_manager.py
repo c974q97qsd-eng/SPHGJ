@@ -1467,7 +1467,16 @@ class AccountWorker:
                     m["audience_10m"] = self._audience_10m
                     m["gmv_10m"] = self._gmv_10m
                     m["gmv_30m"] = self._gmv_30m
-                    m["liveDuration"] = (info.get("live_stats") or {}).get("liveDurationInSeconds")
+                    # rev57: liveStats 缺席时用 check_live_status.createTime 推算时长,
+                    # 避免时长格直接空白(前端会把 undefined 渲染成 "0:00" 的假值)。
+                    # 上限 24h 的护栏:createTime 残留上一场时算出天文数字要丢弃,宁可显示 "-"。
+                    _dur = (info.get("live_stats") or {}).get("liveDurationInSeconds")
+                    if _dur in (None, 0):
+                        _st = info.get("live_start_ts")
+                        if isinstance(_st, int) and _st > 0:
+                            _d = int(time.time()) - _st
+                            _dur = _d if 0 < _d < 24 * 3600 else None
+                    m["liveDuration"] = _dur
                     info["metrics"] = m
                     await self._emit("live_screen_update", {
                         "account_id": self.account["id"],

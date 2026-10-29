@@ -45,6 +45,9 @@ export function LiveScreenPage() {
 }
 
 function fmtDuration(sec?: number) {
+  // rev57: 缺失(undefined/null)显示 "-",不能落到下面的 0:00 —— 那是"直播刚开始 0 秒"
+  // 与"没有数据"两种含义的混淆,用户看到 0:00 会以为数据坏了却没线索。
+  if (sec == null) return "-"
   if (!sec) return "0:00"
   const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = Math.round(sec % 60)
   return h > 0 ? `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}` : `${m}:${String(s).padStart(2, "0")}`
@@ -110,9 +113,12 @@ function LiveCard({ it, cardFields, metricDict }: { it: LiveScreenItem; cardFiel
     }
   }, [it.stream_url, it.is_live])
 
-  // 画面下部 overlay:当前在线(liveStats)+ 自然流量 + 自然GMV(均来自 dashboardV4 metrics)
+  // 画面下部 overlay:当前在线 + 自然流量 + 自然GMV(均来自 dashboardV4 metrics)
   const naturalTraffic = it.metrics?.naturalTraffic
   const naturalGmv = it.metrics?.naturalGmv
+  // rev57: 当前在线优先取 dashboardV4 的 onlineWatchUv(与 9 格指标同源、有 liveObjectId 就能拿),
+  // liveStats 只作兜底 —— liveStats 断供时原来会直接显示假 0,看起来像"人都跑光了"。
+  const onlineCount = it.metrics?.onlineWatchUv ?? s?.currentOnlineCount
 
   return (
     <Card className="w-[342px] shrink-0 overflow-hidden">
@@ -129,7 +135,7 @@ function LiveCard({ it, cardFields, metricDict }: { it: LiveScreenItem; cardFiel
         {/* 画面下部 overlay:当前在线 + 自然流量 + 自然GMV(半透明) */}
         <div className="absolute bottom-0 left-0 right-0 flex items-baseline justify-around gap-2 bg-black/50 px-3 py-2 text-white backdrop-blur-sm">
           <div className="flex items-baseline gap-1">
-            <span className="text-xl font-bold tabular-nums">{s?.currentOnlineCount ?? 0}</span>
+            <span className="text-xl font-bold tabular-nums">{onlineCount ?? "-"}</span>
             <span className="text-[0.625rem] opacity-80">当前在线</span>
           </div>
           <div className="flex items-baseline gap-1">
