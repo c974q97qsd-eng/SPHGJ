@@ -39,6 +39,18 @@ pinlun/
 - **手动回复**:仅选中评论时触发右侧 Sheet 抽屉(回复/删除/置顶),无常驻回复栏。
 - **实时**:后端 Hub 把 `qr_update`/`login_status`/`engine_status`/`comments_update` 广播给所有 WS 客户端。
 
+### 已知硬坑(踩过别再踩,rev61)
+- **回评必须带 `exportId`**:`comment/create_comment` 不带 `exportId` 时服务端一律回
+  `{errCode:300800, errMsg:"request failed"}`,而且这个响应里**没有 `__err` 字段** ——
+  只审 `__err` 的调用方会把失败当成功,标 `replied=1` 后永不重试,客户就永远收不到。
+  对照:同一账号同一接口,`post_comment`(带 exportId)成功 446 条,`reply_comment`(不带)0 条。
+  **判成败一律用 `WxApiClient.failed(resp)`**(`__err` 或 `errCode != 0` 都算失败)。
+- **`_aid` 每次登录都会变**:`_post()` 里现取最新值,别用 `__init__` 里那份
+  (浏览器路径原来只有 HTTP 路径做了纠正)。
+- **补登「自己发出的评论」必须带时间窗**:自动评论话术是固定的,同话术全库几千条,
+  只按内容匹配会认到几个月前的老评论(`storage.reconcile_own_comments` 已加
+  `_pending_time_window`,登记前 10min ~ 后 30min,且取最近一条)。
+
 ## 运行 / 打包
 - 开发:`cd frontend && npm run dev`(5173,代理 /api /ws 到 8000);另起 `python -m uvicorn backend.server:app --port 8000`。
 - 桌面:`python main.py`(起服务 + pywebview 窗口)。
