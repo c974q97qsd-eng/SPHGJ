@@ -108,7 +108,11 @@ class WxApiClient:
         if not isinstance(resp, dict):
             return True
         err = resp.get("__err")
-        if err and err != "daily_write_limit":
+        # rev62: daily_write_limit / no_cookie / no_page:* 都是「本地这条路走不通」,
+        # 不是服务端拒绝。原来只有 daily_write_limit 豁免,no_cookie 也照样进退避,
+        # 而退避(30/120/600s)是按账号的 —— 会把同账号的正常读请求一起停掉。
+        if err and err != "daily_write_limit" and not (
+                err == "no_cookie" or str(err).startswith("no_page")):
             return True
         if resp.get("ret") not in (None, 0):
             return True
@@ -172,7 +176,13 @@ class WxApiClient:
         if self._via_http(is_write):
             resp = await self._post_via_http(path, url, body, page_url, is_write=is_write)
         if resp is None:
-            resp = await self._post_via_page(path, url, body)
+            if self.page is None:
+                # rev62: 没有页面就不存在"回退浏览器"这件事。原来这里一律调
+                # _post_via_page,拿回来的 no_page 既看不出真实原因(no_cookie?
+                # cookie 已过期?),又会被计成一次接口失败去触发退避。
+                resp = {"__err": "no_page:" + (self._http_last_why or "unknown")}
+            else:
+                resp = await self._post_via_page(path, url, body)
         # 失败退避 / 成功重置;写操作成功计数(持久化)
         if self._is_failure(resp):
             self._on_failure()
@@ -220,6 +230,13 @@ class WxApiClient:
         if not is_write:
             return self._read_via == "http"
         if self._write_via == "http":
+            return True
+        # rev62: 纯 HTTP 模式(浏览器已收回 / 从未打开)下,写操作直接走 HTTP。
+        # 原来这里返回 False -> _post_via_page -> page is None -> {"__err":"no_page"},
+        # 于是 uspoloassn7 每轮「自动评论失败: no_page」,一条都没发出去;
+        # 而且 no_page 被 _is_failure 当成接口失败,连续 11 次触发 600s 全局退避,
+        # 把正常的读请求一起停掉。写操作不再为它去开浏览器:同源同 cookie。
+        if self.page is None:
             return True
         if not self._write_http_accounts:
             return False
@@ -319,6 +336,12 @@ class WxApiClient:
             # rev54: 这不是限流,是【登录态死了】—— 记下来给上层判掉线用。
             if code in (300333, 300330):
                 self.auth_fail = {"code": code, "ts": time.time(), "path": path}
+            if is_write:
+                # rev62: 写操作经 HTTP 直连失败时,响应在这里就被 _http_give_up
+                # 换成 {"__err": "http_errCode=..."} 了,上层再也看不到原始报文。
+                # rev61 要求「写失败必须能看到服务端说了什么」,这里补上。
+                logger.warning("[api] HTTP 写失败 path=%s code=%s resp=%s",
+                               path, code, str(resp)[:400])
             # 读操作交回浏览器;写操作不重试
             return self._http_give_up("errCode=%s" % code, path,
                                       long_block=(code in (300333, 300330)),

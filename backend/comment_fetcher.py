@@ -261,7 +261,8 @@ class CommentFetcher:
             # 新视频检测(本地无记录)-> 自动评论+置顶
             is_new = (st is None) or (not st["seen"])
             if is_new and self.auto_commenter:
-                await self._maybe_auto_comment(oid)
+                # rev62c: 把发布时间传下去,由 AutoCommenter 判断是不是「新发布」。
+                await self._maybe_auto_comment(oid, v.get("createTime"))
 
             if st is not None:
                 # 优化1:接口明确说没评论 -> 跳过(记录快照)。set 内部有单调性保护,
@@ -301,8 +302,11 @@ class CommentFetcher:
         self._log_round(mode, len(videos), checked, total_new, pages, zone, complete)
         return len(videos), total_new, new_comments, deleted_ids, complete
 
-    async def _maybe_auto_comment(self, oid):
+    async def _maybe_auto_comment(self, oid, create_time=None):
         """自动评论。达每日写上限后当日直接跳过,不再逐条撞上限。
+
+        create_time: 作品发布时间(unix 秒)。AutoCommenter 用它挡掉老作品。
+        
 
         rev52: 原来每个新作品都调 try_comment -> post_comment 被上限挡回,
         线上一天打了 5574 条「写操作达每日上限」WARNING,把真正有用的日志淹掉。
@@ -314,7 +318,7 @@ class CommentFetcher:
             except Exception:
                 pass
         try:
-            await self.auto_commenter.try_comment(oid)
+            await self.auto_commenter.try_comment(oid, create_time)
         except Exception as e:
             logger.error(f"[{self.account_id}] 自动评论异常 {oid}: {e}")
 

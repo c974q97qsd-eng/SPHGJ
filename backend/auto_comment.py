@@ -5,6 +5,8 @@ config account 字段:
   auto_comment_content: str    评论内容(每账号自定义)
 """
 import logging
+import time
+
 logger = logging.getLogger("sphgj")
 
 
@@ -24,12 +26,42 @@ class AutoCommenter:
     def is_enabled(self):
         return bool(self.account.get("auto_comment_enabled")) and bool(self.account.get("auto_comment_content"))
 
-    async def try_comment(self, export_id):
-        """新视频:发评论 + 置顶(未发过才发)。返回是否成功。"""
+    def max_age_days(self):
+        """只评论「新发布」的作品:发布超过 N 天的不评论。0/负数 = 关闭闸门(老行为)。
+
+        rev62c: 触发上层的 is_new 是「本地没抓过这条作品」,不是「刚发布」。
+        浏览器收起的账号(非直播常态)写操作原来全失败,积压了大量从没评论过的
+        老作品;写通道修好后会在同一轮里逐条补评论 —— 一轮最多 100 条。
+        """
+        v = self.account.get("auto_comment_max_age_days")
+        if v is None:
+            cfg = getattr(self.api, "config", None) or {}
+            v = cfg.get("auto_comment_max_age_days", 7)
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return 7
+
+    async def try_comment(self, export_id, create_time=None):
+        """新视频:发评论 + 置顶(未发过才发)。返回是否成功。
+
+        create_time 是该作品的发布时间(unix 秒,接口 createTime);给了就按
+        auto_comment_max_age_days 判断是不是「新发布」。
+        """
         if not self.is_enabled():
             return False
         if self.storage.is_auto_commented(self.finder_id, export_id):
             return False
+        lim = self.max_age_days()
+        if lim > 0 and create_time:
+            try:
+                age_days = (time.time() - int(create_time)) / 86400.0
+            except (TypeError, ValueError):
+                age_days = 0.0
+            if age_days > lim:
+                logger.debug("[%s] 跳过自动评论:作品已发布 %.1f 天 > %d 天 %s",
+                             self.account["id"], age_days, lim, export_id)
+                return False
         content = self.account["auto_comment_content"]
         try:
             resp = await self.api.post_comment(export_id, content)

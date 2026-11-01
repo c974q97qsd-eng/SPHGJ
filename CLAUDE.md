@@ -50,6 +50,19 @@ pinlun/
 - **补登「自己发出的评论」必须带时间窗**:自动评论话术是固定的,同话术全库几千条,
   只按内容匹配会认到几个月前的老评论(`storage.reconcile_own_comments` 已加
   `_pending_time_window`,登记前 10min ~ 后 30min,且取最近一条)。
+- **写操作不要依赖浏览器页面(rev62)**:非直播账号的浏览器是收回的(`page is None`),
+  原来 `_via_http(is_write=True)` 一律返回 False → `_post_via_page` 拿到 `no_page`,
+  于是 uspoloassn7 的自动评论**一条都发不出去**(2026-11-02 每 10 分钟报一次),
+  而且 `no_page` 被 `_is_failure` 计成接口失败,连续 11 次触发 600s 全局退避,
+  把同账号正常读请求一起停掉。现在:没有页面时写操作直接走 HTTP(同源同 cookie),
+  `no_cookie` / `no_page:*` 也不再计入退避。
+  实测(2026-11-02 03:12,`page=None`):`create_comment` errCode=0 拿到真实 commentId,
+  `set_top_comment` 也 errCode=0 —— 写链路纯 HTTP 完全可用。
+- **自动评论要判「新发布」而不是「本地第一次见」(rev62)**:`is_new` 的原始判据是
+  `video_stats` 里没有该作品,不是发布时间。写通道修好之后,任何积压的未评论老作品
+  都会在同一轮被逐条补评论(一轮最多 100 条,直接撞 `daily_write_limit`),
+  砸到几个月前的视频上就是灾难。现在按 `createTime` 挡:`auto_comment_max_age_days`
+  默认 7 天(account 级可覆盖,0/负数 = 关闭闸门)。
 
 ## 运行 / 打包
 - 开发:`cd frontend && npm run dev`(5173,代理 /api /ws 到 8000);另起 `python -m uvicorn backend.server:app --port 8000`。
