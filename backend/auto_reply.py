@@ -74,8 +74,12 @@ class AutoReply:
         if not reply_text:
             return False
         try:
-            resp = await self.api.reply_comment(cid, reply_text)
-            if resp and not resp.get("__err"):
+            # rev61: exportId 必须带;不带时服务端回 300800,原来被当成成功。
+            if not export_id:
+                _row = await asyncio.to_thread(self.storage.get_comment, cid) or {}
+                export_id = _row.get("export_id")
+            resp = await self.api.reply_comment(cid, reply_text, export_id=export_id)
+            if not self.api.failed(resp):
                 await asyncio.to_thread(self.storage.mark_replied, cid)
                 # 记录本工具发出的评论(隐藏与溯源用):拿到 id 直接登记,
                 # 拿不到就记待确认,由 comment_fetcher 抓完一轮后补登

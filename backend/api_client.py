@@ -158,6 +158,13 @@ class WxApiClient:
         await self._throttle(path)
         base = base or BASE
         page_url = page_url or PAGE_URL
+        # rev61: _aid 每次登录都会变,而原来只有 _post_via_http 里会纠正 —— 写操作
+        # 默认走浏览器,于是拿旧 aid 发包,服务端一律回 300800 request failed。
+        # 这里统一现取,两条路都用同一份最新值。
+        _cur_aid = ((self._latest_account() or {}).get("_aid") or "").strip()
+        if _cur_aid and _cur_aid != self.aid:
+            logger.info(f"[api] _aid 已更新({str(self.aid)[:8]}… -> {_cur_aid[:8]}…) path={path}")
+            self.aid = _cur_aid
         url = f"{base}/{path}?_aid={self.aid}&_pageUrl={quote(page_url)}"
         # rev50: 读走 HTTP 直连(快、不占 renderer),写默认仍走浏览器。
         # 任何 HTTP 侧异常一律回退浏览器 —— 页面里是"活会话",永远比 storage_state 新。
@@ -169,6 +176,16 @@ class WxApiClient:
         # 失败退避 / 成功重置;写操作成功计数(持久化)
         if self._is_failure(resp):
             self._on_failure()
+            if is_write:
+                # rev61: 写失败必须留下请求指纹。原来只有一句「请求失败(连续 N 次)」,
+                # 拿不到 path/aid/关键字段,300800 查了两周都没定位。
+                _keys = ("replyCommentId", "rootCommentId", "exportId", "opType",
+                         "objectId", "visibleType", "stickyOp")
+                logger.warning(
+                    "[api] 写操作失败 path=%s aid=%s 字段=%s resp=%s",
+                    path, (self.aid or "-")[:10],
+                    {k: str(body.get(k))[:24] for k in _keys if k in body},
+                    str(resp)[:300])
         else:
             self._on_success()
             if is_write:
@@ -235,6 +252,23 @@ class WxApiClient:
             if isinstance(v, int):
                 return v
         return None
+
+    @staticmethod
+    def failed(resp):
+        """rev61: 给【上层】判断「这一次到底成没成」。
+
+        原来 server/auto_reply/auto_comment 三处都只审 `__err`,而视频号的业务
+        失败走的是 errCode(如 300800 request failed),响应里根本没有 __err ——
+        于是失败被当成成功:mark_replied 照写、待确认照记,客户没收到回复,
+        系统却认为已经回过了,下一轮也不会再试。线上 01:36/02:20/03:03/03:05/
+        04:23 五次 300800 全是这么被吞掉的。
+        daily_write_limit 也算失败(确实没发出去),调用方按 502 提示即可。
+        """
+        if not isinstance(resp, dict):
+            return True
+        if resp.get("__err"):
+            return True
+        return WxApiClient._err_code(resp) not in (0, None)
 
     def _http_give_up(self, why, path, long_block=False, is_write=False):
         """HTTP 不可用 -> 记录原因。
@@ -445,12 +479,22 @@ class WxApiClient:
             lastBuff=last_buff, exportId=export_id,
             commentSelection=comment_selection, forMcn=False))
 
-    async def reply_comment(self, reply_comment_id, content, root_comment_id=None):
-        """回复评论。rootCommentId 缺省=replyCommentId(回复一级评论)。"""
+    async def reply_comment(self, reply_comment_id, content, root_comment_id=None,
+                            export_id=None):
+        """回复评论。rootCommentId 缺省=replyCommentId(回复一级评论)。
+
+        rev61: **必须带 exportId**。不带时服务端一律回 {errCode:300800,
+        errMsg:"request failed"}。对照证据(同一批账号、同一个接口
+        comment/create_comment):
+            post_comment  带 exportId + comment{}  -> own_comments 成功 446 条
+            reply_comment 不带 exportId            -> 成功 0 条(4 条全是补登误配)
+        export_id 缺省时由调用方从 comments 表按 comment_id 反查。
+        """
         return await self._post("comment/create_comment", self._body(
             replyCommentId=reply_comment_id, content=content,
             clientId=str(uuid.uuid4()),
-            rootCommentId=root_comment_id or reply_comment_id))
+            rootCommentId=root_comment_id or reply_comment_id,
+            exportId=export_id or ""))
 
     async def mark_read(self, export_id, op_type=1):
         return await self._post("comment/update_feed_comment", self._body(

@@ -33,7 +33,8 @@ class AutoCommenter:
         content = self.account["auto_comment_content"]
         try:
             resp = await self.api.post_comment(export_id, content)
-            if not resp or resp.get("__err"):
+            # rev61: 与回评同一套判定(errCode 业务失败也算失败)
+            if self.api.failed(resp):
                 logger.warning(f"[{self.account['id']}] 自动评论失败 {export_id}: {resp}")
                 return False
             # 解析 commentId(响应 data.comment.commentId 或 data.commentId)
@@ -57,7 +58,7 @@ class AutoCommenter:
                 return False
             # 置顶
             pin_resp = await self.api.pin_comment(export_id, comment_id)
-            if pin_resp and not pin_resp.get("__err"):
+            if not self.api.failed(pin_resp):
                 logger.info(f"[{self.account['id']}] 自动评论+置顶 {export_id}: {content}")
             else:
                 logger.warning(f"[{self.account['id']}] 置顶失败 {export_id}: {pin_resp}")

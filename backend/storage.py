@@ -1503,6 +1503,19 @@ class Storage:
         finally:
             c.close()
 
+    @staticmethod
+    def _pending_time_window(created_at, before=600, after=1800):
+        """待确认登记的时间窗(unix 秒)。登记时刻前 10 分钟 ~ 后 30 分钟。
+
+        抓取有延迟,所以窗口向后放宽;但绝不允许跨天 —— 跨天就会认到老的
+        同话术评论。created_at 解析不出来时退化为「不限时间」。
+        """
+        try:
+            ts = int(datetime.fromisoformat(str(created_at).strip()).timestamp())
+        except Exception:
+            return 0, 2 ** 31
+        return ts - int(before), ts + int(after)
+
     def pending_own_comment_count(self, finder_id=None):
         c = self._conn()
         try:
@@ -1526,25 +1539,33 @@ class Storage:
         c = self._conn()
         try:
             rows = c.execute(
-                "SELECT id, finder_id, account_id, export_id, content, via FROM own_comment_pending"
+                "SELECT id, finder_id, account_id, export_id, content, via, created_at "
+                "FROM own_comment_pending"
                 + (" WHERE finder_id=?" if finder_id else ""),
                 (finder_id,) if finder_id else ()).fetchall()
             if not rows:
                 return 0
             matched = 0
-            for pid, fid, acc, exp, content, via in rows:
+            for pid, fid, acc, exp, content, via, created_at in rows:
                 if not content:
                     c.execute("DELETE FROM own_comment_pending WHERE id=?", (pid,))
                     continue
+                # rev61: 加时间窗 + 取【最近】的一条。
+                # 原来不限时间还 ORDER BY create_time ASC,会认到几个月前的同话术
+                # 老评论 —— 线上实锤:10-14/10-25 两条待确认,被补登成 10-21 的两条
+                # auto_comment(话术都是「点头像，进入直播间领取优惠券下单！」)。
+                # 客户不会复述我方话术,但【我方自动评论】会,所以只靠内容匹配必然串。
+                lo, hi = self._pending_time_window(created_at)
                 row = c.execute(
                     """SELECT comment_id FROM comments
                         WHERE finder_id=? AND content=?
                           AND (?='' OR export_id=?)
+                          AND create_time BETWEEN ? AND ?
                           AND deleted=0 AND COALESCE(comment_id,'')<>''
                           AND comment_id NOT IN
                               (SELECT comment_id FROM own_comments WHERE COALESCE(comment_id,'')<>'')
-                        ORDER BY create_time ASC, id ASC LIMIT 1""",
-                    (fid, content, exp or "", exp or "")).fetchone()
+                        ORDER BY create_time DESC, id DESC LIMIT 1""",
+                    (fid, content, exp or "", exp or "", lo, hi)).fetchone()
                 if not row:
                     continue
                 c.execute("INSERT OR IGNORE INTO own_comments(finder_id,account_id,comment_id,via,created_at) "

@@ -2278,8 +2278,15 @@ async def reply_comment(comment_id: str, body: schemas.ManualReply):
     ok = await w.hold_for_manual()
     if not ok:
         raise HTTPException(400, "开浏览器失败,请检查登录状态")
-    resp = await w.api.reply_comment(comment_id, body.content)
-    if not resp or resp.get("__err"):
+    # rev61: exportId 必须带(见 api_client.reply_comment);成败判定改用
+    # api.failed() —— 只审 __err 会把 errCode=300800 当成功,标记已回复后
+    # 再也不会重试,客户永远收不到。
+    _cinfo = storage.get_comment(comment_id) or {}
+    _exp = _cinfo.get("export_id")
+    resp = await w.api.reply_comment(comment_id, body.content, export_id=_exp)
+    if w.api.failed(resp):
+        logger.warning("手动回复失败 comment=%s export=%s resp=%s",
+                       comment_id, (_exp or "-")[:18], str(resp)[:300])
         raise HTTPException(502, f"回复失败: {resp}")
     storage.mark_replied(comment_id)
     # 记录本工具发出的评论(「隐藏发出的评论」开关用)
@@ -2290,9 +2297,7 @@ async def reply_comment(comment_id: str, body: schemas.ManualReply):
         if isinstance(_cmt, dict):
             _ncid = _cmt.get("commentId") or _cmt.get("comment_id")
         _ncid = _ncid or _data.get("commentId") or _data.get("comment_id")
-    _cinfo = storage.get_comment(comment_id) or {}
     _fid = _cinfo.get("finder_id") or fid          # 以评论行上的归属为准(更权威)
-    _exp = _cinfo.get("export_id")
     _aid = w.account["id"]
     if _ncid:
         storage.mark_own_comment(_fid, _ncid, "manual_reply",
