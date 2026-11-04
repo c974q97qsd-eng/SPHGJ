@@ -469,6 +469,10 @@ export const api = {
   // ==================== 自动发作品 ====================
   publishStatus: () => req<PublishStatus>("/publish/status"),
   publishFinders: () => req<{ items: PublishFinder[]; generic_titles: { total: number; unused: number }; mappings: Record<string, string> }>("/publish/finders"),
+  // rev61: 手动解除某视频号的发布熔断
+  publishResetStreak: (finderId: string) =>
+    req<{ ok: boolean }>(`/publish/finders/${encodeURIComponent(finderId)}/reset-streak`,
+      { method: "POST" }),
   publishTasks: (params: { status?: string; finder_id?: string; limit?: number; offset?: number; order?: "queue" | "history" } = {}) => {
     const q = new URLSearchParams()
     Object.entries(params).forEach(([k, v]) => v !== undefined && v !== "" && q.set(k, String(v)))

@@ -37,6 +37,11 @@ SUB_DONE = "_done"
 SUB_FAILED = "_failed"
 SUB_UNKNOWN = "_unknown"
 
+# rev61: 「环境未就绪」错误前缀。带此前缀的失败不计入熔断 ——
+# 账号掉线等人扫码不是发布失败,计入会形成熔断死锁(详见 _ensure_worker)。
+_OFFLINE_TAG = "【需扫码】"
+
+
 DEFAULTS = {
     "enabled": False,              # 默认关:装好先看清配置再开
     "inbox_dir": "",               # 空 = <项目>/data/publish_inbox
@@ -49,6 +54,9 @@ DEFAULTS = {
     "auto_start_account": True,    # 账号没运行就自动拉起并保持运行
     "min_login_remain_sec": 7200,  # 登录态剩余不足 2h 不发(避免发一半掉登录)
     "tick_interval_sec": 30,
+    # rev61: 熔断(同一视频号连败 2 次)后冷却多久自动半开试发一条。
+    # 0 = 永久熔断,只能手动点重试或重启进程(旧行为)。
+    "circuit_cooldown_sec": 1800,
     "refresh_posts_after_sec": 180,  # 发完多久触发一次作品列表刷新
     # 发布成功后把素材重命名为 "发布日期"发布-"标题"-原文件名
     # (rev41:归档到 <店铺目录>/_done/,不再一律塞 inbox/_done/)
@@ -116,6 +124,7 @@ class PublishQueue:
         self._last_scan_at = 0.0
         self._last_scan_stat = {}
         self._fail_streak = {}              # finder_id -> 连续失败次数(熔断用)
+        self._fail_at = {}                  # rev61: finder_id -> 最后一次真失败时间戳(熔断半开用)
         self._last_tick = 0.0
         self._current = None                # 正在发的任务 id
         self._unbound = []                  # 认不出归属的目录(引导用户绑定)
@@ -317,6 +326,11 @@ class PublishQueue:
         return n
 
     # ---------------- 调度 ----------------
+    def _bump_fail_streak(self, fid):
+        """记一次真失败。rev61: 同时打时间戳,供熔断冷却期满后自动半开试探。"""
+        self._fail_streak[fid] = self._fail_streak.get(fid, 0) + 1
+        self._fail_at[fid] = time.time()
+
     def can_run(self, task, manual=False):
         """这条任务现在能不能发。返回 (ok, 原因)。manual=True 只查硬条件。"""
         fid = task.get("finder_id") or ""
@@ -347,8 +361,24 @@ class PublishQueue:
                 if last_ts and now - last_ts < need:
                     left = int((need - (now - last_ts)) / 60)
                     return False, f"距上次发布不足间隔,还要等约 {left} 分钟"
-            if self._fail_streak.get(fid, 0) >= 2:
-                return False, "连续失败 2 次已自动暂停该视频号,请在发布记录里核对后手动重试"
+            streak = self._fail_streak.get(fid, 0)
+            if streak >= 2:
+                # rev61: 熔断加冷却期,到点自动半开试一条。
+                # 旧版是纯内存计数、无 TTL:熔断 -> 不再派任务 -> 永远没有成功 -> 永不归零,
+                # 只能重启或手动点重试,实测把两个号锁死了两天。
+                # 半开失败会再次 _bump_fail_streak 并刷新时间戳,自然进入下一轮冷却。
+                cool = float(self._cfg_get("circuit_cooldown_sec") or 0)
+                if cool <= 0:
+                    # 配置 0 = 保留旧行为:永久熔断,只能手动解除或重启进程
+                    return False, f"连续失败 {streak} 次已自动暂停该视频号,请在发布记录里核对后手动重试"
+                last_fail = float(self._fail_at.get(fid) or 0)
+                # 没有时间戳(升级前就已熔断/手工塞的值)一律视为冷却已过,
+                # 否则会重现「永远不归零」的死锁
+                waited = (now - last_fail) if last_fail else 1e9
+                if waited < cool:
+                    left = int((cool - waited) / 60) + 1
+                    return False, f"连续失败 {streak} 次已熔断,约 {left} 分钟后自动试发一次"
+                logger.info(f"[publish] {self.finder_label(fid)} 熔断冷却期已过,半开试发一条")
         return True, ""
 
     def _account_for_finder(self, fid):
@@ -380,9 +410,21 @@ class PublishQueue:
         logger.info(f"[publish] 自动拉起账号 {aid} 用于发布")
         w = await self.manager.start_account(aid)
         if w is None:
+            # rev61: start_account 返回 None 有两种完全不同的原因:
+            #   1) 已知掉线(_is_known_offline) -> 直接排队扫码,要人等,属于环境未就绪
+            #   2) 浏览器真起不来 -> 属于失败,该计入熔断
+            # 旧版一律算失败,队列每 30s tick 一次,两条任务就把号熔断并锁死。
+            acc = next((a for a in (self.config.get("accounts") or [])
+                        if a.get("id") == aid), None)
+            known_offline = bool(
+                acc is not None
+                and getattr(self.manager, "_is_known_offline", None)
+                and self.manager._is_known_offline(acc))
+            if known_offline:
+                return None, f"{_OFFLINE_TAG}账号 {aid} 登录态失效,已排队等待扫码(不计入熔断)"
             return None, f"自动启动账号 {aid} 失败"
         if not w.logged_in:
-            return None, f"账号 {aid} 登录态失效,需要重新扫码(发布已排队等待)"
+            return None, f"{_OFFLINE_TAG}账号 {aid} 登录态失效,需要重新扫码(发布已排队等待)"
         return w, ""
 
     def _login_remain_sec(self, w):
@@ -428,9 +470,13 @@ class PublishQueue:
         try:
             w, err = await self._ensure_worker(fid)
             if err:
-                self.storage.set_task_status(int(task_id), status="pending" if "重新扫码" in err else "failed",
-                                             step="prepare", error=err, finished="重新扫码" not in err)
-                self._fail_streak[fid] = self._fail_streak.get(fid, 0) + 1
+                # rev61: 「需扫码」不是发布失败 —— 任务留 pending 等下一条,且不计入熔断
+                need_login = err.startswith(_OFFLINE_TAG) or "重新扫码" in err
+                self.storage.set_task_status(int(task_id),
+                                             status="pending" if need_login else "failed",
+                                             step="prepare", error=err, finished=not need_login)
+                if not need_login:
+                    self._bump_fail_streak(fid)
                 return {"ok": False, "error": err}
 
             # 登录身份必须与任务归属一致,否则会把作品发错号
@@ -480,6 +526,7 @@ class PublishQueue:
                     export_id=res.get("export_id") or "", account_id=w.account.get("id"),
                     finished=True)
                 self._fail_streak[fid] = 0
+                self._fail_at.pop(fid, None)
                 archived = self._archive(t, ok=True)
                 if archived:
                     self.storage.set_task_status(int(task_id), archived_name=archived)
@@ -490,8 +537,7 @@ class PublishQueue:
                 if self._cfg_get("refresh_posts_after_sec"):
                     asyncio.create_task(self._refresh_posts_later(w, int(task_id)))
             else:
-                attempts_fail = self._fail_streak.get(fid, 0) + 1
-                self._fail_streak[fid] = attempts_fail
+                self._bump_fail_streak(fid)
                 self.storage.set_task_status(
                     int(task_id), status="failed", step=res.get("step") or "",
                     error=res.get("error") or "", account_id=w.account.get("id"),

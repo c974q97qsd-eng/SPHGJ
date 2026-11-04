@@ -69,6 +69,16 @@ export function SettingsPanel() {
   if (loading) return <LoadingState />
   if (error || !st) return <ErrorState message={error || "加载失败"} onRetry={load} />
 
+  const resetStreak = async (finderId: string) => {
+    try {
+      await api.publishResetStreak(finderId)
+      toast.success("已解除熔断,该号会重新排入队列")
+      await load()
+    } catch (e) {
+      toast.error(`解除失败: ${(e as Error).message}`)
+    }
+  }
+
   return (
     <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_20rem]">
       <Card>
@@ -151,7 +161,13 @@ export function SettingsPanel() {
                 <span className="truncate text-sm font-medium" title={f.name}>{f.name}</span>
                 <div className="flex shrink-0 items-center gap-1">
                   {f.human_stopped && <Badge variant="secondary" className="text-[10px] font-normal">手动停</Badge>}
-                  {f.fail_streak >= 2 && <Badge variant="destructive" className="text-[10px] font-normal">已熔断</Badge>}
+                  {f.fail_streak >= 2 && (
+                    <>
+                      <Badge variant="destructive" className="text-[10px] font-normal">已熔断</Badge>
+                      <Button variant="outline" className="h-5 px-1.5 text-[10px]"
+                        onClick={() => resetStreak(f.finder_id)}>解除</Button>
+                    </>
+                  )}
                   {!f.logged_in && <Badge variant="warning" className="text-[10px] font-normal">未登录</Badge>}
                 </div>
               </div>

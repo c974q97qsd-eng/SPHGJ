@@ -2778,7 +2778,9 @@ async def publish_run(task_id: int, dry_run: bool = False):
     if t.get("status") == "success":
         raise HTTPException(400, "这条已经发布成功,不重复发(防重复)")
     # 手动发:清掉该视频号的熔断,重试要给人机会
-    publish_queue._fail_streak[t.get("finder_id") or ""] = 0
+    _fid = t.get("finder_id") or ""
+    publish_queue._fail_streak[_fid] = 0
+    publish_queue._fail_at.pop(_fid, None)
     if t.get("status") in ("failed", "need_review", "skipped"):
         storage.reset_task(task_id)
     res = await publish_queue.run_task(task_id, manual=True, dry_run=dry_run)
@@ -2807,7 +2809,9 @@ async def publish_retry(task_id: int):
         raise HTTPException(404, "任务不存在")
     if t.get("status") == "running":
         raise HTTPException(400, "正在发布中")
-    publish_queue._fail_streak[t.get("finder_id") or ""] = 0
+    _fid = t.get("finder_id") or ""
+    publish_queue._fail_streak[_fid] = 0
+    publish_queue._fail_at.pop(_fid, None)
     # 标题被还回池子后可能已被别的任务用掉 -> 重新取一条
     if not (t.get("title") or "").strip():
         tid, content = storage.take_title(t.get("finder_id") or "")
@@ -2817,6 +2821,16 @@ async def publish_retry(task_id: int):
     storage.reset_task(task_id)
     await publish_queue._push()
     return {"ok": True}
+
+
+@app.post("/api/publish/finders/{finder_id}/reset-streak")
+async def publish_reset_streak(finder_id: str):
+    """rev61: 手动解除某个视频号的熔断(连败计数清零,并清掉冷却时间戳)。"""
+    publish_queue._fail_streak[finder_id] = 0
+    publish_queue._fail_at.pop(finder_id, None)
+    await publish_queue._push()
+    logger.info(f"[publish] 人工解除熔断: {publish_queue.finder_label(finder_id)}")
+    return {"ok": True, "finder_id": finder_id}
 
 
 @app.post("/api/publish/tasks/{task_id}/title")
