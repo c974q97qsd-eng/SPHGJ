@@ -56,6 +56,13 @@ pinlun/
   而且 `no_page` 被 `_is_failure` 计成接口失败,连续 11 次触发 600s 全局退避,
   把同账号正常读请求一起停掉。现在:没有页面时写操作直接走 HTTP(同源同 cookie),
   `no_cookie` / `no_page:*` 也不再计入退避。
+- **发布熔断不能把「掉线等扫码」算失败,且必须有冷却期(rev63)**:
+  扫码要人参与,而队列 30s 一个 tick —— 只要 `_ensure_worker` 返回 err 就计数,
+  两条任务就能把号熔断。熔断又是纯内存字典、无 TTL、无半开:熔断 → 不派任务 →
+  永远没成功 → 永远不归零,只能重启,实测锁死两天。现在掉线类失败带
+  `_OFFLINE_TAG` 不计入,`circuit_cooldown_sec`(默认 1800s)到期自动半开试发。
+  **改熔断逻辑时注意:凡 `_fail_streak += 1` 都必须走 `_bump_fail_streak()`,
+  漏打 `_fail_at` 会让冷却判断拿到 `waited=1e9` 直接放行,等于没加冷却。**
   实测(2026-11-02 03:12,`page=None`):`create_comment` errCode=0 拿到真实 commentId,
   `set_top_comment` 也 errCode=0 —— 写链路纯 HTTP 完全可用。
 - **自动评论要判「新发布」而不是「本地第一次见」(rev62)**:`is_new` 的原始判据是
