@@ -110,6 +110,8 @@ class PostFetcher:
         self.page_size = int(pc.get("page_size", 200))
         data_dir = os.path.dirname(storage.db_path) if getattr(storage, "db_path", "") else "data"
         self.covers_root = os.path.join(data_dir, "covers")
+        self._last_post_list_why = ""   # rev64: _post_list_http 失败原因
+        self.last_why = ""              # rev64: find_video_url 最后一次失败原因
 
     @property
     def finder_id(self):
@@ -135,6 +137,7 @@ class PostFetcher:
         acc = self._latest_account()
         aid = self._aid()
         if not aid:
+            self._last_post_list_why = "no_aid"
             return None
         url = f"{BASE}/post/post_list?_aid={aid}&_pageUrl={quote(PAGE_URL)}"
         body = wx_http.std_body(
@@ -144,13 +147,17 @@ class PostFetcher:
             j = await wx_http.post_json(acc, url, body, page_url=PAGE_URL, timeout=30)
         except Exception as e:
             logger.debug(f"[posts] HTTP 取第 {cur} 页异常: {e}")
+            self._last_post_list_why = "request_error:" + type(e).__name__
             return None
         if not isinstance(j, dict) or j.get("__err"):
             logger.debug(f"[posts] HTTP 取第 {cur} 页不可用: {j.get('__err') if isinstance(j, dict) else j}")
+            self._last_post_list_why = "http:" + str(j.get("__err") if isinstance(j, dict) else "bad_json")
             return None
         if j.get("errCode") not in (0, None):
             logger.debug(f"[posts] HTTP 取第 {cur} 页 errCode={j.get('errCode')}")
+            self._last_post_list_why = "errCode:" + str(j.get("errCode"))
             return None
+        self._last_post_list_why = ""
         return j
 
     async def _post_list_page(self, page, cur, page_size=None):
@@ -166,35 +173,61 @@ class PostFetcher:
         except Exception:
             return {"__parse_error": (r.get("body") or "")[:120]}
 
-    async def find_video_url(self, worker, object_id, max_pages=3, page_size=None):
-        """现取某作品的播放地址(CDN 地址有时效,旧作品存的会过期)。
+    async def find_video_url_http(self, object_id, max_pages=None):
+        """rev64: 纯 HTTP 现取播放地址,不依赖 worker / 浏览器 context。
 
-        复用 worker 的 context 开临时页,直接打 post_list 接口翻前几页找 object_id。
-        找不到返回 ""。
+        账号取自 config(按作品 finder_id 归属解析),用 wx_http 的 cookie + _aid
+        直打 post_list,翻到命中 object_id 为止。返回 (url, why):
+        url 为空时 why 是失败原因,供上层给出准确提示。
         """
         oid = (object_id or "").strip()
-        if not oid or worker is None or worker.context is None:
-            return ""
-        ps = int(page_size or self.page_size)
-        # rev50: 先纯 HTTP 翻页找（不再为拿 cookie 先 goto 等 3 秒）
-        http_ok = True
-        for pg in range(1, int(max_pages) + 1):
+        if not oid:
+            return "", "empty_object_id"
+        acc = self._latest_account()
+        aid = (acc.get("_aid") or self.account.get("_aid") or "").strip()
+        if not aid:
+            return "", "no_aid"
+        if not wx_http.cookie_header_of(acc):
+            return "", "no_cookie"
+        pc = self.config.get("posts") or {}
+        limit = max(1, int(max_pages or pc.get("play_max_pages", 20)))
+        ps = int(self.page_size or 200)
+        for pg in range(1, limit + 1):
+            self._last_post_list_why = ""
             j = await self._post_list_http(pg, page_size=ps)
             if j is None:
-                http_ok = False
-                break
-            lst = (((j.get("data") or {}).get("list")) or [])
+                return "", self._last_post_list_why or "post_list_unavailable"
+            d = j.get("data") or {}
+            lst = d.get("list") or []
             for p in lst:
                 if (p.get("objectId") or p.get("exportId")) == oid:
                     ms = ((p.get("desc") or {}).get("media") or [])
-                    if ms:
-                        return ms[0].get("url") or ms[0].get("fullUrl") or ""
+                    u = (ms[0].get("url") or ms[0].get("fullUrl") or "") if ms else ""
+                    return (u, "") if u else ("", "no_media_url")
             if not lst:
-                return ""
-        if http_ok and not (worker is not None and worker.context is not None):
+                return "", "not_in_list"
+            total = int(d.get("total") or d.get("totalCount") or 0)
+            if total > 0 and pg * ps >= total:
+                return "", "not_in_list"
+        return "", "page_limit"
+
+    async def find_video_url(self, worker, object_id, max_pages=3, page_size=None):
+        """现取某作品的播放地址(CDN 地址有时效,旧作品存的会过期)。
+
+        rev64: 先纯 HTTP —— 纯 HTTP 模式的账号没有浏览器 context,原实现开头
+        `worker.context is None -> return ""` 直接放弃,账号明明在跑却被误报
+        「视频号未运行」。HTTP 走不通才回退浏览器路径(需要 context)。
+        """
+        oid = (object_id or "").strip()
+        if not oid:
             return ""
+        fresh, why = await self.find_video_url_http(object_id)
+        self.last_why = why
+        if fresh:
+            return fresh
         if worker is None or worker.context is None:
             return ""
+        ps = int(page_size or self.page_size)
         aidv = self._aid()
         page = None
         try:
