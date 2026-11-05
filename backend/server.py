@@ -1035,50 +1035,41 @@ def _play_fail_message(why):
 
 @app.get("/api/posts/play")
 async def post_play(finder_id: str = Query(""), object_id: str = Query("")):
-    """取作品播放地址。存的地址过期时用该视频号的 HTTP 登录态现取(rev64)。
+    """取作品播放地址 —— rev65 全程纯 HTTP,零浏览器、零 CDN 预探测。
 
-    CDN 直链带时效(实测旧地址 400 / 新地址 206)。旧实现必须先有运行中的 worker
-    且 worker.context 非空才肯现取;纯 HTTP 模式的账号没有浏览器 context,于是
-    明明在跑却被误报「视频号未运行」。现在按 finder_id 从 config 取账号直接
-    wx_http 打 post_list,与 worker / 浏览器完全解耦。
+    旧链路:先同步 Range 探测旧 CDN 地址(8s) -> 失效再翻 post_list -> 再探测 ->
+    失败还要开浏览器兜底(goto 45s + 固定 3s)。老作品翻 12 页要等十几秒,
+    前端又是裸 fetch 无超时,于是「加载中…」一直转圈。
+    现在:按作品在库内的时间排名直跳官方页码,一次 HTTP 拿最新地址;
+    整条链路 8s 上限,拿不到就给准确原因,绝不开浏览器。
     """
     if not finder_id or not object_id:
         raise HTTPException(400, "缺少 finder_id / object_id")
     row = storage.get_post_video(finder_id, object_id)
     if row is None:
         raise HTTPException(404, "作品不存在")
-    url = row.get("video_url") or ""
-    refreshed = False
-    why = ""
-    ok_now = await asyncio.to_thread(_url_playable, url)
-    if not ok_now:
-        acc = _account_for_finder(finder_id)
-        if acc is None:
-            why = "no_account_for_finder"
-        else:
-            fresh, why = await PostFetcher(storage, acc, config).find_video_url_http(object_id)
-            if fresh and await asyncio.to_thread(_url_playable, fresh):
-                storage.update_post_video(finder_id, object_id, fresh)
-                url, refreshed, ok_now, why = fresh, True, True, ""
-            if not refreshed:
-                # 兜底:HTTP 这条路走不通时,若 worker 有浏览器 context 仍走老路径
-                w = None
-                for cand in (manager.workers or {}).values():
-                    ca = getattr(cand, "account", None) or {}
-                    if (ca.get("_log_finder_id") or "").strip() == finder_id:
-                        w = cand
-                        break
-                if (w is not None and getattr(w, "logged_in", False)
-                        and getattr(w, "context", None) is not None):
-                    fresh2 = await PostFetcher(storage, w.account, config).find_video_url(w, object_id)
-                    if fresh2 and await asyncio.to_thread(_url_playable, fresh2):
-                        storage.update_post_video(finder_id, object_id, fresh2)
-                        url, refreshed, ok_now, why = fresh2, True, True, ""
-    if not (ok_now or await asyncio.to_thread(_url_playable, url)):
-        return {"ok": False, "title": row.get("title") or "",
-                "message": _play_fail_message(why)}
-    return {"ok": True, "url": url, "refreshed": refreshed,
-            "title": row.get("title") or ""}
+    title = row.get("title") or ""
+    acc = _account_for_finder(finder_id)
+    if acc is None:
+        return {"ok": False, "title": title,
+                "message": _play_fail_message("no_account_for_finder")}
+    try:
+        fresh, why = await asyncio.wait_for(
+            PostFetcher(storage, acc, config).find_video_url_http(object_id),
+            timeout=8.0)
+    except asyncio.TimeoutError:
+        return {"ok": False, "title": title,
+                "message": "取播放地址超时(8 秒),视频号接口响应慢,请稍后重试。"}
+    except Exception as e:
+        return {"ok": False, "title": title,
+                "message": f"取播放地址异常({type(e).__name__}),请稍后重试。"}
+    if not fresh:
+        return {"ok": False, "title": title, "message": _play_fail_message(why)}
+    try:
+        storage.update_post_video(finder_id, object_id, fresh)
+    except Exception as e:
+        logger.warning(f"[posts] 写回播放地址失败(不影响本次播放): {e}")
+    return {"ok": True, "url": fresh, "refreshed": True, "title": title}
 
 
 @app.websocket("/api/remote/ws")

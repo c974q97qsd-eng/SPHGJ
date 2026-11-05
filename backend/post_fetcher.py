@@ -173,12 +173,38 @@ class PostFetcher:
         except Exception:
             return {"__parse_error": (r.get("body") or "")[:120]}
 
-    async def find_video_url_http(self, object_id, max_pages=None):
-        """rev64: 纯 HTTP 现取播放地址,不依赖 worker / 浏览器 context。
+    def _guess_start_page(self, object_id, page_size):
+        """rev65: 按库内 create_time 倒序排名估算官方列表页码。
 
-        账号取自 config(按作品 finder_id 归属解析),用 wx_http 的 cookie + _aid
-        直打 post_list,翻到命中 object_id 为止。返回 (url, why):
-        url 为空时 why 是失败原因,供上层给出准确提示。
+        官方 post_list 不支持按 objectId 过滤(实测 objectId/exportId/objectIdList
+        全被忽略,仍返回该页 200 条)。老作品从第 1 页顺序翻要 12+ 页 ≈ 17s。
+        库里存着全部作品的 create_time,一条 COUNT 就能算出目标大约在第几页;
+        实测 2639 条库内作品 / 2587 官方作品,估算第 12 页一次命中。
+        估算不出来(老库 / stub / 异常)返回 1,退化为原来的顺序翻页。
+        """
+        try:
+            ps = max(1, int(page_size))
+            c = self.storage._conn()
+            try:
+                r = c.execute(
+                    "SELECT create_time FROM posts WHERE finder_id=? AND object_id=?",
+                    (self.finder_id, object_id)).fetchone()
+                if not r or not r[0]:
+                    return 1
+                n = c.execute(
+                    "SELECT COUNT(*) FROM posts WHERE finder_id=? AND create_time>?",
+                    (self.finder_id, r[0])).fetchone()[0]
+            finally:
+                c.close()
+            return max(1, n // ps + 1)
+        except Exception:
+            return 1
+
+    async def find_video_url_http(self, object_id, max_pages=None):
+        """rev65: 纯 HTTP 现取播放地址 —— 播放链路唯一的取地址入口。
+
+        按库内时间排名直跳页码(前后各 2 页容错),不再从第 1 页顺序翻。
+        返回 (url, why):url 为空时 why 是失败原因,供上层给出准确提示。
         """
         oid = (object_id or "").strip()
         if not oid:
@@ -192,22 +218,43 @@ class PostFetcher:
         pc = self.config.get("posts") or {}
         limit = max(1, int(max_pages or pc.get("play_max_pages", 20)))
         ps = int(self.page_size or 200)
+        guess = min(max(1, self._guess_start_page(oid, ps)), limit)
+        # 候选页:估算页 -> 第 1 页(置顶作品永远在这) -> 前后各 2 页 -> 其余页顺序补齐。
+        # 置顶作品 create_time 很老,按时间估算会指向列表末尾甚至超界;官方
+        # stickyOrder=True 把它排在第 1 页,所以第 1 页必须固定进候选。
+        order, seen = [], set()
+        for pg in (guess, 1, guess + 1, guess - 1, guess + 2, guess - 2):
+            if 1 <= pg <= limit and pg not in seen:
+                seen.add(pg)
+                order.append(pg)
+        near = set(order)       # 容错页不受"到尾/空页"早停影响(估算超界会返回空页)
         for pg in range(1, limit + 1):
+            if pg not in seen:
+                seen.add(pg)
+                order.append(pg)
+        empty = 0
+        for pg in order:
             self._last_post_list_why = ""
             j = await self._post_list_http(pg, page_size=ps)
             if j is None:
                 return "", self._last_post_list_why or "post_list_unavailable"
             d = j.get("data") or {}
             lst = d.get("list") or []
+            if not lst:
+                if pg not in near:      # 估算页超界时的空页不代表列表到底
+                    empty += 1
+                    if empty >= 2:      # 补齐阶段连续两页空才算到底
+                        return "", "not_in_list"
+                continue
+            empty = 0
             for p in lst:
                 if (p.get("objectId") or p.get("exportId")) == oid:
                     ms = ((p.get("desc") or {}).get("media") or [])
                     u = (ms[0].get("url") or ms[0].get("fullUrl") or "") if ms else ""
                     return (u, "") if u else ("", "no_media_url")
-            if not lst:
-                return "", "not_in_list"
             total = int(d.get("total") or d.get("totalCount") or 0)
-            if total > 0 and pg * ps >= total:
+            tail = len(lst) < ps or (total > 0 and pg * ps >= total)
+            if tail and pg not in near:
                 return "", "not_in_list"
         return "", "page_limit"
 
