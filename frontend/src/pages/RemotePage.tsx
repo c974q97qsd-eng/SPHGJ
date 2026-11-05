@@ -25,6 +25,9 @@ export function RemotePage() {
   const [sp] = useSearchParams()
   const navigate = useNavigate()
   const account = sp.get("account") || ""
+  const view = sp.get("view") || ""
+  const rawFrom = sp.get("from") || "/accounts"
+  const backTo = rawFrom.startsWith("/") && !rawFrom.startsWith("//") ? rawFrom : "/accounts"
 
   const [phase, setPhase] = useState<"connecting" | "live" | "closed" | "error">("connecting")
   const [msg, setMsg] = useState("")
@@ -102,8 +105,9 @@ export function RemotePage() {
     setPhase("connecting")
     setMsg("正在启动浏览器…")
     const proto = location.protocol === "https:" ? "wss:" : "ws:"
+    const extra = view ? `&view=${encodeURIComponent(view)}` : ""
     const ws = new WebSocket(
-      `${proto}//${location.host}/api/remote/ws?account=${encodeURIComponent(account)}`)
+      `${proto}//${location.host}/api/remote/ws?account=${encodeURIComponent(account)}${extra}`)
     ws.binaryType = "blob"
     wsRef.current = ws
 
@@ -157,7 +161,7 @@ export function RemotePage() {
         return p
       })
     }
-  }, [account, onFrame])
+  }, [account, view, onFrame])
 
   useEffect(() => {
     connect()
@@ -307,7 +311,7 @@ export function RemotePage() {
     <div className="fixed inset-0 z-50 flex h-screen flex-col bg-background">
       {/* 工具栏 */}
       <div className="flex flex-wrap items-center gap-2 border-b px-3 py-2">
-        <Button size="sm" variant="ghost" className="gap-1" onClick={() => navigate("/accounts")}>
+        <Button size="sm" variant="ghost" className="gap-1" onClick={() => navigate(backTo)}>
           <X className="h-4 w-4" />关闭
         </Button>
         <div className="flex items-center gap-1">
@@ -370,7 +374,7 @@ export function RemotePage() {
             <span>{msg}</span>
             <div className="flex gap-2">
               <Button size="sm" onClick={connect}>重试</Button>
-              <Button size="sm" variant="secondary" onClick={() => navigate("/accounts")}>返回账号管理</Button>
+              <Button size="sm" variant="secondary" onClick={() => navigate(backTo)}>返回</Button>
             </div>
           </div>
         )}
@@ -381,7 +385,7 @@ export function RemotePage() {
             <span>{msg}</span>
             <div className="flex gap-2">
               <Button size="sm" onClick={connect}>重新连接</Button>
-              <Button size="sm" variant="secondary" onClick={() => navigate("/accounts")}>返回账号管理</Button>
+              <Button size="sm" variant="secondary" onClick={() => navigate(backTo)}>返回</Button>
             </div>
           </div>
         )}
@@ -392,7 +396,9 @@ export function RemotePage() {
         <span className="truncate" title={url}>{url || "—"}</span>
         <span>
           {phase === "live"
-            ? "串流期间该账号的数据抓取已暂停;断开或空闲超时会自动恢复"
+            ? (view === "dashboard"
+                ? "直播大屏串流中 · 独立浏览器 + 注入登录态,后台采集不受影响"
+                : "串流使用独立浏览器 + 注入登录态,后台采集不受影响")
             : "未连接"}
         </span>
       </div>

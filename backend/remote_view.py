@@ -35,6 +35,7 @@ logger = logging.getLogger("sphgj")
 VIEW_W, VIEW_H = 1280, 800
 JPEG_QUALITY = 58
 IDLE_TIMEOUT_SEC = 300          # 5 分钟无操作自动断开
+DASHBOARD_IDLE_SEC = 7200       # rev67: 直播大屏是挂着看的,2 小时无操作才断
 MAX_SESSIONS = 2                # 同时最多两路串流:一路别人开了还能再开一路,
                                 # 又不至于把主机压垮(每个 context 约 150-300MB)
 DEFAULT_URL = "https://channels.weixin.qq.com/platform/post/create"
@@ -44,7 +45,8 @@ HOME_URL = "https://channels.weixin.qq.com/platform"
 class RemoteSession:
     """一路串流会话:一个浏览器 context + 一个 page + 一条 CDP 通道。"""
 
-    def __init__(self, manager, account_id, config, storage=None):
+    def __init__(self, manager, account_id, config, storage=None,
+                 idle_timeout_sec=IDLE_TIMEOUT_SEC):
         self.manager = manager
         self.account_id = account_id
         self.config = config
@@ -57,6 +59,7 @@ class RemoteSession:
         self.h = VIEW_H
         self.url = ""
         self.last_active = time.time()
+        self.idle_timeout_sec = int(idle_timeout_sec or IDLE_TIMEOUT_SEC)
         self.created_at = time.time()
         self.closed = False
         self.close_reason = ""
@@ -120,7 +123,7 @@ class RemoteSession:
         return {"t": "hello", "account_id": self.account_id,
                 "account_name": (self.acc or {}).get("name") or self.account_id,
                 "w": self.w, "h": self.h, "url": self.url,
-                "idle_timeout": IDLE_TIMEOUT_SEC,
+                "idle_timeout": self.idle_timeout_sec,
                 "logged_in": bool((self.acc or {}).get("_log_finder_id"))}
 
     async def _watchdog(self):
@@ -128,7 +131,7 @@ class RemoteSession:
         try:
             while not self.closed:
                 await asyncio.sleep(5)
-                if time.time() - self.last_active > IDLE_TIMEOUT_SEC + 10:
+                if time.time() - self.last_active > self.idle_timeout_sec + 10:
                     logger.info(f"[remote] 空闲超时自动关闭 {self.account_id}")
                     await self.close("idle")
                     return
@@ -321,7 +324,7 @@ class RemoteRegistry:
             return s
         return None
 
-    async def open(self, account_id, url=None):
+    async def open(self, account_id, url=None, idle_timeout_sec=None):
         # 全局只留 MAX_SESSIONS 路
         alive = [s for s in self.sessions.values() if not s.closed]
         while len(alive) >= MAX_SESSIONS:
@@ -342,7 +345,8 @@ class RemoteRegistry:
                 pass
             logger.info(f"[remote] 复用会话已失效,重建 {account_id}")
             await self.close(account_id, "stale")
-        s = RemoteSession(self.manager, account_id, self.config, self.storage)
+        s = RemoteSession(self.manager, account_id, self.config, self.storage,
+                          idle_timeout_sec=idle_timeout_sec or IDLE_TIMEOUT_SEC)
         meta = await s.open(url)
         self.sessions[account_id] = s
         return s, False

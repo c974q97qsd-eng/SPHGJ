@@ -73,12 +73,20 @@ function LiveCard({ it, cardFields, metricDict }: { it: LiveScreenItem; cardFiel
   const s = it.live_stats
   const metricOf = (k: string) => metricDict.find((m) => m.key === k)
 
-  const handleOpenDashboard = async () => {
-    try {
-      await api.openDashboard(it.account_id)
-      toast.success("已打开直播大屏(不影响后台采集)")
-    } catch (e) {
-      toast.error("打开失败:" + (e as Error).message)
+  // rev67: 大屏不再在「运行程序的那台机器」上弹实体窗口(远程访问根本看不到),
+  // 改为和「远程查看」同一条 CDP 串流通道,画面直接显示在访问者的网页标签里。
+  const handleOpenDashboard = () => {
+    const target = `/remote?account=${encodeURIComponent(it.account_id)}` +
+      `&view=dashboard&from=%2Flive-screen`
+    const inWebview = !!(window as unknown as { pywebview?: unknown }).pywebview
+    if (inWebview) {
+      window.location.assign(target)
+      return
+    }
+    const w = window.open(target, "_blank")
+    if (!w) {
+      toast.info("浏览器拦截了新标签页,已在当前页打开")
+      window.location.assign(target)
     }
   }
 
@@ -153,7 +161,7 @@ function LiveCard({ it, cardFields, metricDict }: { it: LiveScreenItem; cardFiel
         <div className="flex items-center justify-between gap-2">
           <div className="flex items-center gap-1 min-w-0">
             <span className="truncate text-base font-semibold">{it.name}</span>
-            <Button size="icon" variant="ghost" className="h-6 w-6 shrink-0" onClick={handleOpenDashboard} aria-label="打开直播大屏" title="打开直播大屏"><ExternalLink className="h-3 w-3" /></Button>
+            <Button size="icon" variant="ghost" className="h-6 w-6 shrink-0" onClick={handleOpenDashboard} aria-label="在网页标签里打开直播大屏" title="在网页标签里打开直播大屏"><ExternalLink className="h-3 w-3" /></Button>
           </div>
           {it.logged_in
             ? <Badge variant="success" className="font-normal">在线</Badge>

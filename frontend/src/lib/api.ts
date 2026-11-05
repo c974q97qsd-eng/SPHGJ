@@ -394,6 +394,8 @@ export const api = {
   /** 退出登录态:清该账号 profile 内登录文件,账号保留(下次需重新扫码) */
   logoutAccount: (id: string) =>
     req<{ ok: boolean; message: string; accounts: AccountStatus[] }>(`/accounts/${id}/logout`, { method: "POST" }),
+  // rev67: 这两个是「在运行程序的本机弹实体窗口」的兼容入口,远程访问会被 403。
+  // WEB 界面请用 openAccountWindow(本机) 或 /remote?view=dashboard(网页串流)。
   openAccountBrowser: (id: string) => req<{ ok: boolean }>(`/accounts/${id}/open-browser`, { method: "POST" }),
   openDashboard: (id: string) => req<{ ok: boolean }>(`/accounts/${id}/open-dashboard`, { method: "POST" }),
 

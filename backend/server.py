@@ -38,7 +38,7 @@ from .memtrim import trim_now
 from .post_fetcher import PostFetcher
 from .publish_queue import PublishQueue
 from .publish_fixups import fix_mislabeled_need_review   # rev40: 历史误标回滚
-from .remote_view import RemoteRegistry
+from .remote_view import RemoteRegistry, DASHBOARD_IDLE_SEC
 from .browser import reap_profile_orphans
 from . import platforms                          # rev56: 平台维度抽象（wx / dy）
 from .douyin.manager import DouyinManager   # rev56: 抖音（platform=dy）
@@ -1072,15 +1072,31 @@ async def post_play(finder_id: str = Query(""), object_id: str = Query("")):
     return {"ok": True, "url": fresh, "refreshed": True, "title": title}
 
 
+# rev67: 「打开直播大屏」不再在服务端弹实体窗口 —— 从别的电脑访问 WEB 界面时,
+# 窗口会出现在运行程序的那台机器上(原型机),访问者根本看不到。改为和「远程查看」
+# 共用 CDP 串流:由后端从运行中 worker 现取 liveObjectId 拼出起始地址,画面推到
+# 访问者自己的网页标签里。
+DASHBOARD_URL_TPL = ("https://channels.weixin.qq.com/platform/statistic/dashboardV4"
+                     "?objetctId=%s&entrance_id=2")
+
+
+def _dashboard_start_url(account_id):
+    worker = manager.workers.get(account_id)
+    lf = getattr(worker, "live_fetcher", None) if worker else None
+    oid = getattr(lf, "live_object_id", None) if lf else None
+    return DASHBOARD_URL_TPL % oid if oid else ""
+
+
 @app.websocket("/api/remote/ws")
-async def remote_ws(ws: WebSocket, account: str = Query(""), url: str = Query("")):
-    """远程同步浏览通道(rev27)。
+async def remote_ws(ws: WebSocket, account: str = Query(""), url: str = Query(""),
+                    view: str = Query("")):
+    """远程同步浏览通道(rev27 / rev67 支持 view=dashboard)。
 
     文本帧 = JSON 指令/元信息;二进制帧 = JPEG 画面。
     客户端 -> 服务端:{t:"mouse"|"text"|"key"|"nav"|"ping"|"close"}
     服务端 -> 客户端:{t:"opening"|"hello"|"url"|"closed"|"error"} + 二进制 JPEG
 
-    会话期间该账号 worker 会让出 profile 锁(数据抓取暂停),断开/空闲超时后自动恢复。
+    rev66 起串流用独立临时 profile + 注入登录态,worker 一直在跑,数据抓取不中断。
     """
     await ws.accept()
     if not account:
@@ -1090,10 +1106,32 @@ async def remote_ws(ws: WebSocket, account: str = Query(""), url: str = Query(""
         except Exception:
             pass
         return
+    target_url = url or ""
+    idle_sec = None
+    if view == "dashboard":
+        target_url = _dashboard_start_url(account)
+        if not target_url:
+            try:
+                await ws.send_json({"t": "error",
+                                    "message": "账号未在直播或未拿到 liveObjectId,打不开直播大屏"})
+                await ws.close()
+            except Exception:
+                pass
+            return
+        idle_sec = DASHBOARD_IDLE_SEC
     sess = None
     try:
         await ws.send_json({"t": "opening", "account_id": account})
-        sess, reused = await remote_registry.open(account, url or None)
+        sess, reused = await remote_registry.open(account, target_url or None,
+                                                   idle_timeout_sec=idle_sec)
+        if reused:
+            # registry 复用会话时不会重新 goto:同账号先开了「远程查看」再点「大屏」,
+            # 画面会停在旧页。这里显式导航,并按大屏模式放宽空闲超时。
+            if idle_sec and getattr(sess, "idle_timeout_sec", None) != idle_sec:
+                sess.idle_timeout_sec = idle_sec
+                sess.touch()
+            if target_url:
+                await sess.nav("goto", target_url)
         await ws.send_json(sess.meta())
     except Exception as e:
         logger.warning(f"[remote] 建立会话失败 {account}: {e}")
@@ -1179,7 +1217,7 @@ async def remote_sessions():
 
 @app.post("/api/remote/close")
 async def remote_close(account: str = Query("")):
-    """手动断开某账号的串流并恢复抓取。"""
+    """手动断开某账号的串流(rev66 起 worker 从未停过,无需恢复采集)。"""
     if not account:
         raise HTTPException(400, "缺少 account 参数")
     await remote_registry.close(account, "manual")
@@ -1730,8 +1768,15 @@ async def stop_account(account_id: str):
 
 
 @app.post("/api/accounts/{account_id}/open-browser")
-async def open_account_browser(account_id: str):
-    """打开带登录态的 headed 浏览器供手动操作(停 worker,关浏览器后自动重启)。"""
+async def open_account_browser(account_id: str, request: Request):
+    """在运行程序的本机打开带登录态的 headed 浏览器(rev66: 不停 worker)。
+
+    rev67: 非本机访问一律 403 —— 窗口只会弹在服务端那台机器的桌面上,访问者看不到。
+    远程请走 /remote 网页串流。
+    """
+    if not _client_is_local(request):
+        raise HTTPException(403, "本机窗口只能在运行程序的这台机器上打开"
+                                 "(远程请用「远程」按钮走网页串流)")
     ok = await manager.open_account_browser(account_id)
     if not ok:
         raise HTTPException(404, "账号不存在或打开失败")
@@ -1739,8 +1784,15 @@ async def open_account_browser(account_id: str):
 
 
 @app.post("/api/accounts/{account_id}/open-dashboard")
-async def open_dashboard(account_id: str):
-    """打开当前直播的 dashboardV4 大屏(需账号在直播,停 worker,关浏览器后自动重启)。"""
+async def open_dashboard(account_id: str, request: Request):
+    """本机兼容入口:在运行程序的机器上弹 dashboardV4 实体窗口。
+
+    rev67: WEB 端「打开大屏」已改为 /remote?view=dashboard 网页串流;这个接口只留给
+    确实坐在运行机前的场景,非本机一律 403,避免又在原型机上弹出看不见的窗口。
+    """
+    if not _client_is_local(request):
+        raise HTTPException(403, "本机窗口只能在运行程序的这台机器上打开"
+                                 "(直播大屏请点界面上的「打开大屏」,走网页串流)")
     ok, msg = await manager.open_dashboard(account_id)
     if not ok:
         raise HTTPException(400, msg or "打开失败")
