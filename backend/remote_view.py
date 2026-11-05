@@ -9,10 +9,10 @@
 
 资源与抓取的关系(重要)
 --------------------
-同一个 profile_dir 不能同时被两处占用(Chromium profile 锁),所以远程会话期间必须
-先停 worker。但**不能走 stop_account**:它会写 human_stopped、清运行意图,
-把「临时让位」当成「人工停止」,之后自动发作品就不会再拉起这个号。
-这里用 _park_worker 只摘 workers 里的 worker,两样都不动;关闭时按原样恢复。
+rev66: 改用独立临时 profile + 注入登录态,**不停 worker、不动运行意图**。
+旧实现共用一个 profile_dir,必须先 _park_worker 让锁;WS 在 hello 之前断开
+会留下僵尸会话,账号一直停到看门狗 5 分钟后才恢复。现在三条「另起浏览器」
+入口(本机窗口 / 大屏 / 远程串流)各用各的临时 profile,可并存且不影响采集。
 
 空闲超时
 --------
@@ -26,7 +26,9 @@ import os
 import time
 
 from .browser import launch_stealth, close_context_safely
-from .local_window import _local_storage_script
+from .local_window import (export_login_state, inject_login_state,
+                           new_view_profile, drop_view_profile,
+                           _local_storage_script)
 
 logger = logging.getLogger("sphgj")
 
@@ -37,17 +39,6 @@ MAX_SESSIONS = 2                # 同时最多两路串流:一路别人开了还
                                 # 又不至于把主机压垮(每个 context 约 150-300MB)
 DEFAULT_URL = "https://channels.weixin.qq.com/platform/post/create"
 HOME_URL = "https://channels.weixin.qq.com/platform"
-
-
-async def _park_worker(manager, account_id):
-    """临时摘掉 worker 让出 profile 锁,不改人工停止标记/运行意图。"""
-    w = (getattr(manager, "workers", {}) or {}).pop(account_id, None)
-    if w is not None:
-        try:
-            await w.stop()
-        except Exception as e:
-            logger.warning(f"[remote] 停 worker 失败 {account_id}: {e}")
-    return w
 
 
 class RemoteSession:
@@ -61,6 +52,7 @@ class RemoteSession:
         self.ctx = None
         self.page = None
         self.cdp = None
+        self.profile_dir = None     # rev66: 独立临时 profile
         self.w = VIEW_W
         self.h = VIEW_H
         self.url = ""
@@ -86,53 +78,19 @@ class RemoteSession:
         acc = self.acc
         if not acc:
             raise RuntimeError("账号不存在")
-        self._was_running = self.account_id in (getattr(self.manager, "workers", {}) or {})
-        self._was_human_stopped = self.account_id in getattr(
-            self.manager, "human_stopped", set())
-
-        # rev37: 必须在 park 之前把登录态导出来 —— park 会把 worker 的 context
-        # 一起关掉,之后就再也拿不到了。而 profile 磁盘的 cookie 是不可靠的
-        # (Chromium 延迟写盘,进程被中途关掉就是 0 条,见 rev29),只靠磁盘会出现
-        # 「worker 明明登录着,远程窗口一打开却是扫码页」(2026-10-21 用户实证)。
-        state = None
-        try:
-            _w = (getattr(self.manager, "workers", {}) or {}).get(self.account_id)
-            _ctx = getattr(_w, "context", None) if _w else None
-            if _ctx is not None:
-                state = await _ctx.storage_state()
-                logger.info(f"[remote] {self.account_id} 从运行中的 context 导出"
-                            f"登录态 cookies={len(state.get('cookies') or [])} 条")
-        except Exception as e:
-            logger.warning(f"[remote] {self.account_id} 导出登录态失败: {e}")
-            state = None
-        if not (state or {}).get("cookies"):
-            # worker 没跑 / 导出失败 -> 退回 config 里存的扫码登录态
-            _ss = acc.get("storage_state") or {}
-            if _ss.get("cookies"):
-                state = _ss
-                logger.info(f"[remote] {self.account_id} 使用 config 内保存的登录态 "
-                            f"cookies={len(_ss.get('cookies') or [])} 条")
-
-        await _park_worker(self.manager, self.account_id)
+        # rev66: worker 一直活着,登录态优先从它的 context 现导(最权威),
+        # 纯 HTTP 账号没有 context 时回落 config.storage_state。
+        state = await export_login_state(self.manager, self.account_id, acc, "remote")
+        if not state:
+            raise RuntimeError("该账号没有可用登录态,请先扫码登录")
 
         pw = await self.manager._ensure_playwright()
-        self.ctx = await launch_stealth(pw, acc["profile_dir"], headless=True)
+        self.profile_dir = new_view_profile("%s_remote" % self.account_id)
+        self.ctx = await launch_stealth(pw, self.profile_dir, headless=True)
         pages = list(self.ctx.pages)
         self.page = pages[0] if pages else await self.ctx.new_page()
-        # rev37: 注入登录态(cookie + localStorage)。视频号的身份 aid 存在
-        # localStorage,只注 cookie 不够 —— 缺了它页面照样把你当没登录。
-        if state:
-            try:
-                _ck = state.get("cookies") or []
-                if _ck:
-                    await self.ctx.add_cookies(_ck)
-                _origins = state.get("origins") or []
-                if _origins:
-                    await self.ctx.add_init_script(_local_storage_script(_origins))
-                logger.info(f"[remote] {self.account_id} 已注入登录态 "
-                            f"cookies={len(_ck)} origins={len(_origins)}")
-            except Exception as e:
-                logger.warning(f"[remote] {self.account_id} 注入登录态失败: {e}")
+        # 视频号身份 aid 存在 localStorage,只注 cookie 不够(rev37)。
+        await inject_login_state(self.ctx, state, self.account_id, "remote")
 
         self.page.set_default_timeout(20000)
         try:
@@ -194,20 +152,15 @@ class RemoteSession:
             pass
         if self.ctx is not None:
             try:
-                await close_context_safely(self.ctx, self.acc and self.acc.get("profile_dir"),
+                await close_context_safely(self.ctx, self.profile_dir,
                                           f"remote-{self.account_id}")
             except Exception as e:
                 logger.warning(f"[remote] 关 context 异常: {e}")
             self.ctx = None
-        # 恢复原本在跑的账号(原本就是人工停的 -> 保持停)
-        if self._was_running:
-            try:
-                w = await self.manager.start_account(self.account_id)
-                if w is not None and self._was_human_stopped:
-                    self.manager.human_stopped.add(self.account_id)
-                logger.info(f"[remote] 已恢复抓取 {self.account_id}")
-            except Exception as e:
-                logger.warning(f"[remote] 恢复抓取失败 {self.account_id}: {e}")
+        drop_view_profile(self.profile_dir)
+        self.profile_dir = None
+        # rev66: worker 从未停过,不需要(也不能)在这里 start_account ——
+        # 那会重新写运行意图,把用户手动停的号又拉起来。
         logger.info(f"[remote] 会话结束 {self.account_id} reason={reason}")
 
     # ---------------- 帧 ----------------
@@ -378,8 +331,17 @@ class RemoteRegistry:
             self.sessions.pop(old.account_id, None)
         s = self.get(account_id)
         if s is not None:
-            await s.refresh_url()
-            return s, True
+            # rev66: 页面已关 / CDP 掉了的「僵尸会话」不能复用,否则前端
+            # 连上就报「建立会话失败」,而且这个会话永远没人收尾。
+            try:
+                if (s.page is not None and not s.page.is_closed()
+                        and s.cdp is not None and s.ctx is not None):
+                    await s.refresh_url()
+                    return s, True
+            except Exception:
+                pass
+            logger.info(f"[remote] 复用会话已失效,重建 {account_id}")
+            await self.close(account_id, "stale")
         s = RemoteSession(self.manager, account_id, self.config, self.storage)
         meta = await s.open(url)
         self.sessions[account_id] = s

@@ -76,7 +76,7 @@ function LiveCard({ it, cardFields, metricDict }: { it: LiveScreenItem; cardFiel
   const handleOpenDashboard = async () => {
     try {
       await api.openDashboard(it.account_id)
-      toast.success("已打开直播大屏,关闭后自动恢复")
+      toast.success("已打开直播大屏(不影响后台采集)")
     } catch (e) {
       toast.error("打开失败:" + (e as Error).message)
     }

@@ -24,6 +24,8 @@ from . import live_probe_http
 from .auto_comment import AutoCommenter
 from .login_capture import LoginSession, clear_login_state
 from .browser import launch_stealth, close_context_safely, reap_profile_orphans
+from .local_window import (export_login_state, inject_login_state,
+                           new_view_profile, drop_view_profile)
 from .selectors import COMMENT_URL, POST_CREATE_URL
 from .memtrim import MemoryTrimmer, trim_now
 
@@ -1597,6 +1599,7 @@ class AccountManager:
         self._relogin_active_acc = None  # 当前正在 auto-relogin 的 account_id
         self._relogin_active_sid = None
         self._open_browsers = {}         # account_id -> headed BrowserContext(用户手动操作)
+        self._open_browser_profiles = {}  # rev66: account_id -> 独立临时 profile 路径
         # rev15 P0: 定时内存归还(gc.collect + 工作集压缩),解决 Python 分配器不归还 OS 的 RSS 膨胀
         self._memtrim = MemoryTrimmer(int(config.get("memtrim_interval_sec", 600)))
         # rev21: 运行意图持久化 —— start/stop_account 时实时维护,
@@ -2053,9 +2056,10 @@ class AccountManager:
                 logger.warning(f"[{account_id}] 退出登录前停止 worker 失败: {e}")
         # 2) 关掉用户手动打开的 headed 浏览器(否则同样占着 profile)
         ctx = self._open_browsers.pop(account_id, None)
+        temp = self._open_browser_profiles.pop(account_id, None)
         if ctx:
             try:
-                await close_context_safely(ctx, acc.get("profile_dir"), f"[{account_id}] logout")
+                await close_context_safely(ctx, temp, f"[{account_id}] logout")
             except Exception as e:
                 logger.debug(f"[{account_id}] 退出登录时关闭 headed 浏览器异常(忽略): {e}")
         # 3) 清 profile 内登录文件(函数自带 ./profiles 范围校验),稍等句柄释放
@@ -2267,42 +2271,52 @@ class AccountManager:
         logger.info("[恢复] 自动恢复流程结束")
 
     async def open_account_browser(self, account_id):
-        """打开带登录态的 headed 浏览器供用户手动操作。
-        同 profile_dir 不能与 worker 并存(Chromium profile 锁),先停 worker;
-        用户关浏览器后自动重启 worker 恢复抓取。"""
+        """rev66: 独立临时 profile + 注入登录态,不停 worker、不动运行意图。
+
+        旧实现用 acc["profile_dir"] 起浏览器并先调 stop_account():后者会清
+        _run_intent + 写 human_stopped,用户点一下「打开」就等于手动停号,
+        重启后不再自动恢复(2026-11-06 母本实证)。
+        """
         acc = next((a for a in self.config.get("accounts", []) if a["id"] == account_id), None)
         if not acc:
             return False
         if account_id in self._open_browsers:
             return True
-        was_running = account_id in self.workers
-        if was_running:
-            await self.stop_account(account_id)
+        state = await export_login_state(self, account_id, acc, "open-browser")
+        if not state:
+            logger.warning(f"[{account_id}] 没有可用登录态,打不开浏览器,请先扫码登录")
+            return False
         pw = await self._ensure_playwright()
+        temp = new_view_profile("%s_headed" % account_id)
+        ctx = None
         try:
-            ctx = await launch_stealth(pw, acc["profile_dir"], headless=False, window_size=(1920, 1035))
+            ctx = await launch_stealth(pw, temp, headless=False, window_size=(1920, 1035))
+            await inject_login_state(ctx, state, account_id, "open-browser")
             page = ctx.pages[0] if ctx.pages else await ctx.new_page()
             try:
                 await page.goto(POST_CREATE_URL, wait_until="domcontentloaded")
             except Exception as e:
                 logger.warning(f"[{account_id}] 打开浏览器 goto 失败(忽略): {e}")
             self._open_browsers[account_id] = ctx
-            asyncio.create_task(self._hold_open_browser(account_id, was_running))
-            logger.info(f"[{account_id}] 已打开 headed 浏览器(原{'运行中' if was_running else '未运行'})")
+            self._open_browser_profiles[account_id] = temp
+            asyncio.create_task(self._hold_open_browser(account_id))
+            logger.info(f"[{account_id}] 已打开 headed 浏览器(独立 profile,后台采集不受影响)")
             return True
         except Exception as e:
             logger.error(f"[{account_id}] 打开浏览器失败: {e}")
-            if was_running:
+            if ctx is not None:
                 try:
-                    await self.start_account(account_id)
+                    await close_context_safely(ctx, temp, f"[{account_id}] open-browser")
                 except Exception:
                     pass
+            drop_view_profile(temp)
             return False
 
     async def open_dashboard(self, account_id):
-        """打开当前直播的 dashboardV4 大屏(带 liveObjectId,需账号在直播)。
+        """rev66: 打开当前直播的 dashboardV4 大屏,不停 worker、不动运行意图。
 
-        同 open_account_browser:停 worker -> 开 headed(1920x1035) -> goto dashboardV4。
+        live_object_id 仍从运行中的 worker.live_fetcher 取;登录态从 worker
+        context 现导 / config.storage_state 兜底,注入到独立临时 profile。
         """
         acc = next((a for a in self.config.get("accounts", []) if a["id"] == account_id), None)
         if not acc:
@@ -2313,12 +2327,15 @@ class AccountManager:
             return False, "账号未在直播或未拿到 liveObjectId"
         if account_id in self._open_browsers:
             return True, ""
-        was_running = account_id in self.workers
-        if was_running:
-            await self.stop_account(account_id)
+        state = await export_login_state(self, account_id, acc, "dashboard")
+        if not state:
+            return False, "该账号没有可用登录态,请先扫码登录"
         pw = await self._ensure_playwright()
+        temp = new_view_profile("%s_headed" % account_id)
+        ctx = None
         try:
-            ctx = await launch_stealth(pw, acc["profile_dir"], headless=False, window_size=(1920, 1035))
+            ctx = await launch_stealth(pw, temp, headless=False, window_size=(1920, 1035))
+            await inject_login_state(ctx, state, account_id, "dashboard")
             page = ctx.pages[0] if ctx.pages else await ctx.new_page()
             url = f"https://channels.weixin.qq.com/platform/statistic/dashboardV4?objetctId={live_object_id}&entrance_id=2"
             try:
@@ -2326,25 +2343,28 @@ class AccountManager:
             except Exception as e:
                 logger.warning(f"[{account_id}] 打开 dashboardV4 goto 失败(忽略): {e}")
             self._open_browsers[account_id] = ctx
-            asyncio.create_task(self._hold_open_browser(account_id, was_running))
-            logger.info(f"[{account_id}] 已打开 dashboardV4 大屏 liveObjectId={live_object_id}(原{'运行中' if was_running else '未运行'})")
+            self._open_browser_profiles[account_id] = temp
+            asyncio.create_task(self._hold_open_browser(account_id))
+            logger.info(f"[{account_id}] 已打开 dashboardV4 大屏 liveObjectId={live_object_id}(独立 profile,后台采集不受影响)")
             return True, ""
         except Exception as e:
             logger.error(f"[{account_id}] 打开 dashboardV4 失败: {e}")
-            if was_running:
+            if ctx is not None:
                 try:
-                    await self.start_account(account_id)
+                    await close_context_safely(ctx, temp, f"[{account_id}] dashboard")
                 except Exception:
                     pass
+            drop_view_profile(temp)
             return False, str(e)
 
-    async def _hold_open_browser(self, account_id, was_running=True):
-        """保持 headed 浏览器;用户关所有 page 后关 context,只在原本在跑时重启 worker。
+    async def _hold_open_browser(self, account_id, was_running=None):
+        """rev66: 只收尾自己的独立 profile。worker 从未停过,不需要恢复。
 
-        用 close_context_safely 兜底 kill 残留 chrome 进程(带 FLV 流的 context.close
-        易抛异常致孤儿进程)。was_running=False(原本未启动)时关窗不自动启动,避免凭空
-        给未启动账号开常驻进程。"""
+        close_context_safely 必须传临时 profile:传账号 profile_dir 会在 close
+        异常时按 --user-data-dir 兜底 kill,把正在跑的 worker 浏览器一起杀掉。
+        """
         ctx = self._open_browsers.get(account_id)
+        temp = self._open_browser_profiles.get(account_id)
         if not ctx:
             return
         try:
@@ -2357,18 +2377,11 @@ class AccountManager:
                     break
         except Exception:
             pass
-        acc = next((a for a in self.config.get("accounts", []) if a["id"] == account_id), None)
-        profile_dir = acc["profile_dir"] if acc else None
-        await close_context_safely(ctx, profile_dir, f"[{account_id}] headed")
+        await close_context_safely(ctx, temp, f"[{account_id}] headed")
         self._open_browsers.pop(account_id, None)
-        if was_running:
-            logger.info(f"[{account_id}] headed 浏览器已关闭,重启 worker")
-            try:
-                await self.start_account(account_id)
-            except Exception as e:
-                logger.warning(f"[{account_id}] 浏览器关闭后重启 worker 失败: {e}")
-        else:
-            logger.info(f"[{account_id}] headed 浏览器已关闭(原未运行,不自动启动)")
+        self._open_browser_profiles.pop(account_id, None)
+        drop_view_profile(temp)
+        logger.info(f"[{account_id}] headed 浏览器已关闭(后台采集未中断)")
 
     async def fetch_all_once(self):
         """全部账号立即抓取一次。
@@ -2548,10 +2561,11 @@ class AccountManager:
                 logger.debug(f"login session cancel 异常(忽略): {e}")
         self.login_sessions.clear()
         for acc_id, ctx in list(self._open_browsers.items()):
-            acc = next((a for a in self.config.get("accounts", []) if a["id"] == acc_id), None)
-            await close_context_safely(ctx, acc["profile_dir"] if acc else None,
-                                       f"[{acc_id}] headed")
+            temp = self._open_browser_profiles.get(acc_id)
+            await close_context_safely(ctx, temp, f"[{acc_id}] headed")
+            drop_view_profile(temp)
         self._open_browsers.clear()
+        self._open_browser_profiles.clear()
         if self._playwright:
             try:
                 await self._playwright.stop()

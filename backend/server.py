@@ -1097,6 +1097,12 @@ async def remote_ws(ws: WebSocket, account: str = Query(""), url: str = Query(""
         await ws.send_json(sess.meta())
     except Exception as e:
         logger.warning(f"[remote] 建立会话失败 {account}: {e}")
+        # rev66: open() 可能已经把会话登记进 registry(日志里出现过
+        # 「会话已开启」紧接「建立会话失败」),不清理会留下僵尸会话。
+        try:
+            await remote_registry.close(account, "open_failed")
+        except Exception:
+            pass
         try:
             await ws.send_json({"t": "error",
                                 "message": f"{type(e).__name__}: {str(e)[:200]}"})

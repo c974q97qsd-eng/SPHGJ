@@ -19,7 +19,7 @@ type Meta = {
 /** 远程同步浏览:把账号浏览器的画面串到这里,鼠标键盘直接操作那一端。
  *
  * 后端用 CDP Page.startScreencast 推 JPEG 帧(二进制),输入走 Input.dispatch*。
- * 5 分钟没有任何操作自动断开并恢复数据抓取 —— 串流期间该账号的 worker 是停的。
+ * 5 分钟没有任何操作自动断开。串流用独立浏览器 + 注入登录态,后台采集不中断。
  */
 export function RemotePage() {
   const [sp] = useSearchParams()
@@ -133,7 +133,7 @@ export function RemotePage() {
           const reason = String(m.reason || "")
           setPhase("closed")
           setMsg(reason === "idle"
-            ? "5 分钟没有操作,已自动断开并恢复数据抓取"
+            ? "5 分钟没有操作,已自动断开"
             : reason === "kicked"
               ? "这个账号已在另一个标签页里打开,当前连接被接管"
               : reason === "manual" ? "会话已被手动关闭" : "连接已断开")
@@ -177,7 +177,7 @@ export function RemotePage() {
       setIdleLeft(left)
       if (left <= 0) {
         setPhase("closed")
-        setMsg("5 分钟没有操作,已自动断开并恢复数据抓取")
+        setMsg("5 分钟没有操作,已自动断开")
         try { wsRef.current?.close() } catch { /* ignore */ }
       }
     }, 500)

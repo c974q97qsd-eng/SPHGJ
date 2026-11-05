@@ -303,3 +303,66 @@ def sweep_stale_view_profiles(log_tag="[local-window]"):
 
 
 local_windows = LocalWindowManager()
+
+
+# ===================== rev66: 另起浏览器统一登录态 =====================
+async def export_login_state(manager, account_id, account, tag="view"):
+    """worker 还活着时只读导出现役登录态;没跑/导出失败回落 config.storage_state。
+
+    rev66: 纯 HTTP 化之后 profile 磁盘 cookie 不再可靠(cookie 权威副本在浏览器
+    内存与 config.accounts[].storage_state),另起的浏览器必须显式注入,否则开出
+    的是扫码页。调用方必须在 worker 被停之前调本函数。
+    """
+    w = (getattr(manager, "workers", {}) or {}).get(account_id)
+    ctx = getattr(w, "context", None) if w else None
+    if ctx is not None:
+        try:
+            st = await ctx.storage_state()
+            if (st or {}).get("cookies"):
+                logger.info(f"[{tag}] {account_id} 从运行中的 context 导出登录态 "
+                            f"cookies={len(st.get('cookies') or [])} 条")
+                return st
+        except Exception as e:
+            logger.warning(f"[{tag}] {account_id} 导出登录态失败(回落 config): {e}")
+    st = (account or {}).get("storage_state") or {}
+    if st.get("cookies"):
+        logger.info(f"[{tag}] {account_id} 使用 config 保存的登录态 "
+                    f"cookies={len(st.get('cookies') or [])} 条")
+        return st
+    return None
+
+
+async def inject_login_state(ctx, state, account_id, tag="view"):
+    """cookie + localStorage 一起注入。缺 localStorage 页面照样当未登录(rev37)。"""
+    if not state:
+        return False
+    try:
+        ck = state.get("cookies") or []
+        if ck:
+            await ctx.add_cookies(ck)
+        origins = state.get("origins") or []
+        if origins:
+            await ctx.add_init_script(_local_storage_script(origins))
+        logger.info(f"[{tag}] {account_id} 已注入登录态 "
+                    f"cookies={len(ck)} origins={len(origins)}")
+        return True
+    except Exception as e:
+        logger.warning(f"[{tag}] {account_id} 注入登录态失败: {e}")
+        return False
+
+
+def new_view_profile(suffix):
+    """独立临时 profile;_view_ 前缀由 sweep_stale_view_profiles 启动时清理。"""
+    p = os.path.join(".", "profiles", "_view_%s" % suffix)
+    _reset_dir(p)
+    return p
+
+
+def drop_view_profile(p):
+    """只删自己的临时 profile,绝不碰账号的 profile_dir(worker 还在用它)。"""
+    if not p:
+        return
+    try:
+        shutil.rmtree(p, ignore_errors=True)
+    except Exception:
+        pass

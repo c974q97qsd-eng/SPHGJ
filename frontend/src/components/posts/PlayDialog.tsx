@@ -6,8 +6,8 @@ import { Play, ExternalLink } from "lucide-react"
 
 /** 作品播放:点封面弹这个,拿后端现取的 CDN 直链播放。
  *
- * 地址带时效(视频号 CDN 会过期),所以每次打开都问后端要一次;
- * 后端发现过期会用该视频号的浏览器现取,拿不到就明确提示原因。
+ * 地址带时效(视频号 CDN 会过期),每次打开都由后端用当前账号的登录态
+ * 实时取最新地址(纯 HTTP 直连),拿不到就明确提示原因。
  */
 export function PlayDialog({ open, onOpenChange, finderId, objectId, title }: {
   open: boolean
@@ -65,7 +65,7 @@ export function PlayDialog({ open, onOpenChange, finderId, objectId, title }: {
                 className="max-h-[62vh] w-full rounded-md bg-black" />
               <div className="flex items-center justify-between text-xs text-muted-foreground">
                 <span>
-                  {data.refreshed ? "播放地址已过期,已用当前登录态现取" : "播放地址有效"}
+                  已实时获取播放地址
                 </span>
                 <a href={data.url} target="_blank" rel="noreferrer"
                   className="inline-flex items-center gap-1 hover:text-foreground">
