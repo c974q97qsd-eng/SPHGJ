@@ -177,6 +177,9 @@ _SLIM_FLV_URLS = ["*.flv*", "*.m3u8*", "*wxlivecdn*", "*trtc*"]
 # 所以页面文本是最廉价、最不依赖接口字段的兜底判据。
 # 词表刻意保守:"拿不准一律 None",绝不用它下"未播"的结论(只作弱正向)。
 _DOM_NOT_LIVE_WORDS = ("未开播", "暂未开播", "当前未开播", "直播已结束", "已结束直播", "暂无直播")
+# rev68: 微信对大屏页的功能限制提示。它不是"未播"，而是 dashboard 取不到数，
+# 继续重开/重载只会更频繁触发限制（2026-11-07 实测：83 次重建里大半是这么来的）。
+_DOM_BLOCKED_WORDS = ("暂时无法使用该功能", "该功能暂不可用", "暂时无法使用")
 _DOM_LIVE_WORDS = ("正在直播", "直播中", "结束直播", "直播时长", "在线人数")
 
 
@@ -276,6 +279,7 @@ class LiveFetcher:
         # rev47: 统一判据所需的两个事实来源
         self.status_num = None          # check_live_status.status(0=未开播,实测确认)
         self.dom_state = None           # 直播大屏页文本推断(True/False/None)
+        self.dom_blocked = False        # 大屏页是否被微信限制(「暂时无法使用该功能」)
         self.dom_ts = 0.0               # dom_state 的采样时间
         self._dom_dumped = False        # 页面文本只落盘一次(诊断用)
         # rev57: 看板字段缺失定位用
@@ -901,6 +905,9 @@ class LiveFetcher:
             except Exception:
                 pass
         txt = " || ".join(texts)
+        # rev68: 先认「被限制」再认在播/未播 —— 受限页同时含后台导航文案，
+        # 拿它当"未播"会让上层立刻关页重开，正是自激循环的起点。
+        self.dom_blocked = bool(txt) and any(w in txt for w in _DOM_BLOCKED_WORDS)
         state, matched = read_dom_state_from_text(txt)
         self.dom_state = state
         self.dom_ts = time.time()
@@ -1322,6 +1329,7 @@ class LiveFetcher:
             "status_num": self.status_num,
             "live_start_ts": self.live_start_ts,   # rev57: 时长兜底用
             "dom_state": self.dom_state,
+            "dom_blocked": self.dom_blocked,
             "dom_ts": self.dom_ts,
         }
 

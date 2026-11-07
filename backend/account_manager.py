@@ -75,6 +75,7 @@ class AccountWorker:
         self._live_probe_task = None     # 手动启动后短期开播探测任务
         self._live_opened_ts = 0.0   # live_page 开启时间(P0-1 按需开关)
         self._live_closed_ts = 0.0   # live_page 关闭时间
+        self._dash_blocked_until = 0.0   # rev68: 大屏被微信限制的退避截止时间
         self.live_info = None
         # 增值统计:每窗口独立采样(10分钟/30分钟各一套),增值=本次采样-上次采样
         self._ts_10m = 0.0
@@ -873,6 +874,9 @@ class AccountWorker:
             return True
         try:
             self.live_page = await self.context.new_page()
+            # rev68: 新页就把重建计时器拨到当下。否则 _live_loop 首次进循环会因为
+            # _last_live_reload 还停在很久以前而立刻再重建一次（白搭约 15s 空窗）。
+            self._last_live_reload = time.time()
             # 用局部 lf 持有 LiveFetcher,避免并发 _close_context/release_idle_browser 将
             # self.live_fetcher 置 None 后,本方法内再访问 .updated_at_ts 触发 'NoneType' 崩溃。
             lf = LiveFetcher(self.live_page, self.account["id"], account=self.account)
@@ -896,6 +900,13 @@ class AccountWorker:
                 info = await lf.snapshot()
             except Exception as e:
                 logger.debug(f"[{self.account['id']}] 判定前读直播页文本失败: {e}")
+            # rev68: 大屏页弹「暂时无法使用该功能」= 微信限制 dashboard，不是没信号。
+            # 记退避窗口，期间不再重建/重载大屏页；推流照旧（stream_url 由主动轮询给）。
+            if getattr(lf, "dom_blocked", False):
+                _bk = int(self.config.get("dashboard_blocked_backoff_sec", 900))
+                self._dash_blocked_until = time.time() + _bk
+                logger.warning(f"[{self.account['id']}] 大屏页提示「暂时无法使用该功能」"
+                               f"(微信限制),dashboard 数据不可用;{_bk}s 内不再重建/重载大屏页")
             # 判定:有 live_stats(近期)即直播;stream_url(.flv 流)也视为直播(视频流必出)。
             # 【rev13 修复 flapping】live_object_id 单独【不再】作为直播信号:
             # 它可能来自上一场直播残留的 check_live_status 响应(账号已下播但接口仍返回旧
@@ -1296,7 +1307,8 @@ class AccountWorker:
                 # 释放;重建有约 15s 数据空窗(转诊断用 pending 标记),30min 是空窗频率与内存增长的折中。
                 self._last_live_reload = getattr(self, "_last_live_reload", 0.0)
                 rebuild_sec = int(self.config.get("live_page_rebuild_sec", 1800))
-                if self.live_page and now - self._last_live_reload >= rebuild_sec:
+                if self.live_page and now - self._last_live_reload >= rebuild_sec \
+                        and now >= getattr(self, "_dash_blocked_until", 0.0):
                     rebuilt = False
                     try:
                         # rev16 F4: 先取出旧实例已学的 API 规格,重建后继承(省去重学空窗)。
@@ -1409,7 +1421,8 @@ class AccountWorker:
                         page_alive = bool(self.live_page) and "liveBuild" in (self.live_page.url or "")
                         can_reload = page_alive and (self._live_nosignal_reloads or 0) < 3 \
                             and (now - (self._live_last_reload_attempt or 0)) > 60
-                        if idle > 120 and can_reload:
+                        if idle > 120 and can_reload \
+                                and now >= getattr(self, "_dash_blocked_until", 0.0):
                             self._live_nosignal_reloads = (self._live_nosignal_reloads or 0) + 1
                             self._live_last_reload_attempt = now
                             try:
