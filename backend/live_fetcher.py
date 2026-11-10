@@ -225,7 +225,7 @@ def judge_live(live_stats=None, stats_fresh=True, stream_url=None,
 
 
 class LiveFetcher:
-    def __init__(self, page, account_id, learned=None, account=None):
+    def __init__(self, page, account_id, learned=None, account=None, config=None):
         """learned: rev16 F4 —— 继承上一实例的 API 规格 {name: spec}。
 
         重建 live_page(信号丢失自愈 / 定期释放 renderer)时传入旧实例的 _learned,
@@ -234,6 +234,9 @@ class LiveFetcher:
         """
         self.page = page
         self.account_id = account_id
+        # rev69: config 引用 —— 纯 HTTP 全靠它取【最新】账号对象(重新扫码后
+        # storage_state / _aid 会写回 config,而 account 只是启动时的快照)。
+        self._config = config or {}
         # rev50: 账号 dict（含 _aid / _log_finder_id / storage_state）。给了就让 dashboard
         # 走纯 HTTP，不必等页面渲染；不给则只能读 localStorage（浏览器路径）。
         self._account = account or {}
@@ -270,6 +273,12 @@ class LiveFetcher:
         self._learning = not self._learned                 # 已继承则无需再学
         self._learn_deadline = 0.0      # 学习超时阈值(>此时间未学到则回退 CDP)
         self._poll_fail_streak = 0      # 主动轮询连续失败计数
+        self._http_last_why = ""        # rev69: 纯 HTTP 最近一次失败原因(诊断用)
+        # rev70: 纯 HTTP 连续被顶(300342)。账号会话被别处登录顶替时,继续每秒一枪
+        # 只会把日志刷满、还拖慢真正有用的轮询 —— 退避 1→2→4→8 分钟(封顶 8 分钟)。
+        # 注意:退避只停【接口轮询】,已经推给前端的 flv 流不受影响(不关流、不下播)。
+        self._http_kick_streak = 0
+        self._http_backoff_until = 0.0
         self._cdp_fallback = False      # 主动轮询不可用回退到 CDP 响应捕获
         self._replay_tick = 0           # rev43: 回退 CDP 后的主动重放节流计数
         self._reload_nudged = False     # rev43: 学习超时只自动 reload 一次,防抖
@@ -520,6 +529,10 @@ class LiveFetcher:
         # 原逻辑 _learning 是"全有或全无"开关:15s 内只学到 live_status(缺 live_info)
         # 就完全不主动轮询,直接掉进 CDP 被动捕获 —— 而此刻页面早已把 check_live_status
         # 发完,被动监听永远等不到新响应 -> 误判"未在直播"(2026-10-28 2 号事故)。
+        # rev69: page 为 None = 纯 HTTP 实例(直播期默认模式),整条链路不碰浏览器。
+        # 放在最前:下面的学习窗口 / CDP 回退全部依赖 page,纯 HTTP 实例没有这些状态。
+        if self.page is None:
+            return await self._poll_http()
         if not self._learned:
             # 一个都没学到:等学习窗口;超时则回退 CDP(回退时自动 reload 重触发请求)
             if self._learning and not self._cdp_fallback and time.time() > self._learn_deadline:
@@ -1115,6 +1128,109 @@ class LiveFetcher:
 
     # ======================== Dashboard 主动抓取 ========================
 
+    def _config_account(self):
+        """rev69: 取 config 里【最新】的账号对象。
+
+        重新扫码/登录后 storage_state 与 _aid 会写回 config,而 worker 手里那份
+        account dict 是启动时的快照。纯 HTTP 全靠它拿 cookie,必须取最新,
+        否则扫码后旧 worker 会一直以为没登录态。
+        """
+        aid = self.account_id
+        cfg = self._config if isinstance(self._config, dict) else {}
+        for a in (cfg.get("accounts") or []):
+            if isinstance(a, dict) and a.get("id") == aid:
+                return a
+        return self._account or {}
+
+    async def _http_post_spec(self, spec):
+        """rev69: 直发一份已学规格(纯 HTTP,不需要 page)。成功返回响应文本,否则 ""。
+
+        复用 live_probe_http.prepare_request:剔 cookie、刷毫秒 timestamp、
+        借用规格时换 _aid/_log_finder_id —— 这些坑都已经踩过,不另写一份。
+        """
+        acc = self._config_account()
+        if not acc:
+            return ""
+        try:
+            from .live_probe_http import prepare_request
+            from .wx_http import post_json
+            url, method, headers, body = prepare_request(spec, acc)
+        except Exception as e:
+            logger.debug(f"[live:{self.account_id}] 规格准备失败: {e}")
+            return ""
+        if not url:
+            return ""
+        # rev57 的坑:get_live_info 的 body 里 liveObjectId 冻结在"学到那一刻",
+        # 不换成本场就是 errCode=0 但 data 只剩 realtimeStatus(2026-11-07 实测)。
+        if body and "liveObjectId" in body:
+            try:
+                body = self._fresh_post_data(dict(spec, postData=body))
+            except Exception:
+                pass
+            if body is None:
+                logger.debug(f"[live:{self.account_id}] 缺本场 liveObjectId,跳过该接口")
+                return ""
+        j = await post_json(acc, url, body, page_url=LIVE_URL,
+                            headers=headers, timeout=_EVAL_TIMEOUT)
+        if not isinstance(j, dict) or j.get("__err"):
+            self._http_last_why = (j or {}).get("__err") if isinstance(j, dict) else "not_dict"
+            logger.debug(f"[live:{self.account_id}] 纯 HTTP 请求失败: {self._http_last_why}")
+            return ""
+        if j.get("errCode") not in (0, None):
+            self._http_last_why = "errCode=%s" % j.get("errCode")
+            return ""
+        return json.dumps(j, ensure_ascii=False)
+
+    async def _poll_http(self):
+        """rev69: 纯 HTTP 轮询 —— 全程不碰 page。
+
+        顺序必须是 status -> info:liveObjectId 只能从 check_live_status 拿,
+        而 get_live_info 的 body 要用它重写。返回 snapshot(),与页面路径结构一致,
+        上层不需要区分这次数据是 HTTP 拿的还是页面拿的。
+        """
+        # rev70: 退避期内直接返回上一份快照 —— 一个包都不发。
+        if time.time() < self._http_backoff_until:
+            return await self.snapshot()
+        if not self._learned:
+            self._learned = _load_spec_cache(self.account_id) or {}
+        got = False
+        spec = self._learned.get("live_status")
+        if spec:
+            txt = await self._http_post_spec(spec)
+            if txt:
+                await self._parse_live_status(txt)
+                got = True
+        spec = self._learned.get("live_info")
+        if spec and self.live_object_id:
+            txt = await self._http_post_spec(spec)
+            if txt:
+                if await self._parse_live_info(txt):
+                    got = True
+        if got:
+            self._poll_fail_streak = 0
+            self._http_kick_streak = 0
+            self._http_backoff_until = 0.0
+        else:
+            self._poll_fail_streak += 1
+            n = self._poll_fail_streak
+            why = getattr(self, "_http_last_why", "") or ""
+            if "300342" in why:
+                # rev70: 会话被别处登录顶替。软故障 —— 不判离线、不关流,
+                # 只把接口轮询按 1/2/4/8 分钟往后推;顶替结束后第一枪成功即恢复。
+                self._http_kick_streak += 1
+                k = self._http_kick_streak
+                wait = min(60 * (2 ** (k - 1)), 480)
+                self._http_backoff_until = time.time() + wait
+                if k <= 2 or k % 5 == 0:
+                    logger.warning(f"[live:{self.account_id}] 纯 HTTP 轮询被顶"
+                                   f"(errCode=300342)连续第 {k} 次,"
+                                   f"{wait}s 内暂停接口轮询"
+                                   f"(视频流不受影响,不判离线)")
+            elif n in (3, 10) or n % 60 == 0:
+                logger.warning(f"[live:{self.account_id}] 纯 HTTP 轮询连续失败 {n} 次"
+                               f"(规格={sorted(self._learned)}, why={why})")
+        return await self.snapshot()
+
     async def _ensure_ids(self):
         """确定 _aid + _log_finder_id。
 
@@ -1129,6 +1245,16 @@ class LiveFetcher:
             self._aid = (acc.get("_aid") or "").strip() or None
         if not self._log_finder_id:
             self._log_finder_id = (acc.get("_log_finder_id") or "").strip() or None
+        # rev69: 纯 HTTP 模式下 page 是 None,读不到 localStorage ——
+        # 必须能只靠 config 拿到这两个值,否则 dashboard 三个接口全部静默失败。
+        if not (self._aid and self._log_finder_id):
+            _cfgacc = self._config_account()
+            if _cfgacc:
+                if not self._aid:
+                    self._aid = (str(_cfgacc.get("_aid") or "")).strip() or None
+                if not self._log_finder_id:
+                    self._log_finder_id = (
+                        str(_cfgacc.get("_log_finder_id") or "")).strip() or None
         if self._aid and self._log_finder_id:
             return
         if self.page is None:

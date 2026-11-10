@@ -401,8 +401,18 @@ def main():
         for k, v in (req.get("env") or {}).items():
             if v:
                 env[k] = v
+        # rev69: **绝不能**把 run.log 当子进程的 stdout。
+        # 子进程继承的是 Win32 HANDLE —— CRT 的 O_APPEND 标志在这一层就丢了,
+        # 而文件位置是内核对象的共享属性。结果是:main.py 把 run.log 截断成 0 之后,
+        # 继承来的句柄下一次写仍从旧末尾(22MB)开始,文件被重新撑回原大小、
+        # 中间填满 NUL 空洞(实测母本 2026-11-07 19:59 就是这样)。
+        # 所以子进程只拿一个独立的启动日志(捕捉 import 阶段的崩溃),
+        # run.log 完全交给 main.py 自己 open,谁持有谁负责。
+        # 注意:helper 是独立脚本(没有 ROOT 变量),路径只能从 req 里推。
+        _root = os.path.dirname(os.path.abspath(req.get("log") or "")) or "."
+        boot_log = os.path.join(_root, "run.boot.log")
         try:
-            logf = open(req["log"], "a", encoding="utf-8")
+            logf = open(boot_log, "a", encoding="utf-8")
         except Exception as e:
             write_status(req, ok=False, phase="failed", old_pid=old_pid, new_pid=0,
                          port=0, error="打开日志失败: %r" % (e,))

@@ -32,6 +32,7 @@ from .account_manager import AccountManager
 from .title_clean import split_titles
 from .login_capture import LoginLockError
 from .log_hub import install as install_log_hub
+from . import log_rotate as log_rotate_mod   # rev69: 运行日志轮转
 from . import schemas
 from .metrics import metric_dictionary, validate_card_fields, DEFAULT_CARD_FIELDS
 from .memtrim import trim_now
@@ -159,6 +160,68 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 _LOOP: Optional[asyncio.AbstractEventLoop] = None
 
 
+async def _log_rotate_boot():
+    """rev69: 启动 40s 后兜底再归档一次 —— **只读复制,不动 run.log**。
+
+    main.py 启动阶段已按 plan_startup 归档过、并用 "w" 打开 run.log 完成截断,
+    正常情况下这里 run.log 很小,直接 return。
+    这一步只兜底启动时复制失败的情况(权限/占用),好歹把内容留在 logs/ 里;
+    **不做截断** —— 运行中截断要求自己持有 run.log 句柄,pythonw 下不可靠
+    (实测 server 进程的 sys.stdout 并不是 run.log 的句柄)。真要收缩只能重启,
+    见 _log_rotate_loop。
+    """
+    try:
+        await asyncio.sleep(40)
+        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        max_mb = float(config.get("log_max_mb", 20) or 20)
+        keep_days = int(config.get("log_keep_days", 7) or 7)
+        if log_rotate_mod.size_mb(base) < max_mb:
+            return
+        info = log_rotate_mod.copy_archive(base, reason="启动兜底",
+                                           keep_days=keep_days)
+        if info:
+            logger.warning(
+                f"[log] run.log 仍是大文件({info.get('archived_from_mb')}MB),"
+                f"已兜底归档到 logs/{info.get('archived_to')}"
+                f"{'(复用已有)' if info.get('dedup') else ''};"
+                f"下次重启时会被截断")
+        elif log_rotate_mod.LAST_ERROR:
+            logger.warning(f"[log] 启动后补归档失败: {log_rotate_mod.LAST_ERROR}"
+                           f"(run.log 当前 {log_rotate_mod.size_mb(base):.1f}MB)")
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.debug(f"[log] 补归档异常: {e}")
+
+
+async def _log_rotate_loop():
+    """rev69: run.log 超限 -> 安排优雅重启(重启时归档)。
+
+    为什么只能重启:pythonw 下 stdout 一直指向 run.log,句柄常驻,
+    运行中 rename 必报 WinError 32(详见 backend/log_rotate.py)。
+    重启约 12s,账号会自动恢复;每天最多触发一次(默认 6 小时检查一次)。
+    """
+    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    while True:
+        try:
+            gap = int(config.get("log_rotate_check_sec", 21600) or 21600)
+            await asyncio.sleep(max(600, gap))
+            max_mb = float(config.get("log_max_mb", 20) or 20)
+            if not log_rotate_mod.should_rotate_running(base, max_mb):
+                continue
+            sz = log_rotate_mod.size_mb(base)
+            logger.warning(f"[log] run.log 已达 {sz:.1f}MB(阈值 {max_mb:.0f}MB),"
+                           f"安排重启以归档(重启后账号自动恢复)")
+            info = restart_mod.restart(3)
+            logger.info(f"[log] 已安排重启(helper_pid={info.get('helper_pid')}),"
+                        f"新进程启动时把 run.log 归档到 logs/")
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.debug(f"[log] 轮转检查异常: {e}")
+
+
 @app.on_event("startup")
 async def _capture_loop():
     global _LOOP
@@ -166,6 +229,9 @@ async def _capture_loop():
     # 日志中心绑定事件循环,之后可从任意工作线程安全地推送到界面
     log_hub.attach(_LOOP, hub.emit)
     asyncio.create_task(_mem_monitor())
+    # rev69: 运行日志超限自动轮转(通过优雅重启实现,见 backend/log_rotate.py)
+    asyncio.create_task(_log_rotate_loop())
+    asyncio.create_task(_log_rotate_boot())
     # rev18: 泄漏高发期(启动后 ~3.5h)自动深采样,结果落盘 mem_deep.log
     asyncio.create_task(_deep_autopsy_loop())
     # 作品每日定时刷新(手动刷新不受影响)
@@ -1290,6 +1356,67 @@ async def system_reap_orphans(account: str = Query("")):
 
 # rev58: 等待发布任务结束再重启的状态(前端据此提示,避免重启把正在发的作品打断)
 _restart_wait = {"waiting": False, "since": 0.0, "max_wait": 0.0}
+
+
+@app.get("/api/system/log")
+async def system_log_info():
+    """rev69: 运行日志状态 —— 大小、归档、阈值、最近一次失败原因。
+
+    诊断用:日志没按预期轮转时,先看这里的 last_error / has_handle,
+    不用再去猜是权限、占用还是配置。
+    """
+    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    d = log_rotate_mod.logs_dir(base)
+    archives = []
+    try:
+        for f in sorted(os.listdir(d), reverse=True):
+            if f.startswith("run-") and f.endswith(".log"):
+                p = os.path.join(d, f)
+                archives.append({"name": f,
+                                 "mb": round(os.path.getsize(p) / 1048576.0, 2),
+                                 "mtime": datetime.fromtimestamp(
+                                     os.path.getmtime(p)).strftime("%Y-%m-%d %H:%M:%S")})
+    except Exception:
+        pass
+    return {"size_mb": round(log_rotate_mod.size_mb(base), 2),
+            "max_mb": float(config.get("log_max_mb", 20) or 20),
+            "keep_days": int(config.get("log_keep_days", 7) or 7),
+            "check_sec": int(config.get("log_rotate_check_sec", 21600) or 21600),
+            "has_handle": log_rotate_mod.handle_of(base) is not None,
+            "archives": archives,
+            "last_error": log_rotate_mod.LAST_ERROR}
+
+
+@app.post("/api/system/log-rotate")
+async def system_log_rotate(restart: bool = Query(False)):
+    """rev69: 立刻归档一次(只复制,不动 run.log)。
+
+    运行中没法把 run.log 截短(拿不到自己的句柄),所以归档后文件大小不变;
+    想让体积真正归零得重启 —— restart=1 会顺手安排一次优雅重启。
+    """
+    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    keep_days = int(config.get("log_keep_days", 7) or 7)
+    before = log_rotate_mod.size_mb(base)
+    info = log_rotate_mod.archive_now(base, keep_days=keep_days)
+    after = log_rotate_mod.size_mb(base)
+    if info:
+        logger.info(f"[log] 手动归档 {before:.2f}MB -> logs/{info.get('archived_to')}"
+                    f"{'(复用已有)' if info.get('dedup') else ''},"
+                    f"当前仍 {after:.2f}MB(重启后归零)")
+    out = {"ok": bool(info), "before_mb": round(before, 2),
+           "after_mb": round(after, 2), "need_restart": after > 0.2,
+           "result": info, "restarted": False,
+           "last_error": log_rotate_mod.LAST_ERROR}
+    if restart and after > 0.2:
+        try:
+            r = restart_mod.restart(3)
+            out["restarted"] = True
+            out["helper_pid"] = r.get("helper_pid")
+            logger.info(f"[log] 已安排重启以截断 run.log"
+                        f"(helper_pid={r.get('helper_pid')})")
+        except Exception as e:
+            out["restart_error"] = f"{type(e).__name__}: {e}"
+    return out
 
 
 @app.post("/api/system/restart")

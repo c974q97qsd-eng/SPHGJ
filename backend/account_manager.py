@@ -28,6 +28,7 @@ from .local_window import (export_login_state, inject_login_state,
                            new_view_profile, drop_view_profile)
 from .selectors import COMMENT_URL, POST_CREATE_URL
 from .memtrim import MemoryTrimmer, trim_now
+from . import auth_events
 
 
 def auth_fingerprint(account):
@@ -154,6 +155,10 @@ class AccountWorker:
         self._http_block_until = 0.0
         self._http_block_logged = ""
         self._http_last_why = ""        # 最近一次 HTTP 探测不可用的原因(no_spec/no_cookie/expired…)
+        # rev70: 软故障退避(300342 会话被新登录顶替)。这不是失效,不能判离线 ——
+        # 但连着撞也没意义,按 60→120→240… 指数退避,避免每轮都白白撞一发。
+        self._soft_fail_streak = 0
+        self._soft_block_until = 0.0
 
     async def start(self, playwright, headless=True):
         self._pw = playwright
@@ -251,6 +256,8 @@ class AccountWorker:
             await self._close_context()
         except Exception as e:
             logger.debug(f"[{self.account['id']}] 掉线后关浏览器异常(忽略): {e}")
+        auth_events.record(self.account["id"], "offline", code=code,
+                           reason=self.auth_reason, source="mark_offline")
         await self._emit("account_offline", {"account_id": self.account["id"],
                                             "reason": self.auth_reason,
                                             "code": code, "ts": self.auth_ts})
@@ -266,6 +273,13 @@ class AccountWorker:
         self._http_block_until = 0.0
         self._http_block_logged = ""
         self._http_last_why = ""
+        # rev70: 重新上线 = 之前所有退避作废(用户可能刚重新扫码)
+        self._soft_fail_streak = 0
+        self._soft_block_until = 0.0
+        if was == "offline" or why:
+            auth_events.record(self.account["id"], "online", reason=why or "",
+                               source="mark_online",
+                               extra={"was": was})
         try:
             if self.api is not None:
                 self.api.clear_auth_fail()
@@ -409,14 +423,16 @@ class AccountWorker:
         self.context = await launch_stealth(self._pw, self.account["profile_dir"], headless=self._headless)
         # rev29: 注入扫码时导出的登录态(双保险)。profile 磁盘 cookie 有时写入不成功
         # (Chromium 延迟写盘 + 进程被中途关闭),只靠磁盘会反复「扫码成功但登录不上」。
-        try:
-            _ss = (self.account.get("storage_state") or {})
-            _ck = _ss.get("cookies") or []
-            if _ck:
-                await self.context.add_cookies(_ck)
-                logger.info(f"[{self.account['id']}] 已注入登录态 cookies={len(_ck)} 条")
-        except Exception as e:
-            logger.warning(f"[{self.account['id']}] 注入登录态失败(回退用 profile 磁盘): {e}")
+        # rev70: **cookie + localStorage 必须一起注**。视频号的登录身份
+        # (__ml::aid / finder_username)存在 localStorage,只 add_cookies 页面照样当
+        # 未登录:要么被弹回 login.html,要么 _aid 缺失让接口报 300333/300330 假过期。
+        # rev66 给「另起浏览器」三个入口补过这一课,worker 主路径这里一直漏着。
+        _ss = (self.account.get("storage_state") or {})
+        _inj = await inject_login_state(self.context, _ss, self.account["id"], "worker")
+        if not _inj and (_ss.get("cookies") or _ss.get("origins")):
+            logger.warning(f"[{self.account['id']}] 注入登录态未成功"
+                           f"(cookies={len(_ss.get('cookies') or [])} "
+                           f"origins={len(_ss.get('origins') or [])}),回退用 profile 磁盘")
         self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
         await self.page.goto(COMMENT_URL, wait_until="domcontentloaded")
         await self.page.wait_for_timeout(2500)
@@ -631,12 +647,10 @@ class AccountWorker:
         调用方必须持有 _browser_lock,用完自己 close(绝不写回 self.context)。
         """
         ctx = await launch_stealth(self._pw, self.account["profile_dir"], headless=self._headless)
-        try:
-            _ck = ((self.account.get("storage_state") or {}).get("cookies") or [])
-            if _ck:
-                await ctx.add_cookies(_ck)
-        except Exception as e:
-            logger.debug(f"[{self.account['id']}] 轻量探测注入登录态失败: {e}")
+        # rev70: 同样 cookie + localStorage 一起注 —— ctx.request 虽然只吃 cookie,
+        # 但 ctx 之后可能被复用成页面(大屏/串流),留着半套登录态迟早出事。
+        await inject_login_state(ctx, self.account.get("storage_state"),
+                                 self.account["id"], "probe")
         return ctx
 
     async def _probe_via_context(self, ctx):
@@ -671,7 +685,8 @@ class AccountWorker:
             return None
         lf = None
         try:
-            lf = LiveFetcher(None, self.account["id"], account=self.account)
+            lf = LiveFetcher(None, self.account["id"], account=self.account,
+                             config=self.config)
             # 抑制"拿到 liveObjectId, dashboard 抓取启用"这类只对常驻实例有意义的日志
             # 与首次落盘(轻量探测每几分钟一次,不该重复写文件)
             lf.live_object_id = "-"
@@ -702,7 +717,8 @@ class AccountWorker:
         cookie 用 config 里的**最新**账号对象取(重新扫码后 storage_state 会被换掉),
         拿不到才回退 self.account —— 否则扫码前的旧 worker 会一直以为没 cookie。
         """
-        if time.time() < self._http_block_until:
+        _now = time.time()
+        if _now < self._http_block_until or _now < self._soft_block_until:
             return None
         acc = self.account
         try:
@@ -721,9 +737,39 @@ class AccountWorker:
         if res is not None:
             self._http_block_until = 0.0
             self._http_block_logged = ""
+            if self._soft_fail_streak:
+                # rev70: 被顶之后自己恢复了(新登录把会话换回来了 / 对方下线)
+                logger.info(f"[{self.account['id']}] HTTP 直连已恢复"
+                            f"(此前连续 {self._soft_fail_streak} 次被顶),清除退避")
+                auth_events.record(self.account["id"], "soft_recover",
+                                   reason="HTTP 直连恢复", source="probe_http",
+                                   extra={"streak": self._soft_fail_streak})
+                self._soft_fail_streak = 0
+            self._soft_block_until = 0.0
             return res
         why = diag.get("why") or ""
         self._http_last_why = why
+        if why == "kicked":
+            # rev70: errCode=300342 = 会话正被【别处的登录】顶替 —— 软故障,不是失效。
+            # 判定上绝不据此判离线(浏览器 auth_data 硬验才算数);但连着撞没意义,
+            # 60→120→240→480→900 秒指数退避,期间直接走浏览器路径。
+            self._soft_fail_streak += 1
+            n = self._soft_fail_streak
+            wait = min(60 * (2 ** (n - 1)), 900)
+            self._soft_block_until = time.time() + wait
+            if n <= 3 or n % 10 == 0:
+                logger.warning(f"[{self.account['id']}] HTTP 探测被顶"
+                               f"(errCode={diag.get('code')} 会话正被别处登录顶替),"
+                               f"连续第 {n} 次 -> {wait}s 内不再走 HTTP 直连;"
+                               f"软故障,不判离线(以浏览器硬验为准)")
+            if n == 1:
+                auth_events.record(self.account["id"], "http_kicked",
+                                   code=diag.get("code"),
+                                   reason="会话正被别处登录顶替",
+                                   source="probe_http",
+                                   extra={"streak": n, "backoff_sec": wait})
+            self._http_block_until = 0.0
+            return None
         if why in ("no_cookie", "badauth", "expired"):
             # 这两类 3 分钟内不会自己恢复:与其每轮白等一次超时,不如先暂停 HTTP,
             # 直接走浏览器路径(那边有真会话,能判)。cookie 一被重新扫码写入,
@@ -731,6 +777,11 @@ class AccountWorker:
             self._http_block_until = time.time() + 180
             if self._http_block_logged != why:
                 self._http_block_logged = why
+                auth_events.record(
+                    self.account["id"],
+                    "http_expired" if why == "expired" else
+                    ("http_nocookie" if why == "no_cookie" else "http_badauth"),
+                    code=diag.get("code"), reason=why, source="probe_http")
                 if why == "no_cookie":
                     logger.warning(f"[{self.account['id']}] HTTP 探测不可用:该账号没有已保存的"
                                    f"登录态(storage_state 无 cookie),改用浏览器路径探测"
@@ -823,12 +874,43 @@ class AccountWorker:
         finally:
             await self.release_idle_browser()
 
+    async def _attach_http_fetcher(self):
+        """rev69: 不开页,挂一个纯 HTTP 的 LiveFetcher。返回是否挂上。
+
+        前提是账号已经学到过接口规格(data/live_api_spec.json 里 live_status/live_info
+        都在)。从没开过页的账号没有规格,只能先开一次页学 —— 学完落盘,之后全程纯 HTTP。
+        """
+        if self.live_fetcher is not None:
+            return True
+        try:
+            spec = _load_spec_cache(self.account["id"]) or {}
+        except Exception:
+            spec = {}
+        if not (spec.get("live_status") and spec.get("live_info")):
+            logger.info(f"[{self.account['id']}] 没有可用的接口规格({sorted(spec)}),"
+                        f"先开一次直播页学习")
+            return False
+        lf = LiveFetcher(None, self.account["id"], learned=spec,
+                         account=self.account, config=self.config)
+        self.live_fetcher = lf
+        self.live_page = None
+        self._live_opened_ts = time.time()
+        self._live_closed_ts = 0.0
+        logger.info(f"[{self.account['id']}] 纯 HTTP 采集已启用"
+                    f"(不开直播页,规格={sorted(spec)})")
+        return True
+
     async def _after_probe(self, probe):
         """轻量探测结果 -> 是否开直播大屏页。probe=None 表示轻量不可用,退回完整检测。"""
         if probe is not None:
             self._last_probe = probe
             self._probe_since_full += 1
             if probe["live"]:
+                # rev69: 默认纯 HTTP 采集。stream_url / liveStats / 46 个 metrics
+                # 都能直连接口拿到,不需要 live_page;开页只在"没有规格"时学一次。
+                if not self.config.get("live_use_page", False):
+                    if await self._attach_http_fetcher():
+                        return True
                 logger.info(f"[{self.account['id']}] 轻量探测:在播(依据={probe['reason']}, "
                             f"via={probe.get('via')}),打开直播大屏页取流")
                 return await self._open_full()
@@ -879,7 +961,8 @@ class AccountWorker:
             self._last_live_reload = time.time()
             # 用局部 lf 持有 LiveFetcher,避免并发 _close_context/release_idle_browser 将
             # self.live_fetcher 置 None 后,本方法内再访问 .updated_at_ts 触发 'NoneType' 崩溃。
-            lf = LiveFetcher(self.live_page, self.account["id"], account=self.account)
+            lf = LiveFetcher(self.live_page, self.account["id"], account=self.account,
+                                config=self.config)
             self.live_fetcher = lf
             await lf.goto_live()
             self._live_opened_ts = time.time()
@@ -1010,13 +1093,100 @@ class AccountWorker:
         return info or {}
 
     async def _initial_live_check(self):
-        """启动后即时直播检测:开 live_page 等响应判定;直播则保持并流式推送,
-        非直播则关页,随后 release_idle_browser 收回评论页进程(空闲不占内存)。"""
-        if not self.logged_in or self.context is None:
+        """启动后即时直播检测。
+
+        rev69: 默认**纯 HTTP**,不开大屏页 —— 大屏页在微信侧有「多账号频繁访问」
+        限制,实测三个号同时恢复就三个都弹「暂时无法使用该功能」。
+        原来这里直接 _open_and_detect_live(),绕过了 _after_probe 的 HTTP 分流,
+        是"重启后又开页"的唯一原因。没规格/HTTP 不通才退回开页学一次。
+        """
+        if not self.logged_in:
+            return
+        if not self.config.get("live_use_page", False):
+            r = await self._http_live_check()
+            if r:                     # 已判在播,fetcher 保留,_live_loop 已在推流
+                return
+            if r is False:            # 纯 HTTP 明确判了"没在播",不用开页
+                await self.release_idle_browser()
+                return
+            # r is None -> 没有规格/接口不通,退回开页学一次(学完落盘,下次就能纯 HTTP)
+        if self.context is None:
             return
         await self._open_and_detect_live()
         # 非直播:收回评论页进程;直播:保持(live_fetcher 存在)
         await self.release_idle_browser()
+
+    async def _http_live_check(self):
+        """rev69: 纯 HTTP 版启动首检。不建 context、不开页。
+
+        返回 True  已判在播(fetcher 保留,_live_loop 已启动)
+              False 明确判了没在播(fetcher 已释放)
+              None  纯 HTTP 不可用(没规格 / 接口全失败) -> 调用方开页学一次
+        """
+        if self.live_fetcher is not None:
+            return True
+        try:
+            if not await self._attach_http_fetcher():
+                return None           # 没规格,只能先开一次页学
+        except Exception as e:
+            logger.debug(f"[{self.account['id']}] 纯 HTTP 首检挂载失败: {e}")
+            return None
+        lf = self.live_fetcher
+        if lf is None:
+            return None
+        deadline = time.time() + float(self.config.get("live_http_first_check_sec", 12))
+        try:
+            while time.time() < deadline:
+                try:
+                    await lf.poll()
+                except Exception as e:
+                    logger.debug(f"[{self.account['id']}] 纯 HTTP 首检 poll 异常: {e}")
+                if lf.live_stats:
+                    break
+                await asyncio.sleep(2)
+            snap = await lf.snapshot()
+            is_live, why = judge_live(
+                live_stats=snap.get("live_stats"),
+                stats_fresh=(time.time() - (lf.updated_at_ts or 0)) < 30,
+                stream_url=lf.stream_url, allow_stream_url=True,
+                dom_state=snap.get("dom_state"), dom_fresh=False,
+                status=snap.get("status_num"))
+            if is_live:
+                logger.info(f"[{self.account['id']}] 检测到直播信号(依据={why}, "
+                            f"纯 HTTP 无页面),开始流式推送")
+                self.start_live_loop()
+                logger.info(f"[{self.account['id']}] 检测到直播,开始流式推送"
+                            f"(live_object_id={lf.live_object_id}, "
+                            f"stream_url={'有' if lf.stream_url else '待取'})")
+                return True
+            why_fail = getattr(lf, "_http_last_why", "") or ""
+            if not snap.get("live_stats") and why_fail:
+                # 一次都没拿到有效响应 -> 很可能是规格失效,交回开页自愈
+                logger.info(f"[{self.account['id']}] 纯 HTTP 首检无有效响应"
+                            f"({why_fail}),退回开页学习接口规格")
+                try:
+                    await lf.close()
+                except Exception:
+                    pass
+                self.live_fetcher = None
+                return None
+            logger.info(f"[{self.account['id']}] 直播检测:当前未在直播"
+                        f"(依据={why}, 纯 HTTP 无页面)")
+            try:
+                await lf.close()
+            except Exception:
+                pass
+            self.live_fetcher = None
+            self._live_closed_ts = time.time()
+            return False
+        except Exception as e:
+            logger.warning(f"[{self.account['id']}] 纯 HTTP 首检失败({e}),改用开页检测")
+            try:
+                await lf.close()
+            except Exception:
+                pass
+            self.live_fetcher = None
+            return None
 
     async def _cycle_live_check(self):
         """评论抓取周期内顺带直播检测(跟随 10 分钟周期)。
@@ -1297,7 +1467,10 @@ class AccountWorker:
             # 用局部 lf 持有 LiveFetcher,避免并发 _close_context/release_idle_browser 将
             # self.live_fetcher 置 None 后,本方法内再访问 .updated_at_ts 触发 'NoneType' 崩溃。
             lf = self.live_fetcher
-            if self.logged_in and self.context:
+            # rev69: 判据不能是 self.context —— 纯 HTTP 实例压根没有 context,
+            # 写成 `and self.context` 会让轮询在无页账号上整段跳过(rev64 播放地址
+            # 就是栽在同一个假设上)。纯 HTTP 用 lf.page is None 区分。
+            if self.logged_in and (self.context is not None or lf.page is None):
                 now = time.time()
                 # 每 ~30 分钟 close+重建 live_page(替代 reload):reload 不退出 Chromium renderer,
                 # 直播期间 FLV 流涨到的峰值内存不归还 OS;close page 触发 renderer 退出归还内存,
@@ -1320,7 +1493,8 @@ class AccountWorker:
                         self.live_page = await self.context.new_page()
                         lf = LiveFetcher(self.live_page, self.account["id"],
                                          learned=inherited_learned,
-                                         account=self.account)
+                                         account=self.account,
+                                         config=self.config)
                         self.live_fetcher = lf
                         await lf.goto_live()
                         self._last_live_reload = now
@@ -1382,7 +1556,9 @@ class AccountWorker:
                     signal_lost_sec = int(self.config.get("live_signal_lost_sec", 90))
                     # rev47: 没有 live_stats 时补一次页面文本采样(最多每 30s 一次),
                     # 这是"接口不认、页面认"的兜底判据 —— 长驻页面最容易遇到接口静默。
-                    if not info.get("live_stats") and now - (getattr(lf, "dom_ts", 0) or 0) > 30:
+                    if (self.live_page is not None      # rev69: 纯 HTTP 实例没有页面可采样
+                            and not info.get("live_stats")
+                            and now - (getattr(lf, "dom_ts", 0) or 0) > 30):
                         try:
                             await lf.read_dom_state(dump=False)
                             info["dom_state"] = lf.dom_state
@@ -1413,6 +1589,22 @@ class AccountWorker:
                                         f"(第{self._live_poll_retry}次/最多{max_retry}次)")
                             await asyncio.sleep(retry_gap)
                             continue
+                        # rev69: 纯 HTTP 实例拿到不信号,很可能是接口改版/规格失效 ——
+                        # 只有开页才能重新学到规格。限流到 30 分钟一次,别反复开页。
+                        if (self.live_page is None
+                                and self.config.get("live_http_fallback_to_page", True)
+                                and now - (self._live_opened_ts or now) > 180
+                                and now - (getattr(self, "_http_open_fallback_ts", 0) or 0) > 1800):
+                            self._http_open_fallback_ts = now
+                            logger.warning(f"[{self.account['id']}] 纯 HTTP 连续拿不到直播信号"
+                                           f"({getattr(lf, '_http_last_why', '') or 'no_signal'}),"
+                                           f"回退开页自愈(重新学接口规格)")
+                            if lf:
+                                try: await lf.close()
+                                except Exception: pass
+                            self.live_fetcher = None
+                            await self._open_full()
+                            continue
                         # 重试耗尽:确认真丢失,走原自愈/关页流程
                         # 自恢复:账号实际可能在播,但 check_live_status 捕获偶发瞬断(长驻页面常见)。
                         # 信号丢失 >120s 不直接关页,而是重载 live_page 重触发捕获(最多 3 次,间隔 60s),
@@ -1435,7 +1627,8 @@ class AccountWorker:
                                 await self.live_page.reload(wait_until="domcontentloaded")
                                 lf = LiveFetcher(self.live_page, self.account["id"],
                                                  learned=inherited_learned,
-                                                 account=self.account)
+                                                 account=self.account,
+                                                 config=self.config)
                                 self.live_fetcher = lf
                                 await lf.goto_live()
                                 self._last_live_reload = now
@@ -1461,7 +1654,9 @@ class AccountWorker:
                             if lf:
                                 try: await lf.close()
                                 except Exception: pass
-                            try: await self.live_page.close()
+                            try:
+                                if self.live_page is not None:   # rev69: 纯 HTTP 模式没有 page
+                                    await self.live_page.close()
                             except Exception: pass
                             self.live_page = None
                             self.live_fetcher = None

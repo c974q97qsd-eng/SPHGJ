@@ -59,21 +59,97 @@ else:
     if os.path.isdir(_offline_browsers):
         os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", _offline_browsers)
 
+# rev69: 日志轮转 —— 先装载模块与配置,真正执行放在下面【打开 run.log 之前】。
+# Windows 下 rename 靠不住(重启助手会继承旧进程的 stdout 句柄,helper 活着就改不了名),
+# 也拿不到别的进程的句柄去截断 → 唯一可行的路是:
+#   先只读复制归档 → 再用 "w" 模式打开 run.log(打开即截断)。
+_LOG_ROTATE = None
+_LOG_ROTATE_CFG = (20.0, 7)
+try:
+    import json as _json
+    from backend import log_rotate as _lr
+    _LOG_ROTATE = _lr
+    try:
+        with open(os.path.join(base, "config.json"), encoding="utf-8") as _cf:
+            _cfg = _json.load(_cf)
+        _LOG_ROTATE_CFG = (float(_cfg.get("log_max_mb") or 20),
+                           int(_cfg.get("log_keep_days") or 7))
+    except Exception:
+        pass
+except Exception:
+    pass
+
 # 无控制台模式(--noconsole 打包 / pythonw 启动)下 sys.stdout/stderr 为 None:
 # uvicorn 日志会调 sys.stdout.isatty() 报 AttributeError,部分库写 None 也会崩。
 # 重定向到 run.log 既避免崩溃,也保留崩溃后排查的线索。
 # (界面上的「运行日志」板块由 backend/log_hub.py 提供,与此文件互补)
-if sys.stdout is None or sys.stderr is None:
+#
+# rev69: 这里踩过两个坑,写法都是被实测逼出来的:
+#  1) 轮转判定不能藏在 `if sys.stdout is None` 里面 —— restart 助手会给子进程传
+#     stdout,那时 sys.stdout 不是 None,于是重启一百次也不归档一次。
+#  2) 更狠的坑:子进程继承的是 Win32 HANDLE,CRT 的 O_APPEND 标志在这一层就丢了,
+#     文件位置又是内核对象的共享属性。父进程句柄停在 22MB 处,我们就算把 run.log
+#     截断成 0,继承句柄下一次写仍从 22MB 开始 —— 文件被重新撑回原大小、中间全是
+#     NUL(2026-11-07 19:59 母本"归档了但还是 22.77MB"就是这么来的)。
+# 所以只要不是真控制台,**自己 open run.log 并接管 sys.stdout/stderr**,
+# 句柄和位置全归本进程管;父进程那个句柄从此不再被写,撑不回去。
+_LOG_FILE = os.path.join(base, "run.log")
+_log_rotate_info = None
+_log_open_mode = "a"
+if _LOG_ROTATE is not None:
     try:
-        _logf = open(os.path.join(base, "run.log"), "a", encoding="utf-8")
-        if sys.stdout is None:
-            sys.stdout = _logf
-        if sys.stderr is None:
-            sys.stderr = _logf
-        _logf.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} 启动 =====\n")
-        _logf.flush()
+        _log_rotate_info, _log_open_mode = _LOG_ROTATE.plan_startup(
+            base, max_mb=_LOG_ROTATE_CFG[0], keep_days=_LOG_ROTATE_CFG[1])
     except Exception:
-        pass
+        _log_open_mode = "a"
+
+try:
+    _console = bool(sys.stdout is not None and sys.stdout.isatty())
+except Exception:
+    _console = False
+
+_logf = None
+if _console:
+    # 开发模式(终端里 python main.py):日志上屏,不抢 sys.stdout。
+    # 该归档时只把 run.log 就地清空 —— 内容已经复制到 logs/ 了。
+    if _log_open_mode == "w":
+        try:
+            with open(_LOG_FILE, "w", encoding="utf-8"):
+                pass
+        except Exception:
+            pass
+    _logf = sys.stdout
+else:
+    try:
+        # 旧 stdout 可能正挂着 run.log 且位置停在旧末尾,先把它归零(防御 C 层直接写 fd 1)
+        try:
+            sys.stdout.flush()
+            sys.stdout.seek(0)
+        except Exception:
+            pass
+        _logf = open(_LOG_FILE, _log_open_mode, encoding="utf-8")
+        sys.stdout = _logf
+        sys.stderr = _logf
+    except Exception:
+        _logf = None
+
+try:
+    if _logf is not None:
+        _logf.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} 启动 =====\n")
+        if _log_rotate_info and _log_rotate_info.get("archived_to"):
+            _logf.write("       日志轮转: 上次 run.log %.2fMB(%s) -> logs/%s%s,"
+                        "清理旧归档 %d 个\n" % (
+                            _log_rotate_info.get("archived_from_mb") or 0,
+                            _log_rotate_info.get("reason") or "",
+                            _log_rotate_info.get("archived_to") or "",
+                            "(复用已有)" if _log_rotate_info.get("dedup") else "",
+                            _log_rotate_info.get("removed") or 0))
+        elif _log_rotate_info:
+            _logf.write("       日志轮转: 清理旧归档 %d 个\n"
+                        % (_log_rotate_info.get("removed") or 0))
+        _logf.flush()
+except Exception:
+    pass
 
 
 def _free_port(preferred: int = 8712) -> int:

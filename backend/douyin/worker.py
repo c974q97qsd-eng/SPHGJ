@@ -212,12 +212,15 @@ class DouyinWorker:
             return False
 
         # 注入扫码时导出的登录态（双保险：profile 磁盘 cookie 可能没写成功）
+        # rev70: cookie + localStorage 一起注(与视频号 worker 同一课:只注 cookie
+        # 页面照样当未登录)。抖音身份存 localStorage 的 odin_tt / sessionid 辅助键。
         try:
             ss = self.account.get("_dy_storage_state") or {}
-            ck = ss.get("cookies") or []
-            if ck:
-                await self.context.add_cookies(ck)
-                logger.info("[dy:%s] 已注入登录态 cookies=%d 条" % (self.account_id, len(ck)))
+            from ..local_window import inject_login_state
+            if not await inject_login_state(self.context, ss, self.account_id, "dy"):
+                if ss:
+                    logger.warning("[dy:%s] 注入登录态未成功(回退用 profile 磁盘)"
+                                   % self.account_id)
         except Exception as e:
             logger.warning("[dy:%s] 注入登录态失败(回退用 profile 磁盘): %r"
                            % (self.account_id, e))

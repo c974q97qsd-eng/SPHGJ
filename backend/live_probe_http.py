@@ -188,9 +188,14 @@ async def probe_http(account, diag=None):
         if '"errCode"' in head:
             m = re.search(r'"errCode"\s*:\s*(-?\d+)', head)
             if m and int(m.group(1)) != 0:
+                _c = int(m.group(1))
                 if diag is not None:
-                    diag["why"] = "expired" if int(m.group(1)) == 300333 else "badauth"
-                    diag["code"] = int(m.group(1))
+                    # rev70: 300342 = 会话正被【别处的登录】顶替 —— 软故障,单独归类。
+                    # 它既不是 cookie 失效(300333/300330/300334),也不是"没登录",
+                    # 混在 badauth 里会被当成硬故障固定停 180 秒,而且日志说不清原因。
+                    diag["why"] = ("expired" if _c == 300333 else
+                                   "kicked" if _c == 300342 else "badauth")
+                    diag["code"] = _c
                 return None
     except Exception:
         pass
