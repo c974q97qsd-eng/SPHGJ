@@ -646,16 +646,25 @@ class AccountWorker:
             if self.context is not None:
                 await self._close_context()
 
+    def _write_via_http(self):
+        """rev72: 写操作是否走纯 HTTP(口径与 api_client 默认值一致)。"""
+        rc = (self.config or {}).get("risk_control") or {}
+        return str(rc.get("api_write_via") or "http").lower() == "http"
+
     async def hold_for_manual(self, delay=None):
         """手动操作(回复/删除/置顶)期间保持浏览器,操作完成后延迟回收省内存。
 
-        - 首次调用:经引用计数开浏览器(只 +1),开进程;
-        - delay 内再次调用(连回复数条):_manual_hold 已置位,不再重复开进程,只续期计时;
-        - 计时到期:释放这一份引用并回收(非直播且无其它引用时关 context)。
-        与抓取/直播的引用计数相互独立(同一把 _browser_lock 串行),互不干扰。
+        rev72: 纯 HTTP 写模式**不再为写操作开浏览器** —— 不发页面内 fetch,
+        开 Chromium 纯属浪费,而且浏览器进程已死时会把写操作带崩(见 rev71)。
+        早退不碰 _browser_lock / _browser_refs / 延迟回收计时器。
+        api_write_via="browser" 时完全恢复原来的行为。
 
-        delay 默认 120s,可经 config.manual_release_delay_sec 调整。
+        - browser 模式:首次调用经引用计数开浏览器(只 +1);
+        - delay 内再次调用:_manual_hold 已置位,只续期计时;
+        - 计时到期:释放这一份引用并回收(非直播且无其它引用时关 context)。
         """
+        if self._write_via_http():
+            return self.logged_in
         if delay is None:
             delay = float((self.config or {}).get("manual_release_delay_sec", 120))
         async with self._browser_lock:
@@ -1266,9 +1275,10 @@ class AccountWorker:
     async def _fetch_loop(self):
         """评论抓取循环(按需开/关浏览器以省内存)。
 
-        - 每 fetch_interval_sec(默认 600s = 10 分钟)抓一次;多账号经 _cycle_offset 错峰
-          + 全局 _fetch_lock 串行,形成"间隔排队":任意时刻最多 1 个账号在抓,
-          浏览器不并发常驻。
+        - 每 fetch_interval_sec(默认 600s = 10 分钟)抓一次;多账号经 _cycle_offset 错峰。
+          rev72: _fetch_lock 改成每账号一把,不同账号并行。读接口早已纯 HTTP,
+          整轮持全局锁只会把自动回复/自动删除也一起跨账号串行化。
+          risk_control.fetch_parallel=false 可恢复原来的全局串行。
         - 抓取用 ensure_browser 开浏览器,结束 release_idle_browser 收回(非直播账号
           抓完即关 Chromium 进程,空闲时不占内存)。
         """
@@ -1293,7 +1303,7 @@ class AccountWorker:
             if self.auth_state == "offline":
                 await self._wait_online(min(int(interval or 600), 600))
                 continue
-            # 串行抓取:全局队列锁,保证多账号不同时拉起浏览器(省内存 + 防风控关联)
+            # rev72: 账号隔离抓取锁(同账号串行、跨账号并行)
             if self._fetch_lock is not None:
                 await self._fetch_lock.acquire()
             used_browser = False
@@ -1933,6 +1943,21 @@ class AccountManager:
         await sess.start(headed=headed)
         return sess
 
+    def _account_fetch_lock(self, account_id):
+        """rev72: 评论抓取按账号隔离 —— 不同账号并行,同账号由自己的循环串行。
+
+        原来 manager 把唯一一把 asyncio.Lock 注入所有 worker,整轮抓取(含
+        自动回复/自动删除)全部跨账号串行;HTTP 直连时代这把锁成了纯人为瓶颈。
+        risk_control.fetch_parallel=false 恢复原全局串行(多账号同时开 Chromium
+        内存吃紧时的回退通道)。
+        """
+        rc = (self.config.get("risk_control") or {})
+        if str(rc.get("fetch_parallel", "true")).lower() in ("false", "0", "no"):
+            if self._fetch_lock is None:
+                self._fetch_lock = asyncio.Lock()
+            return self._fetch_lock
+        return asyncio.Lock()
+
     def get_login_session(self, sid):
         return self.login_sessions.get(sid)
 
@@ -1990,8 +2015,8 @@ class AccountManager:
         self._running = True
         # rev15 P0: 启动定时内存归还(独立于账号,引擎运行期间常驻)
         self._memtrim.start()
-        # 评论抓取全局串行锁:多账号经此锁 + _cycle_offset 错峰,形成"间隔排队",
-        # 任意时刻最多 1 个账号在抓,浏览器不并发常驻(省内存)。
+        # rev72: 默认按账号发独立锁(见 _account_fetch_lock);这把共享锁只在
+        # risk_control.fetch_parallel=false 时作为回退通道使用。
         self._fetch_lock = asyncio.Lock()
         interval = self.config.get("fetch_interval_sec", 600)
         total = max(1, len(self.config.get("accounts", [])))
@@ -2015,7 +2040,7 @@ class AccountManager:
                     continue
                 if w and w.logged_in:
                     # 间隔排队:在 fetch_interval_sec 窗口内按账号序号均匀错峰
-                    w._fetch_lock = self._fetch_lock
+                    w._fetch_lock = self._account_fetch_lock(acc["id"])
                     w._cycle_offset = live_idx * interval / total
                     live_idx += 1
             except Exception as e:
@@ -2128,7 +2153,7 @@ class AccountManager:
         # 按账号在配置中的序号分配错峰偏移,与既有 worker 错开抓取节奏
         idx = next((i for i, a in enumerate(self.config.get("accounts", [])) if a["id"] == account_id), 0)
         total = max(1, len(self.config.get("accounts", [])))
-        w._fetch_lock = self._fetch_lock
+        w._fetch_lock = self._account_fetch_lock(account_id)
         w._cycle_offset = idx * self.config.get("fetch_interval_sec", 600) / total
         # rev60: 登记「启动中」,让 stop_all 能一起收拾它(见 B 段注释)
         self._starting[account_id] = w

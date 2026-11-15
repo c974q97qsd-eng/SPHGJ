@@ -61,6 +61,8 @@ def load_config():
         cfg = {"accounts": [], "fetch_interval_sec": 600,
                "auto_reply": {"enabled": False, "rules": []}, "db_path": "./data/comments.db",
                "risk_control": {"read_interval": [1.0, 2.5], "write_interval": [4.0, 8.0],
+                                 "api_read_via": "http", "api_write_via": "http",
+                                 "write_lock_scope": "account", "fetch_parallel": True,
                                  "night_hours": [0, 6], "night_interval_multiplier": 3,
                                  "daily_write_limit": 100}}
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:

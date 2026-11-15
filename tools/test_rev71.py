@@ -258,7 +258,11 @@ class FakeWorker:
         self.live_fetcher = None
         self._verify_result = "ok"
         self.account = {"id": "t-account"}
-        self.config = {"accounts": [self.account]}
+        # rev72: 本段测的是 browser 回退路径(纯 HTTP 写模式已不碰浏览器,
+        # 早退行为由 test_rev72 的 E 段覆盖),这里显式声明,别让桩误走早退。
+        self.config = {"accounts": [self.account],
+                       "risk_control": {"api_write_via": "browser"}}
+        self._write_via_http = lambda: False
         self.storage = None
         self.logged_in = True
         self._browser_refs = 0

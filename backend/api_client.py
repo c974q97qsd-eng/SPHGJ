@@ -1,6 +1,8 @@
 """视频号助手评论 API 封装。
 
-rev50: **读接口走进程内 HTTP 直连**(backend/wx_http.py),写接口默认仍走浏览器。
+rev50: **读接口走进程内 HTTP 直连**(backend/wx_http.py)。
+rev72: 写接口(回复/删除/置顶/隐藏)也默认纯 HTTP,不再为写操作开浏览器。
+       账号隔离:同账号串行、多账号并行,见 account_lock()。
 rev51c: 写接口支持按账号灰度(
         risk_control.api_write_http_accounts=["uspoloassn1"]),
         且写操作的 HTTP 失败**不自动重试**(避免重复评论),详见 _http_give_up。
@@ -19,6 +21,7 @@ import time
 import random
 import asyncio
 import logging
+import threading
 import uuid
 from urllib.parse import quote
 
@@ -32,6 +35,36 @@ PAGE_URL = "https://channels.weixin.qq.com/micro/interaction/comment"
 # 内容管理页(作品列表/隐藏/置顶走这里,官方前端同源)
 CONTENT_BASE = "https://channels.weixin.qq.com/micro/content/cgi-bin/mmfinderassistant-bin"
 POST_PAGE_URL = "https://channels.weixin.qq.com/platform/post/list"
+
+
+# ==================== rev72: 账号隔离并发锁 ====================
+# 每个账号一把 asyncio.Lock:同一账号的所有 _post 严格串行(节流/退避/每日计数
+# 才不会被并发打穿),不同账号各持一把,互不阻塞 -> 真正并行。
+# 锁放模块级而非实例级:worker 开关浏览器时会重建 WxApiClient(4 处),实例级锁
+# 在重建瞬间会出现两把锁,同账号仍可能并发发包。
+# key = (事件循环 id, 账号标识):asyncio.Lock 绑定 loop,测试和重启不能复用旧锁。
+_ACCOUNT_LOCKS = {}
+_ACCOUNT_LOCKS_GUARD = threading.Lock()
+
+
+def account_lock(key):
+    """按 (事件循环, 账号标识) 返回同一把 asyncio.Lock,永不抛。"""
+    try:
+        loop_id = id(asyncio.get_running_loop())
+    except RuntimeError:
+        loop_id = 0
+    k = (loop_id, str(key or ""))
+    with _ACCOUNT_LOCKS_GUARD:
+        lk = _ACCOUNT_LOCKS.get(k)
+        if lk is None:
+            lk = asyncio.Lock()
+            _ACCOUNT_LOCKS[k] = lk
+        return lk
+
+
+def reset_account_locks_for_test():
+    with _ACCOUNT_LOCKS_GUARD:
+        _ACCOUNT_LOCKS.clear()
 
 
 class WxApiClient:
@@ -61,7 +94,10 @@ class WxApiClient:
         # rev50: 读/写分流。读走 HTTP 直连,写默认仍走浏览器 —— 写操作的风控表现
         # 没有任何实测证据(TLS 指纹与真浏览器不同),先留退路,要切再改配置。
         self._read_via = str(rc.get("api_read_via") or "http").lower()
-        self._write_via = str(rc.get("api_write_via") or "browser").lower()
+        # rev72: 写操作与读一致,默认纯 HTTP。config 显式 "browser" 可整体回退。
+        self._write_via = str(rc.get("api_write_via") or "http").lower()
+        # 账号隔离锁维度:account(登录卡片,默认) / finder(视频号)
+        self._write_lock_scope = str(rc.get("write_lock_scope") or "account").lower()
         # rev51c: 写操作灰度名单。填 account id 或视频号短名都行,默认空 = 全走浏览器。
         #   risk_control.api_write_http_accounts = ["uspoloassn1"]
         _g = rc.get("api_write_http_accounts") or []
@@ -117,6 +153,17 @@ class WxApiClient:
     def _is_write(self, path):
         return any(w in path for w in self.WRITE_PATHS)
 
+    def _lock_key(self):
+        """rev72: 账号隔离锁的标识。默认按登录卡片 id(与每日写计数同维度);
+        risk_control.write_lock_scope="finder" 可改成按视频号串行。
+        """
+        # getattr 兜底:测试桩/裸实例可能没跑 __init__,不能因为缺属性把请求打崩。
+        if getattr(self, "_write_lock_scope", "account") == "finder":
+            return str(getattr(self, "finder_id", "") or getattr(self, "account_id", "")
+                       or getattr(self, "aid", "") or "anon")
+        return str(getattr(self, "account_id", "") or getattr(self, "finder_id", "")
+                   or getattr(self, "aid", "") or "anon")
+
     def _is_failure(self, resp):
         """判定请求失败(网络/解析错误或 ret 非 0)。daily_write_limit 不算失败(自限非风控)。"""
         if not isinstance(resp, dict):
@@ -129,7 +176,10 @@ class WxApiClient:
         # 原来照样计失败 -> 30/120/600s 退避是按账号的,会把同账号正常读请求
         # 一起停掉(rev62 已为 no_page 修过同一类问题)。注意:failed() 仍会
         # 判它们失败,上层不会误报成功。
-        _local_err = {"no_cookie", "eval_error", "eval_timeout", "no_page"}
+        # rev72: http_blocked = 纯 HTTP 写模式在 block 期的零发包短路,
+        # 不是服务端拒绝,不能触发 30/120/600s 账号级退避。
+        _local_err = {"no_cookie", "eval_error", "eval_timeout", "no_page",
+                      "http_blocked"}
         if err and err != "daily_write_limit" and not (
                 err in _local_err or str(err).startswith("no_page")):
             return True
@@ -172,6 +222,12 @@ class WxApiClient:
         return b
 
     async def _post(self, path, body, base=None, page_url=None):
+        # rev72: 账号隔离 —— 同账号严格串行,不同账号并行。
+        # 锁按 (loop, 账号) 存模块级表,api 实例重建后仍是同一把。
+        async with account_lock(self._lock_key()):
+            return await self._post_impl(path, body, base, page_url)
+
+    async def _post_impl(self, path, body, base=None, page_url=None):
         # 写操作每日上限:超限跳过,不调 API(不计退避)
         is_write = self._is_write(path)
         today = time.strftime("%Y-%m-%d") if is_write else None
@@ -195,7 +251,11 @@ class WxApiClient:
         if self._via_http(is_write):
             resp = await self._post_via_http(path, url, body, page_url, is_write=is_write)
         if resp is None:
-            if not self._page_alive():
+            if is_write and self._write_via == "http":
+                # rev72: 纯 HTTP 写模式不存在「回退浏览器」。no_cookie 表示
+                # 请求根本没发出去,直接报本地错误(豁免退避),零发包。
+                resp = {"__err": "no_cookie"}
+            elif not self._page_alive():
                 # rev62: 没有页面就不存在"回退浏览器"这件事。原来这里一律调
                 # _post_via_page,拿回来的 no_page 既看不出真实原因(no_cookie?
                 # cookie 已过期?),又会被计成一次接口失败去触发退避。
@@ -218,7 +278,9 @@ class WxApiClient:
                     str(resp)[:300])
         else:
             self._on_success()
-            if is_write:
+            # rev72: 零发包的本地错误(no_cookie / http_blocked)不算一次写操作,
+            # 否则 block 期前端重试会把每日上限刷满,导致后续真写被跳过。
+            if is_write and not (isinstance(resp, dict) and resp.get("__err")):
                 self._incr_daily_count(today)
         return resp
 
@@ -240,15 +302,21 @@ class WxApiClient:
         """本次走 HTTP 还是浏览器。
 
         读: 默认 http(_read_via)。
-        写: 默认 browser;全局 api_write_via="http" 或账号命中灰度名单才走 http。
+        写: rev72 起默认 http(与读一致);api_write_via="browser" 可整体回退,
+            回退后仍支持灰度名单 / 无页面自动降级 HTTP(rev62/rev71)。
         """
-        if time.time() < self._http_block_until:
+        # rev72: 纯 HTTP 写模式下 block 期也不能回退浏览器 —— 浏览器可能
+        # 根本没开(或已死),回退只会拿到 no_page/eval_error。改由
+        # _post_via_http 短路返回本地错误,零发包。
+        _pure_http_write = is_write and self._write_via == "http"
+        if time.time() < self._http_block_until and not _pure_http_write:
             return False
         # rev54: 这一轮已经撞到 300333/300330(cookie 已死),后面别再逐个请求去撞
         if not is_write and self.auth_fail:
             return False
         if not is_write:
             return self._read_via == "http"
+        # rev72: 写操作默认纯 HTTP(与读一致),不再看页面是否活着。
         if self._write_via == "http":
             return True
         # rev62: 纯 HTTP 模式(浏览器已收回 / 从未打开)下,写操作直接走 HTTP。
@@ -336,6 +404,10 @@ class WxApiClient:
         读操作: 只认「成功」,任何异常都退浏览器重试(幂等)。
         写操作: 见 _http_give_up —— 除 no_cookie 外一律不重试,避免重复提交。
         """
+        # rev72: 纯 HTTP 写模式下 _via_http 会无视 block 直接进来,
+        # 这里补上零发包短路,避免拿已死的 cookie 白撞一枪。
+        if time.time() < self._http_block_until:
+            return self._http_give_up("blocked", path, is_write=is_write)
         try:
             acc = self._latest_account()
             # _aid 每次登录都会变;URL 是早先拼的,这里按最新值纠正
