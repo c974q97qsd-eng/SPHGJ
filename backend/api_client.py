@@ -3,6 +3,8 @@
 rev50: **读接口走进程内 HTTP 直连**(backend/wx_http.py)。
 rev72: 写接口(回复/删除/置顶/隐藏)也默认纯 HTTP,不再为写操作开浏览器。
        账号隔离:同账号串行、多账号并行,见 account_lock()。
+rev73: 写成功逐条打 INFO(path/账号/via/errCode/接口耗时);读/写各自的
+       「首次 HTTP 成功」标记独立 —— 读接口先成功不再吞掉写通道的日志。
 rev51c: 写接口支持按账号灰度(
         risk_control.api_write_http_accounts=["uspoloassn1"]),
         且写操作的 HTTP 失败**不自动重试**(避免重复评论),详见 _http_give_up。
@@ -106,7 +108,12 @@ class WxApiClient:
         self._write_http_accounts = {str(x) for x in _g}
         self._http_block_until = 0.0     # no_cookie 时短期禁用,别每轮白跑
         self._http_last_why = ""
-        self._http_logged = False        # 首次 HTTP 成功打一条 INFO,线上据此确认在跑
+        # rev73: 读/写各自一个「首次成功」标记。旧版只有 _http_logged 一个,
+        # 读接口(post_list)先成功就置 True,写操作永远打不出「首次写操作成功」,
+        # 线上只能靠 delete_logs 反推写通道在不在跑。
+        self._http_logged = False        # 兼容 rev50~72:任意 HTTP 成功都置 True
+        self._http_read_logged = False   # 读首次日志
+        self._http_write_logged = False  # 写首次日志(与读完全分开)
         ri = rc.get("read_interval") or list(self.READ_INTERVAL)
         wi = rc.get("write_interval") or list(self.WRITE_INTERVAL)
         self._read_interval = (float(ri[0]), float(ri[1])) if isinstance(ri, (list, tuple)) and len(ri) >= 2 else self.READ_INTERVAL
@@ -248,7 +255,11 @@ class WxApiClient:
         # rev50: 读走 HTTP 直连(快、不占 renderer),写默认仍走浏览器。
         # 任何 HTTP 侧异常一律回退浏览器 —— 页面里是"活会话",永远比 storage_state 新。
         resp = None
-        if self._via_http(is_write):
+        # rev73: 耗时只量「请求阶段」,不含 _throttle 的随机等待,也不含 _post
+        # 里账号锁的排队时间 —— 否则写接口看起来总像慢了 4~8s。
+        t_req = time.perf_counter()
+        _use_http = self._via_http(is_write)
+        if _use_http:
             resp = await self._post_via_http(path, url, body, page_url, is_write=is_write)
         if resp is None:
             if is_write and self._write_via == "http":
@@ -263,6 +274,7 @@ class WxApiClient:
                 resp = {"__err": "no_page:" + (self._http_last_why or "unknown")}
             else:
                 resp = await self._post_via_page(path, url, body)
+        cost = time.perf_counter() - t_req
         # 失败退避 / 成功重置;写操作成功计数(持久化)
         if self._is_failure(resp):
             self._on_failure()
@@ -278,6 +290,16 @@ class WxApiClient:
                     str(resp)[:300])
         else:
             self._on_success()
+            # rev73: 写成功逐条留痕。必须排除 __err —— daily_write_limit /
+            # no_cookie / http_blocked 都是「零发包的本地错误」,被 _is_failure
+            # 豁免退避后会进这个 else,不能记成写成功。
+            if is_write and isinstance(resp, dict) and not resp.get("__err"):
+                _code = self._err_code(resp)
+                logger.info(
+                    "[api] 写操作成功 path=%s account=%s via=%s errCode=%s 耗时=%.2fs",
+                    path, (self.account_id or self._lock_key() or "-"),
+                    "http" if _use_http else "page",
+                    _code if _code is not None else "none", cost)
             # rev72: 零发包的本地错误(no_cookie / http_blocked)不算一次写操作,
             # 否则 block 期前端重试会把每日上限刷满,导致后续真写被跳过。
             if is_write and not (isinstance(resp, dict) and resp.get("__err")):
@@ -442,11 +464,19 @@ class WxApiClient:
                                       is_write=is_write)
         # 有一次成功就说明会话是活的,清掉失效标记
         self.auth_fail = None
-        if not self._http_logged:
-            self._http_logged = True
-            kind = "写" if is_write else "读"
-            logger.info(f"[api] HTTP 直连可用(首次{kind}操作成功 path={path}, "
-                        f"backend={wx_http.backend_name()}),{kind}接口走进程内请求")
+        # rev73: 读写分开。旧逻辑一个 flag 共用,读接口先成功后写通道永远静默。
+        # _http_logged 保留为兼容标记(旧单测/外部会读它),并继续抑制读首次日志。
+        _compat = getattr(self, "_http_logged", False)
+        self._http_logged = True
+        if is_write:
+            if not getattr(self, "_http_write_logged", False):
+                self._http_write_logged = True
+                logger.info(f"[api] HTTP 直连可用(首次写操作成功 path={path}, "
+                            f"backend={wx_http.backend_name()}),写接口走进程内请求")
+        elif not _compat and not getattr(self, "_http_read_logged", False):
+            self._http_read_logged = True
+            logger.info(f"[api] HTTP 直连可用(首次读操作成功 path={path}, "
+                        f"backend={wx_http.backend_name()}),读接口走进程内请求")
         return resp
 
     def http_available(self):
