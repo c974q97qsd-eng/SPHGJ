@@ -100,6 +100,20 @@ class WxApiClient:
             await asyncio.sleep(wait - elapsed)
         self._last_req_time = time.time()
 
+    def _page_alive(self):
+        """page 对象存在 != 页面还活着(rev71)。
+
+        死 page 必须等价「没有页面」:否则写操作会拿它去 evaluate 报
+        Target closed,而不是按 rev62 既定的原则走 HTTP 直连。
+        """
+        p = self.page
+        if p is None:
+            return False
+        try:
+            return not p.is_closed()
+        except Exception:
+            return False
+
     def _is_write(self, path):
         return any(w in path for w in self.WRITE_PATHS)
 
@@ -111,8 +125,13 @@ class WxApiClient:
         # rev62: daily_write_limit / no_cookie / no_page:* 都是「本地这条路走不通」,
         # 不是服务端拒绝。原来只有 daily_write_limit 豁免,no_cookie 也照样进退避,
         # 而退避(30/120/600s)是按账号的 —— 会把同账号的正常读请求一起停掉。
+        # rev71: eval_error / eval_timeout 是「浏览器通道已死」,不是服务端拒绝。
+        # 原来照样计失败 -> 30/120/600s 退避是按账号的,会把同账号正常读请求
+        # 一起停掉(rev62 已为 no_page 修过同一类问题)。注意:failed() 仍会
+        # 判它们失败,上层不会误报成功。
+        _local_err = {"no_cookie", "eval_error", "eval_timeout", "no_page"}
         if err and err != "daily_write_limit" and not (
-                err == "no_cookie" or str(err).startswith("no_page")):
+                err in _local_err or str(err).startswith("no_page")):
             return True
         if resp.get("ret") not in (None, 0):
             return True
@@ -176,10 +195,11 @@ class WxApiClient:
         if self._via_http(is_write):
             resp = await self._post_via_http(path, url, body, page_url, is_write=is_write)
         if resp is None:
-            if self.page is None:
+            if not self._page_alive():
                 # rev62: 没有页面就不存在"回退浏览器"这件事。原来这里一律调
                 # _post_via_page,拿回来的 no_page 既看不出真实原因(no_cookie?
                 # cookie 已过期?),又会被计成一次接口失败去触发退避。
+                # rev71: 页面对象还在但已关闭,同样算「没有页面」。
                 resp = {"__err": "no_page:" + (self._http_last_why or "unknown")}
             else:
                 resp = await self._post_via_page(path, url, body)
@@ -236,7 +256,9 @@ class WxApiClient:
         # 于是 uspoloassn7 每轮「自动评论失败: no_page」,一条都没发出去;
         # 而且 no_page 被 _is_failure 当成接口失败,连续 11 次触发 600s 全局退避,
         # 把正常的读请求一起停掉。写操作不再为它去开浏览器:同源同 cookie。
-        if self.page is None:
+        # rev71: 死 page 等价「没有页面」 —— 否则写操作仍会拿死对象去
+        # evaluate,报 Target closed 并触发 30/120s 全局退避。
+        if not self._page_alive():
             return True
         if not self._write_http_accounts:
             return False
@@ -381,8 +403,9 @@ class WxApiClient:
 
     async def _post_via_page(self, path, url, body):
         """原路径:页面内 fetch(同源、带真 cookie)。"""
-        if self.page is None:
-            # rev52: 纯 HTTP 模式(未开浏览器)下的回退请求。不能抛异常 ——
+        if not self._page_alive():
+            # rev52/rev71: 纯 HTTP 模式 / 页面已死,都不存在"回退浏览器"这件事。
+            # 不能抛异常 ——
             # 抛出去会让整轮抓取炸掉,而正确语义只是「这条走不通」。
             return {"__err": "no_page"}
         js = """

@@ -415,10 +415,65 @@ class AccountWorker:
                 return "login" not in url
             await self.page.wait_for_timeout(2000)
 
+    # ==================== rev71: context 活体检查 ====================
+    def _context_alive(self):
+        """context 对象存在 != 浏览器还活着。
+
+        Chromium 被回收/崩溃后 Playwright 仍握着 context 对象,但 pages 全部
+        is_closed()。原来所有入口只判 `self.context is None`,于是死 context
+        永远不会被重建:轻量探测回退开页报 `BrowserContext.new_page: Target
+        page... has been closed`,手动删除拿死 page 去 evaluate 报 eval_error,
+        再被计成接口失败触发 30s/120s 账号级退避。
+        """
+        ctx = self.context
+        if ctx is None:
+            return False
+        try:
+            pages = ctx.pages
+            if not pages:
+                return False
+            return any(not p.is_closed() for p in pages)
+        except Exception:
+            # ctx 本身已废:连 .pages 都取不到
+            return False
+
+    async def _drop_dead_context(self):
+        """只清引用 + 重建无浏览器 api,不对死 context 再调 close。
+
+        不能用 _close_context():它会走 close_context_safely 的兜底
+        reap_profile_orphans,按 --user-data-dir 杀残留进程,在这个时机
+        有误伤刚拉起的新 Chromium 的风险。
+        """
+        lf = self.live_fetcher
+        self.context = None
+        self.page = None
+        self.live_page = None
+        self.live_fetcher = None
+        self._verify_result = None
+        if self.api is not None:
+            old_api = self.api
+            self.api = WxApiClient(None, self.account, self.config, self.storage)
+            # 继承「cookie 已死/先别试 HTTP」的状态,否则重建会抹掉退避
+            self.api.auth_fail = getattr(old_api, "auth_fail", None)
+            self.api._http_block_until = getattr(old_api, "_http_block_until", 0.0)
+            self.api._http_logged = getattr(old_api, "_http_logged", False)
+            for comp in (self.auto_reply, self.auto_commenter, self.auto_delete, self.fetcher):
+                if comp is not None:
+                    comp.api = self.api
+        if lf:
+            try:
+                await lf.close()
+            except Exception:
+                pass
+
     async def _open_context(self):
         """懒加载开 Chromium:建 context+评论页,登录校验,建/重绑 API 客户端。幂等。"""
-        if self.context is not None:
+        if self._context_alive():
             return
+        if self.context is not None:
+            # rev71: 对象还在但浏览器已死 —— 先清引用,下面重新拉起
+            logger.warning(f"[{self.account['id']}] 浏览器 context 已失效,重建")
+            await self._drop_dead_context()
         self._verify_result = None
         self.context = await launch_stealth(self._pw, self.account["profile_dir"], headless=self._headless)
         # rev29: 注入扫码时导出的登录态(双保险)。profile 磁盘 cookie 有时写入不成功
@@ -571,7 +626,7 @@ class AccountWorker:
         """获取一次浏览器引用(引用计数)。返回 context 是否可用/已登录。"""
         async with self._browser_lock:
             self._browser_refs += 1
-            if self.context is None:
+            if not self._context_alive():
                 try:
                     await self._open_context()
                 except Exception as e:
@@ -606,7 +661,7 @@ class AccountWorker:
         async with self._browser_lock:
             if not self._manual_hold:
                 self._browser_refs += 1
-                if self.context is None:
+                if not self._context_alive():
                     try:
                         await self._open_context()
                     except Exception as e:
