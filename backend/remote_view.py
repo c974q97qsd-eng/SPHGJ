@@ -36,10 +36,23 @@ VIEW_W, VIEW_H = 1280, 800
 JPEG_QUALITY = 58
 IDLE_TIMEOUT_SEC = 300          # 5 分钟无操作自动断开
 DASHBOARD_IDLE_SEC = 7200       # rev67: 直播大屏是挂着看的,2 小时无操作才断
-MAX_SESSIONS = 2                # 同时最多两路串流:一路别人开了还能再开一路,
-                                # 又不至于把主机压垮(每个 context 约 150-300MB)
+DEFAULT_MAX_SESSIONS = 4  # rev74: 放宽到 4 路,可在 config.json 的 remote.max_sessions 调
+MAX_SESSIONS = DEFAULT_MAX_SESSIONS          # 兼容别名(老脚本可能引用)
+                                # 每路 context 约 150-300MB,上限由 max_sessions() 兜底
 DEFAULT_URL = "https://channels.weixin.qq.com/platform/post/create"
 HOME_URL = "https://channels.weixin.qq.com/platform"
+
+
+class SessionOccupied(RuntimeError):
+    """rev74: 同账号已有一路活跃串流,且本次连接不允许接管。"""
+
+
+class SessionOccupied(RuntimeError):
+    """rev74: 同账号已有一路活跃串流,且本次连接不允许接管。"""
+
+
+class SessionOccupied(RuntimeError):
+    """rev74: 同账号已有一路活跃串流,且本次连接不允许接管。"""
 
 
 class RemoteSession:
@@ -70,6 +83,9 @@ class RemoteSession:
         self._task = None
         self._min_frame_gap = 0.05          # 帧间隔下限(<=20fps),防止白烧带宽
         self._last_frame_ts = 0.0
+        self.owner = None              # rev74: 当前持有这路串流的 WebSocket
+        self.owner = None              # rev74: 当前持有这路串流的 WebSocket
+        self.owner = None              # rev74: 当前持有这路串流的 WebSocket
 
     # ---------------- 生命周期 ----------------
     @property
@@ -145,6 +161,9 @@ class RemoteSession:
             return
         self.closed = True
         self.close_reason = reason
+        self.owner = None              # rev74: 旧 WS 的 release 不再误关新会话
+        self.owner = None              # rev74: 旧 WS 的 release 不再误关新会话
+        self.owner = None              # rev74: 旧 WS 的 release 不再误关新会话
         if self._task:
             self._task.cancel()
             self._task = None
@@ -310,7 +329,16 @@ class RemoteSession:
 
 
 class RemoteRegistry:
-    """会话登记:同账号复用,超并发踢旧的。"""
+    """会话登记:同账号单路 + 归属管理(rev74)。
+
+    rev74 之前同账号多标签会复用同一个 RemoteSession:两个 WS 从同一个
+    maxsize=2 的帧队列抢帧(各只拿到一半画面),而且任一 WS 的 finally 都
+    无条件 close(account),关掉一个标签页就把另一路一起断了。现在:
+      * 每个 session 记 owner(持有它的 WebSocket);同账号第二个连接默认
+        拒绝(SessionOccupied),只有 view=dashboard 允许接管并踢掉旧 WS;
+      * release() 只在「会话仍是当初那个 且 owner 仍是自己」时收尾;
+      * 上限可配(config.remote.max_sessions),踢旧按 created_at 并通知旧 WS。
+    """
 
     def __init__(self, manager, config, storage=None):
         self.manager = manager
@@ -318,20 +346,66 @@ class RemoteRegistry:
         self.storage = storage
         self.sessions = {}
 
+    def max_sessions(self):
+        """同时最多几路串流;非法/缺省值一律收敛到 DEFAULT_MAX_SESSIONS。"""
+        try:
+            n = int(((self.config or {}).get("remote") or {}).get("max_sessions")
+                    or DEFAULT_MAX_SESSIONS)
+        except (TypeError, ValueError, AttributeError):
+            n = DEFAULT_MAX_SESSIONS
+        return max(1, min(16, n))
+
     def get(self, account_id):
         s = self.sessions.get(account_id)
         if s and not s.closed:
             return s
         return None
 
-    async def open(self, account_id, url=None, idle_timeout_sec=None):
-        # 全局只留 MAX_SESSIONS 路
-        alive = [s for s in self.sessions.values() if not s.closed]
-        while len(alive) >= MAX_SESSIONS:
-            old = alive.pop(0)
+    def is_occupied(self, account_id, owner):
+        s = self.get(account_id)
+        return bool(s and getattr(s, "owner", None) is not None
+                    and s.owner is not owner)
+
+    @staticmethod
+    async def _evict_owner(s):
+        """接管/踢旧时让旧 WS 立刻断开,避免它继续抢帧或误关新会话。"""
+        w = getattr(s, "owner", None)
+        s.owner = None
+        if w is None:
+            return
+        try:
+            await w.send_json({"t": "closed", "reason": "kicked",
+                               "message": "这个账号已在另一个标签页里打开,当前连接被接管"})
+        except Exception:
+            pass
+        try:
+            await w.close()
+        except Exception:
+            pass
+
+    async def open(self, account_id, url=None, idle_timeout_sec=None,
+                   owner=None, takeover=False):
+        # 1) 同账号占用先判:不能先踢掉别人的会话再报错
+        s = self.get(account_id)
+        if s is not None and self.is_occupied(account_id, owner):
+            if not takeover:
+                raise SessionOccupied(
+                    "该账号已在另一个标签页里打开远程串流,请先关闭那个标签页再重开")
+            # 直播大屏按钮本身就是新标签页(rev67),允许它接管旧连接。
+            await self._evict_owner(s)
+
+        # 2) 全局上限:按创建时间踢最旧的;排除本账号(它可能正要被复用),
+        #    否则复用自己的会话时会把自己踢掉,大屏画面直接丢失。
+        others = sorted((x for x in self.sessions.values()
+                         if not x.closed and x.account_id != account_id),
+                        key=lambda x: getattr(x, "created_at", 0))
+        while len(others) >= self.max_sessions():
+            old = others.pop(0)
             logger.info(f"[remote] 会话数已满,先关掉 {old.account_id}")
+            await self._evict_owner(old)
             await old.close("kicked")
             self.sessions.pop(old.account_id, None)
+
         s = self.get(account_id)
         if s is not None:
             # rev66: 页面已关 / CDP 掉了的「僵尸会话」不能复用,否则前端
@@ -340,6 +414,7 @@ class RemoteRegistry:
                 if (s.page is not None and not s.page.is_closed()
                         and s.cdp is not None and s.ctx is not None):
                     await s.refresh_url()
+                    s.owner = owner
                     return s, True
             except Exception:
                 pass
@@ -347,7 +422,13 @@ class RemoteRegistry:
             await self.close(account_id, "stale")
         s = RemoteSession(self.manager, account_id, self.config, self.storage,
                           idle_timeout_sec=idle_timeout_sec or IDLE_TIMEOUT_SEC)
-        meta = await s.open(url)
+        try:
+            await s.open(url)
+        except Exception:
+            # 启动浏览器/注入登录态失败时,别留下半死会话(rev66 的僵尸来源)
+            await s.close("open_failed")
+            raise
+        s.owner = owner
         self.sessions[account_id] = s
         return s, False
 
@@ -356,6 +437,20 @@ class RemoteRegistry:
         if s is not None:
             await s.close(reason)
 
+    async def release(self, account_id, sess, owner, reason="closed"):
+        """rev74: WS 结束时只收尾「自己仍持有」的那一路。
+
+        被接管 / 被踢旧 / 已被重建的旧 WS 走到这里时,owner 或 session
+        对象都不再匹配,直接放过,不会把新标签页的串流一起关掉。
+        """
+        if sess is None:
+            return
+        if self.sessions.get(account_id) is not sess:
+            return
+        if getattr(sess, "owner", None) is not owner:
+            return
+        await self.close(account_id, reason)
+
     async def close_all(self):
         for aid in list(self.sessions):
             await self.close(aid, "shutdown")
@@ -363,4 +458,6 @@ class RemoteRegistry:
     def snapshot(self):
         return [{"account_id": s.account_id, "url": s.url,
                  "idle_sec": int(time.time() - s.last_active),
-                 "created_at": s.created_at} for s in self.sessions.values() if not s.closed]
+                 "created_at": s.created_at,
+                 "owned": getattr(s, "owner", None) is not None}
+                for s in self.sessions.values() if not s.closed]

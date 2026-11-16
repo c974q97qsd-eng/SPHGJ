@@ -107,7 +107,9 @@ class FakeRegistry:
         self.calls, self.closed = [], []
         self.session = FakeSession()
 
-    async def open(self, account, url=None, idle_timeout_sec=None):
+    async def open(self, account, url=None, idle_timeout_sec=None,
+                   owner=None, takeover=False):
+        # rev74: 新参数不记进 calls,保持 6/15/16 号断言的口径
         self.calls.append((account, url, idle_timeout_sec))
         if self.boom:
             raise RuntimeError("boom")
@@ -117,6 +119,18 @@ class FakeRegistry:
         return self.session, self.reused
 
     async def close(self, account, reason):
+        self.closed.append((account, reason))
+
+    async def release(self, account, sess, owner, reason):
+        # rev74: 17 号断言看的是 closed 里的 open_failed
+        self.closed.append((account, reason))
+
+    async def release(self, account, sess, owner, reason):
+        # rev74: 17 号断言看的是 closed 里的 open_failed
+        self.closed.append((account, reason))
+
+    async def release(self, account, sess, owner, reason):
+        # rev74: 17 号断言看的是 closed 里的 open_failed
         self.closed.append((account, reason))
 
 
@@ -145,7 +159,8 @@ def build_open_part(manager, registry):
     code = "async def open_part(ws, account, url, view):\n" + body
 
     ns = {"manager": manager, "remote_registry": registry, "logger": Log(),
-          "DASHBOARD_IDLE_SEC": rv.DASHBOARD_IDLE_SEC}
+          "DASHBOARD_IDLE_SEC": rv.DASHBOARD_IDLE_SEC,
+          "SessionOccupied": rv.SessionOccupied}
     tree = ast.parse(SERVER)
     picked = []
     for node in tree.body:
@@ -288,6 +303,7 @@ async def main():
         def __init__(self, manager, account_id, config, storage=None,
                      idle_timeout_sec=None):
             made.append(idle_timeout_sec)
+            self.account_id = account_id     # rev74: 踢旧要按账号排除自己
             self.closed = False
             self.url = ""
 

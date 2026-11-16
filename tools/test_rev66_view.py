@@ -349,8 +349,11 @@ async def test_manager():
 def test_static():
     print("\n--- D. WS 异常清理与前端文案 ---")
     sv = src("backend/server.py")
+    # rev74: 清理搬进 RemoteRegistry.open()（失败时不登记、就地 close），
+    # WS 侧改用 release 只清自己持有的会话,不再无条件 close 误伤别人。
     check("33 WS 建立失败清理会话",
-          'await remote_registry.close(account, "open_failed")' in sv)
+          'await remote_registry.release(account, sess, ws, "open_failed")' in sv
+          and 'await s.close("open_failed")' in src("backend/remote_view.py"))
     pd = src("frontend/src/components/posts/PlayDialog.tsx")
     check("34 播放文案改成「已实时获取播放地址」", "已实时获取播放地址" in pd)
     check("35 旧的「地址已过期」文案已删", "播放地址已过期" not in pd)

@@ -39,7 +39,7 @@ from .memtrim import trim_now
 from .post_fetcher import PostFetcher
 from .publish_queue import PublishQueue
 from .publish_fixups import fix_mislabeled_need_review   # rev40: 历史误标回滚
-from .remote_view import RemoteRegistry, DASHBOARD_IDLE_SEC
+from .remote_view import RemoteRegistry, DASHBOARD_IDLE_SEC, SessionOccupied
 from .browser import reap_profile_orphans
 from . import platforms                          # rev56: 平台维度抽象（wx / dy）
 from .douyin.manager import DouyinManager   # rev56: 抖音（platform=dy）
@@ -1188,10 +1188,24 @@ async def remote_ws(ws: WebSocket, account: str = Query(""), url: str = Query(""
             return
         idle_sec = DASHBOARD_IDLE_SEC
     sess = None
+    skip_cleanup = False
     try:
         await ws.send_json({"t": "opening", "account_id": account})
-        sess, reused = await remote_registry.open(account, target_url or None,
-                                                   idle_timeout_sec=idle_sec)
+        try:
+            # rev74: owner 用于判定「关一个标签页会不会把整路会话关掉」;
+            # 只有 view=dashboard(直播大屏按钮本来就是新标签页)允许接管旧连接。
+            sess, reused = await remote_registry.open(
+                account, target_url or None, idle_timeout_sec=idle_sec,
+                owner=ws, takeover=(view == "dashboard"))
+        except SessionOccupied as e:
+            # 同账号第二个标签页:明确拒绝,前端复用现有 error 分支显示 message,
+            # 不必改前端 dist。绝不能让它复用同一路串流去抢帧。
+            skip_cleanup = True
+            try:
+                await ws.send_json({"t": "error", "message": str(e)})
+            except Exception:
+                pass
+            return
         if reused:
             # registry 复用会话时不会重新 goto:同账号先开了「远程查看」再点「大屏」,
             # 画面会停在旧页。这里显式导航,并按大屏模式放宽空闲超时。
@@ -1203,10 +1217,12 @@ async def remote_ws(ws: WebSocket, account: str = Query(""), url: str = Query(""
         await ws.send_json(sess.meta())
     except Exception as e:
         logger.warning(f"[remote] 建立会话失败 {account}: {e}")
-        # rev66: open() 可能已经把会话登记进 registry(日志里出现过
-        # 「会话已开启」紧接「建立会话失败」),不清理会留下僵尸会话。
+        # rev74: 已在下面发出 error,finally 不要再补一条 closed;且只清理
+        # 自己持有的会话,别误关别人正在用的那一路(open 失败的自清理已搬进
+        # RemoteRegistry.open,不会再留僵尸会话)。
+        skip_cleanup = True
         try:
-            await remote_registry.close(account, "open_failed")
+            await remote_registry.release(account, sess, ws, "open_failed")
         except Exception:
             pass
         try:
@@ -1257,20 +1273,35 @@ async def remote_ws(ws: WebSocket, account: str = Query(""), url: str = Query(""
              asyncio.create_task(urlwatch())]
     try:
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        # rev74: 客户端正常断开时 reader() 会抛 WebSocketDisconnect;不 consume
+        # 已完成 task 的异常,asyncio 会刷 "Task exception was never retrieved"。
+        # 多标签页场景关标签页很频繁,这条噪音必须收掉。
+        for d in done:
+            try:
+                exc = d.exception()
+            except asyncio.CancelledError:
+                continue
+            if exc is not None:
+                logger.debug(f"[remote] WS 子任务结束: {type(exc).__name__}: {exc}")
         for p in pending:
             p.cancel()
     except Exception as e:
         logger.debug(f"[remote] WS 循环异常: {e}")
     finally:
-        reason = sess.close_reason or ("idle" if sess.closed else "client")
-        try:
-            await remote_registry.close(account, reason)
-        except Exception:
-            pass
-        try:
-            await ws.send_json({"t": "closed", "reason": reason})
-        except Exception:
-            pass
+        # rev74: 被拒绝/建会话失败的连接(skip_cleanup)不碰 registry;其余只在
+        # 「会话仍是自己持有」时收尾,避免旧 WS 把接管后的新标签页一起关掉。
+        if not skip_cleanup:
+            reason = (getattr(sess, "close_reason", "") or
+                      ("idle" if getattr(sess, "closed", False) else
+                       ("open_failed" if sess is None else "client")))
+            try:
+                await remote_registry.release(account, sess, ws, reason)
+            except Exception:
+                pass
+            try:
+                await ws.send_json({"t": "closed", "reason": reason})
+            except Exception:
+                pass
         try:
             await ws.close()
         except Exception:
@@ -1280,7 +1311,8 @@ async def remote_ws(ws: WebSocket, account: str = Query(""), url: str = Query(""
 @app.get("/api/remote/sessions")
 async def remote_sessions():
     """当前串流会话(用于界面显示「谁在占用」)。"""
-    return {"items": remote_registry.snapshot()}
+    return {"items": remote_registry.snapshot(),
+            "max_sessions": remote_registry.max_sessions()}
 
 
 @app.post("/api/remote/close")
